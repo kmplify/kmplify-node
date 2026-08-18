@@ -1,0 +1,32 @@
+# systemd unit for the headless KMPLIFY provider node.
+# Install: docs/HEADLESS-NODE.md. Works unchanged on every systemd distro
+# (Ubuntu, Debian, openSUSE, CachyOS/Arch, ...).
+[Unit]
+Description=KMPLIFY headless provider node (fabric worker)
+Documentation=https://github.com/kmplify/kmplify-node/blob/main/docs/HEADLESS-NODE.md
+After=network-online.target docker.service
+Wants=network-online.target
+# Sessions need Docker; a pure inference node (host Ollama only) may drop this.
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/kmplify-node
+# The node's identity + config live here (KMPLIFY_NODE_DIR).
+Environment=KMPLIFY_NODE_DIR=/var/lib/kmplify-node
+EnvironmentFile=-/etc/kmplify-node.env
+# SIGTERM makes the worker tear down every hosted session container before
+# exiting — never SIGKILL first, or containers outlive their node until the
+# next start's orphan handling.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=10
+# Needs the docker socket; run as a user in the docker group rather than root
+# where policy allows.
+User=kmplify
+Group=docker
+StateDirectory=kmplify-node
+
+[Install]
+WantedBy=multi-user.target

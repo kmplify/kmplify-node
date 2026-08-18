@@ -127,6 +127,8 @@ async fn resolve_config() -> WorkerConfig {
             _ => "auto".to_string(),
         },
         cuda: detect_cuda().await,
+        // This binary IS the crate, so its own version is the right answer.
+        client_version: None,
         events: None, // headless: the log IS the surface
     }
 }
