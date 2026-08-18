@@ -279,15 +279,16 @@ pub struct WorkerEvent {
     pub body: String,
 }
 
-/// Every field defaulted, so `..Default::default()` in a test or example
-/// keeps compiling when a new one is added.
+/// Every field defaulted, so `..Default::default()` keeps compiling when a
+/// new one is added.
 ///
 /// Three separate commits added a field here (max_shared_cpus,
-/// max_shared_vram_mb, max_shared_disk_gb) and each one broke
-/// examples/fabric_smoke.rs, because a struct literal must name them all.
-/// The example is part of `cargo test`, so the branch failed to build every
-/// time until someone noticed. #[non_exhaustive] does not help: it permits
-/// omission only OUTSIDE the defining crate, and the example is inside it.
+/// max_shared_vram_mb, max_shared_disk_gb) and each one broke a struct
+/// literal that had to name them all. That used to be an in-crate annoyance;
+/// since the KMPLIFY desktop app became an embedder it is a break in a
+/// DIFFERENT repository, discovered by a human at build time because nothing
+/// compiles the pair. So every construction site, here and in embedders,
+/// ends in `..Default::default()`; see the note on the struct itself.
 ///
 /// Written out rather than derived so the defaults are usable rather than
 /// merely present: a derived String gateway_url would be "", which dials
@@ -322,6 +323,16 @@ impl Default for WorkerConfig {
     }
 }
 
+/// Embedders live in OTHER repositories, so construct this with
+/// `WorkerConfig { ..., ..Default::default() }` and never an exhaustive
+/// literal: functional-update syntax is what makes a field added here a
+/// non-event for them rather than a build break they discover by hand.
+///
+/// `#[non_exhaustive]` would enforce that rather than merely ask for it, at
+/// the price of banning the literal form outright (even inside this package's
+/// own binary and examples), turning every construction site into a run of
+/// field assignments. Left off for readability; revisit if the convention
+/// slips.
 #[derive(Clone)]
 pub struct WorkerConfig {
     pub gateway_url: String,
@@ -1254,7 +1265,12 @@ fn is_fabric_volume(name: &str, target: &str) -> bool {
 /// ComfyUI template was repinned cu124 to cu126 in flight, and a node pinned
 /// to the exact string would have refused every session until it was rebuilt.
 /// The tag and digest are free, the publisher is not.
-const IMAGE_PINS: &[(&str, &str)] = &[
+/// Public so an embedder can ASSERT against it rather than hand-copying it.
+/// The KMPLIFY desktop app advertises its own default template list, and
+/// nothing could check the two agreed: a template it offered but this table
+/// did not pin would be scheduled and then refused at the pull, failing the
+/// session after placement instead of never being placed.
+pub const IMAGE_PINS: &[(&str, &str)] = &[
     ("vllm-openai", "vllm/vllm-openai"),
     ("vllm-openai-lmcache", "lmcache/vllm-openai"),
     ("comfyui", "yanwk/comfyui-boot"),
@@ -1315,7 +1331,7 @@ fn image_repository(image: &str) -> String {
 /// Fails closed: a template with no pin at all is refused rather than waved
 /// through, so a gateway cannot introduce a new template id to an old node
 /// and have it run whatever comes attached.
-fn image_allowed_for(template: &str, image: &str) -> bool {
+pub fn image_allowed_for(template: &str, image: &str) -> bool {
     let repo = image_repository(image);
     IMAGE_PINS
         .iter()
@@ -3014,6 +3030,15 @@ async fn session(
         // answer — an inference that was wrong at least once, because the
         // peer had been rebuilt since the last observation.
         "version": cfg.client_version.as_deref().unwrap_or_else(|| crate::version_string()),
+        // Which WORKER is behind that version, which `version` cannot say
+        // once an embedder overrides it: the desktop app reports its own
+        // release (0.1.10+sha) and is built against whatever kmplify-node
+        // checkout its builder had. Two installs reporting an identical
+        // `version` can therefore contain different protocol support, which
+        // is the exact ambiguity `version` was added to remove. Sent as its
+        // own field rather than folded into `version` because the gateway
+        // truncates that one to 32 chars; older gateways ignore this key.
+        "worker_version": crate::version_string(),
         "country": cfg.country,
         // Admission mode (v2.4). Absent/unknown reads as "auto" on the
         // gateway, so older gateways and workers stay compatible both ways.

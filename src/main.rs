@@ -80,6 +80,11 @@ async fn detect_cuda() -> bool {
     }
 }
 
+// The trailing `..Default::default()` below is redundant TODAY, which is
+// precisely why clippy objects and precisely why it stays: it is what makes
+// the next field added to WorkerConfig a non-event here instead of a build
+// break, and this binary is the example embedders copy.
+#[allow(clippy::needless_update)]
 async fn resolve_config() -> WorkerConfig {
     let dir = node_dir();
     WorkerConfig {
@@ -130,6 +135,8 @@ async fn resolve_config() -> WorkerConfig {
         // This binary IS the crate, so its own version is the right answer.
         client_version: None,
         events: None, // headless: the log IS the surface
+        // Absorbs any field added later; see WorkerConfig's Default impl.
+        ..Default::default()
     }
 }
 

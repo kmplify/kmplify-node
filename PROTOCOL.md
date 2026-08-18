@@ -46,6 +46,15 @@ Consumer ──HTTP──► Gateway ◄──WebSocket (outbound)── Provide
    data-residency preference — not an attestation, and not on its own a DSGVO
    compliance guarantee. Surfaces that expose it must say so. Requests that
    ask for EU fail closed: `"XX"` is never treated as EU.
+   **`worker_version` (v2.7).** The build of THIS crate, always, alongside
+   `version`. When a host application embeds the worker (the KMPLIFY desktop
+   app), `version` reports the host's own release and therefore cannot say
+   which worker is inside it: two installs reporting an identical `version`
+   may carry different protocol support. `worker_version` answers that
+   directly. Sent as its own key rather than folded into `version` because
+   gateways truncate that field to 32 characters; gateways that do not know
+   the key ignore it.
+
 3. Heartbeat: gateway sends `{"type":"ping"}` every 20s; worker answers
    `{"type":"pong"}`. Two missed pongs → node marked offline, in-flight jobs
    rescheduled to other nodes.
