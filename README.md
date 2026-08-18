@@ -23,6 +23,9 @@ decision anyone should make about a binary they cannot read.
 - **Serves inference** from a local OpenAI-compatible endpoint (Ollama, vLLM,
   LiteLLM, TGI, llama.cpp) to consumers on the fabric. Prompts and responses
   pass through your machine and the model runs on your hardware.
+- **Runs on the GPU you have.** NVIDIA (CUDA), AMD (ROCm), Intel (oneAPI) and
+  Apple Silicon (Metal) are detected and reported distinctly, with the right
+  container flags per vendor. See the matrix below.
 - **Advertises honestly**: real GPU model and VRAM, physical cores rather than
   threads, cgroup limits rather than the host's numbers when containerised.
 - **Optionally hosts container sessions** (vLLM, ComfyUI, Ollama) on your GPU.
@@ -30,6 +33,34 @@ decision anyone should make about a binary they cannot read.
   that you have the hardware.
 - **Enforces your ceilings**: CPU, VRAM, RAM and disk caps you set are applied
   on this side, not requested politely from the other.
+
+### Hardware support
+
+| Platform | Accelerator | Serves inference | Hosts container sessions |
+|---|---|---|---|
+| Linux | NVIDIA / CUDA | yes | yes (`--gpus all`) |
+| Linux | AMD / ROCm | yes | yes (`/dev/kfd` + `/dev/dri`) |
+| Linux | Intel / oneAPI | yes | yes (`/dev/dri`) |
+| Windows | NVIDIA / CUDA | yes | yes, native Linux containers only |
+| Windows | AMD / ROCm | yes | HIP SDK dependent |
+| macOS | Apple Silicon / Metal | yes | **no** |
+| any | CPU only | yes (small models) | yes (CPU templates) |
+
+Two honest caveats. **macOS cannot host sessions at all**: the Docker daemon
+runs in a VM with no GPU passthrough, so a Mac lends inference through its
+local model server and the node refuses session work rather than accepting it
+and running on CPU at minutes per answer. And **vLLM templates need native
+Linux**, not WSL2, because vLLM's V1 engine requires UVA.
+
+Detection is automatic. `KMPLIFY_GPU_BACKEND=cuda|rocm|oneapi|metal|cpu`
+overrides it, and `kmplify-node check` prints every accelerator it found plus
+which one goes on the wire.
+
+CUDA and Metal are verified on real hardware. The ROCm and oneAPI paths are
+written against the documented output of `rocm-smi`, `amd-smi` and `xpu-smi`
+and unit-tested on captured samples, but have not yet run on an AMD or Intel
+GPU. If you have one, `kmplify-node check` output is the most useful bug
+report you can file.
 
 ## What it does not do
 
@@ -120,7 +151,8 @@ configure it the same way.
 | `PROVIDER_APPROVAL_MODE` | `auto` | `manual` holds each session for your approval. |
 | `COLIBRI_BASE` | *empty* | Optional second upstream for MoE streaming. |
 | `KMPLIFY_NODE_DIR` | `$XDG_CONFIG_HOME/kmplify-node` | Where the node identity is stored. |
-| `KMPLIFY_CUDA` | autodetect | Force CUDA detection on (`1`) or off (`0`). |
+| `KMPLIFY_GPU_BACKEND` | autodetect | Force the accelerator: `cuda`, `rocm`, `oneapi`, `metal`, `cpu`. |
+| `KMPLIFY_CUDA` | autodetect | Older CUDA-only override (`1`/`0`). Still honoured. |
 | `KMPLIFY_FABRIC_EXTRA_IMAGE_PINS` | *empty* | Extra `template=repository` image pins. See below. |
 
 `PROVIDER_COUNTRY` is self-declared and the gateway cannot verify it. It exists

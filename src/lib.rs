@@ -15,6 +15,7 @@
 //! the operator's view.
 
 pub mod fabric_worker;
+pub mod gpu;
 pub mod hostcpu;
 pub mod proc;
 
