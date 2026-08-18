@@ -1,0 +1,54 @@
+[package]
+name = "kmplify-node"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "Provider agent for the KMPLIFY GPU Fabric: lend a machine's GPU, CPU and local models to a fabric over one outbound connection."
+authors = ["KMPLIFY"]
+license = "Apache-2.0"
+repository = "https://github.com/kmplify/kmplify-node"
+homepage = "https://kmplify.io"
+readme = "README.md"
+keywords = ["gpu", "inference", "ollama", "peer-to-peer", "self-hosted"]
+categories = ["command-line-utilities", "network-programming"]
+
+[lib]
+name = "kmplify_node"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kmplify-node"
+path = "src/main.rs"
+
+[dependencies]
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+    "process",
+    "time",
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "sync",
+    "io-util",
+    "signal",
+    "fs",
+] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# rustls rather than the platform TLS stack so a static-ish binary can be
+# dropped onto a headless box without chasing OpenSSL versions.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls",
+] }
+# Host CPU/RAM telemetry. Must be read on the host: inside a container the
+# usual sources describe the container's VM, not the machine whose capacity
+# is being advertised.
+sysinfo = "0.32"
+
+[profile.release]
+codegen-units = 16
+lto = "thin"
+strip = true
