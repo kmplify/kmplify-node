@@ -136,6 +136,37 @@ systemctl enable --now kmplify-node
 container before exiting — a stopped node leaves nothing running on the
 owner's GPU. The unit works unchanged on every systemd distribution.
 
+## When `check` and your driver disagree
+
+`check` asks two different questions about the GPU, and prints both when the
+answers differ:
+
+```
+accelerator
+  advertised : cpu (no accelerator offered to the fabric)
+  installed  : ROCm (AMD) driver tooling is present
+               but its tool did not answer, so nothing is advertised
+               for it. Local inference may still work; the fabric
+               only advertises what it can size and serve.
+```
+
+That is not a bug report, it is a diagnosis. The node found the ROCm stack on
+disk but `rocm-smi` did not return usable output, so it will not promise a
+consumer capacity it cannot size. Usual causes, cheapest first:
+
+- The node's user cannot reach the device. On Linux the account needs the
+  `video` (and often `render`) group; the systemd unit runs as `kmplify`, so
+  it is that user's groups that matter, not yours.
+- The tool is installed but not on the service's PATH. `check` run from your
+  shell and the unit run by systemd do not share an environment.
+- The driver is genuinely broken or mismatched with the kernel, which
+  `rocm-smi` / `nvidia-smi` will say directly if you run it as the node's user.
+
+The reverse case, `advertised` naming a backend that was **NOT DETECTED**,
+means `KMPLIFY_GPU_BACKEND` is forcing something this host does not have. The
+hello frame reports `cpu` in that case rather than a phantom card, because
+the scheduler reads advertised VRAM as capacity.
+
 ## Scope, honestly
 
 - Serves: fabric container sessions (vLLM / ComfyUI / Ollama / echo-test
