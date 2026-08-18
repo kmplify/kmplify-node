@@ -318,6 +318,7 @@ impl Default for WorkerConfig {
             client_version: None,
             approval_mode: "auto".to_string(),
             cuda: false,
+            accelerator: crate::gpu::Backend::Cpu,
             events: None,
         }
     }
@@ -333,6 +334,20 @@ impl Default for WorkerConfig {
 /// own binary and examples), turning every construction site into a run of
 /// field assignments. Left off for readability; revisit if the convention
 /// slips.
+impl WorkerConfig {
+    /// The accelerator this node actually offers.
+    ///
+    /// Resolves the legacy `cuda` flag against the newer `accelerator`
+    /// field so both spellings agree: an embedder that only knows about
+    /// `cuda` keeps meaning CUDA, and one that sets `accelerator` wins.
+    pub fn accel(&self) -> crate::gpu::Backend {
+        match self.accelerator {
+            crate::gpu::Backend::Cpu if self.cuda => crate::gpu::Backend::Cuda,
+            other => other,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct WorkerConfig {
     pub gateway_url: String,
@@ -390,8 +405,19 @@ pub struct WorkerConfig {
     /// Declared on the hello frame; invitations always bypass the gate.
     pub approval_mode: String,
     /// A working NVIDIA stack was detected on this host (nvidia-smi).
-    /// Advertised to the gateway so CUDA templates schedule here.
+    ///
+    /// Kept because embedders already set it and the gateway already reads
+    /// it; `accelerator` is the field that actually decides behaviour now.
+    /// Leaving this true with `accelerator` unset still means CUDA, so no
+    /// existing caller changed meaning.
     pub cuda: bool,
+    /// Which accelerator this node offers, across vendors.
+    ///
+    /// `Cpu` (the default) combined with `cuda: true` reads as CUDA, which
+    /// is what keeps pre-multi-vendor embedders working unchanged. Set it
+    /// explicitly for anything else: an AMD or Intel host that only sets
+    /// `cuda` would advertise the wrong flags and win sessions it cannot run.
+    pub accelerator: crate::gpu::Backend,
     /// What to report as this build's version on the hello frame.
     ///
     /// `None` reports this crate's version, which is what the standalone
@@ -807,42 +833,6 @@ pub async fn discover(
 /// Total VRAM of GPU 0 in MB via nvidia-smi, or None. The one number the
 /// fabric needs for VRAM-fit filtering — without it this node advertised
 /// `vram_mb: 0` and could never satisfy any consumer's fit check.
-/// The GPU model string ("NVIDIA GeForce RTX 4090"), or None. Shared on the
-/// hello so consumers can pick capacity by hardware in the peer GPU grid —
-/// a product decision superseding the earlier always-"anonymous" stance:
-/// the MODEL is coarse, mass-produced hardware info; node identity and any
-/// geo detail beyond the country code stay unpublished.
-async fn nvidia_gpu_name() -> Option<String> {
-    let out = crate::proc::command("nvidia-smi")
-        .args(["--query-gpu=name", "--format=csv,noheader"])
-        .output()
-        .await
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let name = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()?
-        .trim()
-        .to_string();
-    (!name.is_empty()).then_some(name)
-}
-
-/// Apple Silicon chip name ("Apple M3 Max"), or None.
-async fn apple_chip_name() -> Option<String> {
-    let out = crate::proc::command("sysctl")
-        .args(["-n", "machdep.cpu.brand_string"])
-        .output()
-        .await
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!name.is_empty()).then_some(name)
-}
-
 /// Total VRAM of the first NVIDIA GPU in MB, or `None` without a working
 /// nvidia-smi.
 ///
@@ -852,28 +842,6 @@ async fn apple_chip_name() -> Option<String> {
 pub async fn nvidia_vram_mb() -> Option<u64> {
     let out = crate::proc::command("nvidia-smi")
         .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
-        .output()
-        .await
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()?
-        .trim()
-        .parse::<f64>()
-        .ok()
-        .map(|v| v as u64)
-}
-
-/// VRAM currently in use (nvidia-smi memory.used), or None. Reported with
-/// every pong so the gateway's capacity view tracks what this machine's own
-/// task manager shows — including VRAM eaten by things that are not fabric
-/// sessions at all (games, local inference, browsers).
-async fn nvidia_used_mb() -> Option<u64> {
-    let out = crate::proc::command("nvidia-smi")
-        .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
         .output()
         .await
         .ok()?;
@@ -987,35 +955,22 @@ fn rfc3339_secs(t: &str) -> Option<i64> {
 /// "Apple M3 Max") is shared so consumers can pick capacity by hardware in
 /// the peer GPU grid. Node identity stays anonymous — a mass-produced card
 /// model plus a country code identifies nobody.
-async fn gpu_info(cuda: bool, max_shared_vram_mb: Option<u64>) -> Value {
-    if cuda {
-        let vram = nvidia_vram_mb().await.unwrap_or(0);
-        // Advertise only what the operator agreed to lend. Never MORE than
-        // the card holds, whatever the setting says — over-advertising would
-        // win the node sessions it then cannot run.
-        let vram = match max_shared_vram_mb {
-            Some(cap) if cap > 0 => vram.min(cap),
-            _ => vram,
-        };
-        let name = nvidia_gpu_name()
-            .await
-            .unwrap_or_else(|| "NVIDIA GPU".to_string());
-        return json!({ "backend": "cuda", "name": name, "vram_mb": vram });
-    }
-    if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
-        let name = apple_chip_name()
-            .await
-            .unwrap_or_else(|| "Apple Silicon".to_string());
-        // Advertise what the GPU can actually address (iogpu limit / ~75%
-        // of unified memory), capped by the operator's ceiling — not the
-        // full RAM, which the GPU can never hold.
-        let mut vram = gpu_addressable_mb();
-        if let Some(cap) = max_shared_vram_mb {
-            if cap > 0 {
-                vram = vram.min(cap);
-            }
+async fn gpu_info(backend: crate::gpu::Backend, max_shared_vram_mb: Option<u64>) -> Value {
+    use crate::gpu::Backend;
+    if backend != Backend::Cpu {
+        if let Some(g) = crate::gpu::probe(backend).await {
+            // Advertise only what the operator agreed to lend, and never
+            // MORE than the card holds whatever the setting says:
+            // over-advertising wins the node sessions it cannot then run.
+            let vram = match max_shared_vram_mb {
+                Some(cap) if cap > 0 => g.total_mb.min(cap),
+                _ => g.total_mb,
+            };
+            return json!({ "backend": g.backend.as_str(), "name": g.name, "vram_mb": vram });
         }
-        return json!({ "backend": "metal", "name": name, "vram_mb": vram });
+        // Configured for an accelerator the probe cannot see. Report CPU
+        // rather than a card with 0 MB: the scheduler treats vram_mb as
+        // capacity, and a phantom GPU attracts work this host cannot do.
     }
     // CPU-only host. The name used to be the literal string "CPU", which is
     // why the peer grid showed a card titled "CPU" with no hardware behind
@@ -1109,9 +1064,17 @@ fn workload_capability(
     inventory_error: Option<&str>,
 ) -> Value {
     let usable = docker_ok && !cfg.workload_templates.is_empty();
+    let accel = cfg.accel();
     let mut caps = json!({
         "enabled": usable,
-        "cuda": cfg.cuda,
+        // Legacy shape: gateways predating multi-vendor read only this, and
+        // for them "GPU" has always meant CUDA. Keep it exactly that narrow
+        // -- claiming true for an AMD card would have such a gateway
+        // schedule CUDA images onto it.
+        "cuda": accel == crate::gpu::Backend::Cuda,
+        // Protocol v2.8: what this node can actually passthrough. A gateway
+        // that understands it can schedule rocm/oneapi templates here.
+        "accelerator": accel.as_str(),
         "templates": if usable { cfg.workload_templates.clone() } else { Vec::new() },
     });
     // The disk the owner agreed to lend, and what is already spent of it.
@@ -1277,6 +1240,15 @@ pub const IMAGE_PINS: &[(&str, &str)] = &[
     ("ollama", "ollama/ollama"),
     ("ollama-cpu", "ollama/ollama"),
     ("echo-test", "traefik/whoami"),
+    // Vendor variants (protocol v2.8). Pinned here ahead of the gateway
+    // cataloguing them: a pin for a template nobody schedules is inert,
+    // whereas a MISSING pin is a refusal at the pull, so the safe order is
+    // pin first, catalogue second. An AMD or Intel host that opts into one
+    // of these gets the same publisher guarantee an NVIDIA host already had.
+    ("vllm-rocm", "rocm/vllm"),
+    ("ollama-rocm", "ollama/ollama"),
+    ("vllm-oneapi", "intel/llm-scaler-vllm"),
+    ("ollama-oneapi", "intel/llm-scaler-vllm"),
 ];
 
 /// Operator-supplied pins, `template=repository` separated by commas.
@@ -1902,7 +1874,30 @@ async fn start_workload(
     let template = frame["template"].as_str().unwrap_or_default().to_string();
     let image = frame["image"].as_str().unwrap_or_default().to_string();
     let port = frame["port"].as_u64().unwrap_or(0);
+    // What the template needs. `accelerator` (v2.8) is authoritative when
+    // present; `cuda: true` is the older spelling of "needs an NVIDIA GPU".
+    // An accelerator name this build does not know fails closed below rather
+    // than degrading to "no requirement".
     let cuda = frame["cuda"].as_bool().unwrap_or(false);
+    let required: Option<crate::gpu::Backend> = match frame["accelerator"].as_str() {
+        Some(s) => {
+            match crate::gpu::Backend::parse(s) {
+                Some(crate::gpu::Backend::Cpu) => None,
+                Some(b) => Some(b),
+                None => {
+                    workload_status(
+                    &sink,
+                    &session,
+                    "error",
+                    &format!("template requires accelerator {s:?}, which this node does not understand"),
+                )
+                .await;
+                    return;
+                }
+            }
+        }
+        None => cuda.then_some(crate::gpu::Backend::Cuda),
+    };
     // How long this template may take to answer. Sent per-template because
     // the flat 120s was fatal for self-bootstrapping images (ComfyUI copies
     // its whole tree into /root on first start): the container was killed
@@ -1951,9 +1946,38 @@ async fn start_workload(
         .await;
         return;
     }
-    if cuda && !cfg.cuda {
-        workload_status(&sink, &session, "error", "node has no CUDA GPU").await;
-        return;
+    let accel = cfg.accel();
+    if let Some(need) = required {
+        if need != accel {
+            workload_status(
+                &sink,
+                &session,
+                "error",
+                &format!(
+                    "template needs {} but this node offers {}",
+                    need.as_str(),
+                    accel.as_str()
+                ),
+            )
+            .await;
+            return;
+        }
+        if !accel.hosts_container_sessions() {
+            // Apple Silicon is the case: real GPU, serves inference well,
+            // but macOS has no passthrough into the Docker VM, so a session
+            // scheduled here would silently run on CPU.
+            workload_status(
+                &sink,
+                &session,
+                "error",
+                &format!(
+                    "{} cannot expose a GPU to a container on this platform",
+                    accel.as_str()
+                ),
+            )
+            .await;
+            return;
+        }
     }
 
     let name = container_name(&session);
@@ -2080,9 +2104,10 @@ async fn start_workload(
         "-p".into(),
         format!("127.0.0.1:0:{port}"),
     ];
-    if cuda {
-        args.push("--gpus".into());
-        args.push("all".into());
+    if let Some(need) = required {
+        // Per vendor: --gpus all for CUDA, the kfd/dri devices for ROCm,
+        // the render node for Intel. None of them widen the sandbox.
+        args.extend(need.docker_args());
     }
     // Optional named-volume mounts from the template (e.g. Ollama's model
     // store, ComfyUI's install and its models), so a re-launched session
@@ -2209,13 +2234,12 @@ async fn start_workload(
     // notably WSL2 with a half-installed toolkit — while the driver is
     // still invisible INSIDE the container). Verify with nvidia-smi in the
     // container and fail loudly when the GPU is not actually there.
-    if cuda {
+    if let Some(probe_cmd) = required.and_then(|b| b.container_probe()) {
         let mut gpu_ok = false;
         for _ in 0..5 {
-            let probe = crate::proc::command("docker")
-                .args(["exec", &name, "nvidia-smi", "-L"])
-                .output()
-                .await;
+            let mut argv: Vec<&str> = vec!["exec", &name];
+            argv.extend_from_slice(probe_cmd);
+            let probe = crate::proc::command("docker").args(&argv).output().await;
             if matches!(&probe, Ok(o) if o.status.success()) {
                 gpu_ok = true;
                 break;
@@ -3019,7 +3043,7 @@ async fn session(
         // Per-model upstream overrides ({model: "colibri"}, protocol v2.5).
         // Empty for single-upstream nodes; older gateways ignore the key.
         "engines": engines,
-        "gpu": gpu_info(cfg.cuda, cfg.max_shared_vram_mb).await,
+        "gpu": gpu_info(cfg.accel(), cfg.max_shared_vram_mb).await,
         "workloads": workload_capability(
             cfg, docker_live, disk_live, &images_live, inventory_err.as_deref(),
         ),
@@ -3156,9 +3180,9 @@ async fn session(
         let telemetry = telemetry.clone();
         let client = probe_client.clone();
         let base = cfg.ollama_base.clone();
-        let cuda = cfg.cuda;
+        let accel = cfg.accel();
         tokio::spawn(async move {
-            let used = if cuda { nvidia_used_mb().await } else { None };
+            let used = crate::gpu::used_mb(accel).await;
             let resident = loaded_models(&client, &base).await;
             let names = local_models(&client, &base).await;
             let (disk, imgs, err) = sample_inventory().await;
@@ -3282,9 +3306,9 @@ async fn session(
                             let telemetry = telemetry.clone();
                             let client = probe_client.clone();
                             let base = cfg.ollama_base.clone();
-                            let cuda = cfg.cuda;
+                            let accel = cfg.accel();
                             tokio::spawn(async move {
-                                let used = if cuda { nvidia_used_mb().await } else { None };
+                                let used = crate::gpu::used_mb(accel).await;
                                 let resident = loaded_models(&client, &base).await;
                                 let names = local_models(&client, &base).await;
                                 let dok = docker_ok().await;

@@ -46,6 +46,22 @@ Consumer ──HTTP──► Gateway ◄──WebSocket (outbound)── Provide
    data-residency preference — not an attestation, and not on its own a DSGVO
    compliance guarantee. Surfaces that expose it must say so. Requests that
    ask for EU fail closed: `"XX"` is never treated as EU.
+   **Accelerators beyond CUDA (v2.8).** `gpu.backend` may now be `cuda`,
+   `rocm`, `oneapi` (Intel Level Zero), `metal` or `cpu`, and the hello's
+   `workloads` block carries `accelerator` alongside the legacy `cuda`
+   boolean. `cuda` stays exactly as narrow as it always was, true only for
+   NVIDIA, so a gateway predating this never schedules a CUDA image onto an
+   AMD card. A gateway that understands `accelerator` can schedule
+   vendor-specific templates by setting `accelerator` on `workload_start`;
+   absent that field the older `cuda: true` still means "needs NVIDIA".
+
+   Nodes refuse a session whose required accelerator is not the one they
+   offer, and refuse an accelerator name they do not recognise rather than
+   treating it as "no requirement". `metal` never hosts sessions: macOS has
+   no GPU passthrough into the Docker VM, so an Apple node is an inference
+   provider only, and says so instead of accepting work it would silently
+   run on CPU.
+
    **`worker_version` (v2.7).** The build of THIS crate, always, alongside
    `version`. When a host application embeds the worker (the KMPLIFY desktop
    app), `version` reports the host's own release and therefore cannot say

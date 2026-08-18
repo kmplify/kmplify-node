@@ -20,10 +20,12 @@
 //!   OLLAMA_BASE            host Ollama for model serving (default localhost)
 //!   KMPLIFY_NODE_DIR       identity/credentials dir
 //!                          (default: $XDG_CONFIG_HOME|~/.config /kmplify-node)
-//!   KMPLIFY_CUDA           override CUDA autodetection: 1/0
+//!   KMPLIFY_GPU_BACKEND    force the accelerator: cuda|rocm|oneapi|metal|cpu
+//!   KMPLIFY_CUDA           older CUDA-only override: 1/0
 //!
-//! `kmplify-node check` prints the resolved configuration and probes
-//! (docker, nvidia-smi, Ollama) without connecting — run it first.
+//! `kmplify-node check` prints the resolved configuration, the detected
+//! accelerators and the host probes (docker, vendor SMI tools, the model
+//! server) without connecting — run it first.
 
 use std::path::PathBuf;
 
@@ -72,12 +74,10 @@ async fn probe(cmd: &str, args: &[&str]) -> Option<String> {
     )
 }
 
-async fn detect_cuda() -> bool {
-    match env_opt("KMPLIFY_CUDA").as_deref() {
-        Some("1") => true,
-        Some("0") => false,
-        _ => probe("nvidia-smi", &["-L"]).await.is_some(),
-    }
+/// Which accelerator this host offers. Honours KMPLIFY_GPU_BACKEND and the
+/// older KMPLIFY_CUDA; see kmplify_node::gpu.
+async fn detect_accelerator() -> (kmplify_node::gpu::Backend, Option<kmplify_node::gpu::Gpu>) {
+    kmplify_node::gpu::detect().await
 }
 
 // The trailing `..Default::default()` below is redundant TODAY, which is
@@ -87,6 +87,7 @@ async fn detect_cuda() -> bool {
 #[allow(clippy::needless_update)]
 async fn resolve_config() -> WorkerConfig {
     let dir = node_dir();
+    let (accel, _) = detect_accelerator().await;
     WorkerConfig {
         gateway_url: env_opt("PROVIDER_GATEWAY_URL")
             .unwrap_or_else(|| PUBLIC_FABRIC_URL.to_string()),
@@ -131,7 +132,8 @@ async fn resolve_config() -> WorkerConfig {
             Some("manual") => "manual".to_string(),
             _ => "auto".to_string(),
         },
-        cuda: detect_cuda().await,
+        cuda: accel == kmplify_node::gpu::Backend::Cuda,
+        accelerator: accel,
         // This binary IS the crate, so its own version is the right answer.
         client_version: None,
         events: None, // headless: the log IS the surface
@@ -165,7 +167,50 @@ async fn run_check(cfg: &WorkerConfig) -> i32 {
         "  ceilings   : cpus={:?} vram_mb={:?} disk_gb={:?}",
         cfg.max_shared_cpus, cfg.max_shared_vram_mb, cfg.max_shared_disk_gb
     );
-    println!("  cuda       : {}", cfg.cuda);
+    println!();
+    println!("accelerator");
+    let all = kmplify_node::gpu::detect_all().await;
+    if all.is_empty() {
+        println!("  detected   : none (CPU-only node)");
+    } else {
+        for g in &all {
+            let primary = if g.backend == cfg.accel() {
+                " <- advertised"
+            } else {
+                ""
+            };
+            println!(
+                "  {:<10} : {} ({} MB){}",
+                g.backend.as_str(),
+                g.name,
+                g.total_mb,
+                primary
+            );
+        }
+    }
+    // What actually goes on the wire, said plainly. Forcing a backend the
+    // host does not have is otherwise invisible here: the card list looks
+    // healthy while the node advertises CPU.
+    let advertised = cfg.accel();
+    let found = all.iter().any(|g| g.backend == advertised);
+    if advertised == kmplify_node::gpu::Backend::Cpu {
+        println!("  advertised : cpu (no accelerator offered to the fabric)");
+    } else if found {
+        println!("  advertised : {}", advertised.as_str());
+    } else {
+        println!(
+            "  advertised : {} -- NOT DETECTED on this host, so the hello frame",
+            advertised.as_str()
+        );
+        println!("               will report cpu. Check the override or the driver.");
+    }
+    if !advertised.hosts_container_sessions() && advertised != kmplify_node::gpu::Backend::Cpu {
+        println!(
+            "  note       : {} serves INFERENCE but cannot pass a GPU into a",
+            advertised.as_str()
+        );
+        println!("               container, so this node cannot host sessions.");
+    }
     println!();
     println!("probes");
     let docker = probe("docker", &["version", "--format", "{{.Server.Version}}"]).await;
@@ -176,9 +221,16 @@ async fn run_check(cfg: &WorkerConfig) -> i32 {
     let smi = probe("nvidia-smi", &["-L"]).await;
     println!(
         "  nvidia-smi : {}",
-        smi.clone()
-            .unwrap_or_else(|| "not found (CPU/inference-only node)".into())
+        smi.clone().unwrap_or_else(|| "not found".into())
     );
+    for (bin, args) in [
+        ("rocm-smi", &["--showid"][..]),
+        ("xpu-smi", &["discovery", "-j"][..]),
+    ] {
+        if probe(bin, args).await.is_some() {
+            println!("  {bin:<10} : present");
+        }
+    }
     // Ask the SAME question the worker asks, rather than probing for a sign of
     // life. `/api/version` answering proved nothing: it is Ollama-native, so a
     // vLLM endpoint 404s it — and a 404 is still a response, so the old check
