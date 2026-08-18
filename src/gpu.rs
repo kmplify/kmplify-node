@@ -7,6 +7,29 @@
 //! module makes the vendor a value rather than a boolean, so adding one is a
 //! new [`Backend`] arm instead of a new `if` in five places.
 //!
+//! # Two detectors, on purpose
+//!
+//! There are two questions here that look like one, and answering them with a
+//! single probe is a bug in whichever direction you pick:
+//!
+//! | | [`detect`] | [`detect_installed`] |
+//! |---|---|---|
+//! | asks | is a GPU **usable**, and how big | is a driver stack **installed** |
+//! | how | runs the vendor tool, parses VRAM | filesystem lookups only |
+//! | cost | subprocesses, async | cheap, sync, safe on a UI thread |
+//! | used by | the fabric, advertising capacity | a launcher or installer |
+//!
+//! They can legitimately disagree, and the disagreement is informative rather
+//! than a fault. A host with `nvidia-smi` present but a broken driver is
+//! `Cuda` to one and `Cpu` to the other. Both are right: there IS a CUDA
+//! stack installed, and it CANNOT serve a session right now.
+//!
+//! Collapse them and you get one of two failures. Use the installed answer
+//! for the fabric and the node advertises cards it cannot serve, so sessions
+//! are scheduled onto it and fail after placement. Use the usable answer for
+//! the launcher and one non-zero exit from a vendor tool pushes someone onto
+//! remote GPUs while their own card sits idle.
+//!
 //! Everything here fails soft. A probe that is absent, unreadable, or from a
 //! version whose output we cannot parse returns `None` and the next backend
 //! is tried; the machine ends up CPU-only rather than crashing or, worse,

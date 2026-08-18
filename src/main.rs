@@ -204,6 +204,21 @@ async fn run_check(cfg: &WorkerConfig) -> i32 {
         );
         println!("               will report cpu. Check the override or the driver.");
     }
+    // The two detectors can legitimately disagree, and this is where an
+    // operator meets it: "I installed ROCm, why does it say cpu?". Saying
+    // which question each answered turns a mystery into a next step.
+    let installed = kmplify_node::gpu::detect_installed();
+    if installed != advertised {
+        println!(
+            "  installed  : {} driver tooling is present",
+            installed.label()
+        );
+        if all.iter().all(|g| g.backend != installed) {
+            println!("               but its tool did not answer, so nothing is advertised");
+            println!("               for it. Local inference may still work; the fabric");
+            println!("               only advertises what it can size and serve.");
+        }
+    }
     if !advertised.hosts_container_sessions() && advertised != kmplify_node::gpu::Backend::Cpu {
         println!(
             "  note       : {} serves INFERENCE but cannot pass a GPU into a",

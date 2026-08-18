@@ -58,7 +58,7 @@ fn is_executable(p: &Path) -> bool {
 
 /// Where a helper binary actually is, or `None`.
 ///
-/// Same search as [`resolve`], but it admits failure. Detecting whether a
+/// Same search as `resolve`, but it admits failure. Detecting whether a
 /// vendor's driver tooling is installed is exactly that question, and
 /// answering it by spawning the tool is both slower and wrong: a present but
 /// non-functional `nvidia-smi` still means a CUDA stack is installed.

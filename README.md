@@ -56,6 +56,20 @@ Detection is automatic. `KMPLIFY_GPU_BACKEND=cuda|rocm|oneapi|metal|cpu`
 overrides it, and `kmplify-node check` prints every accelerator it found plus
 which one goes on the wire.
 
+There are deliberately **two** questions being asked, and they can disagree:
+
+- **Is a GPU usable, and how big?** The vendor tool is executed and its VRAM
+  parsed. This is what the node advertises, because advertising capacity to a
+  fabric promises that work can actually land on it.
+- **Is a driver stack installed?** Filesystem lookups only, no subprocess.
+  This is what decides whether local inference is worth attempting at all.
+
+A machine with `nvidia-smi` present but a broken driver answers CUDA to the
+second and CPU to the first, and both answers are right. `check` says so
+explicitly when they differ, so "I installed ROCm and it still says cpu" has a
+visible cause rather than being a mystery: the stack is there, its tool did
+not answer, and the fabric only advertises what it can size and serve.
+
 CUDA and Metal are verified on real hardware. The ROCm and oneAPI paths are
 written against the documented output of `rocm-smi`, `amd-smi` and `xpu-smi`
 and unit-tested on captured samples, but have not yet run on an AMD or Intel
