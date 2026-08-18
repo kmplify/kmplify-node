@@ -18,6 +18,16 @@ pub mod fabric_worker;
 pub mod hostcpu;
 pub mod proc;
 
+/// This crate's NOTICE, compiled in.
+///
+/// Apache-2.0 section 4(d) obliges anything that redistributes this code to
+/// carry it, and an embedder shipping an installer is exactly that. Exposed
+/// as a constant so the obligation can be met from the crate itself rather
+/// than by copying a file out of a checkout: consumed through a git or
+/// registry dependency there IS no checkout to copy from, and a hand-kept
+/// copy is one that can silently stop matching what is actually linked.
+pub const NOTICE: &str = include_str!("../NOTICE");
+
 /// The public KMPLIFY fabric, used when `PROVIDER_GATEWAY_URL` is unset.
 ///
 /// Pointing this at your own gateway is a supported, first-class setup: the
