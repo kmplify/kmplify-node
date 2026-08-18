@@ -56,6 +56,48 @@ fn is_executable(p: &Path) -> bool {
     }
 }
 
+/// Where a helper binary actually is, or `None`.
+///
+/// Same search as [`resolve`], but it admits failure. Detecting whether a
+/// vendor's driver tooling is installed is exactly that question, and
+/// answering it by spawning the tool is both slower and wrong: a present but
+/// non-functional `nvidia-smi` still means a CUDA stack is installed.
+pub fn find(program: impl AsRef<OsStr>) -> Option<PathBuf> {
+    let program = program.as_ref();
+    if Path::new(program).components().count() > 1 {
+        let p = PathBuf::from(program);
+        return is_executable(&p).then_some(p);
+    }
+    // On Windows the executable extension is not part of the name callers use.
+    let names: Vec<OsString> = if cfg!(windows) {
+        let mut n = program.to_os_string();
+        n.push(".exe");
+        vec![n, program.to_os_string()]
+    } else {
+        vec![program.to_os_string()]
+    };
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(paths) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&paths));
+    }
+    dirs.extend(EXTRA_BIN_DIRS.iter().map(PathBuf::from));
+    // Docker Desktop's per-user install, which has no fixed prefix.
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join(".docker/bin"));
+    }
+
+    for dir in dirs {
+        for name in &names {
+            let candidate = dir.join(name);
+            if is_executable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 /// Where a GUI-launched app should look for a helper binary.
 ///
 /// PATH first — a user who put their own docker ahead of Docker Desktop's
@@ -63,31 +105,9 @@ fn is_executable(p: &Path) -> bool {
 /// bare name so the OS produces its own "not found" rather than us inventing
 /// one.
 fn resolve(program: &OsStr) -> OsString {
-    if Path::new(program).components().count() > 1 {
-        return program.to_os_string(); // already a path; respect it
-    }
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let candidate = dir.join(program);
-            if is_executable(&candidate) {
-                return candidate.into_os_string();
-            }
-        }
-    }
-    for dir in EXTRA_BIN_DIRS {
-        let candidate = PathBuf::from(dir).join(program);
-        if is_executable(&candidate) {
-            return candidate.into_os_string();
-        }
-    }
-    // Docker Desktop's per-user install, which has no fixed prefix.
-    if let Some(home) = std::env::var_os("HOME") {
-        let candidate = PathBuf::from(home).join(".docker/bin").join(program);
-        if is_executable(&candidate) {
-            return candidate.into_os_string();
-        }
-    }
-    program.to_os_string()
+    find(program)
+        .map(PathBuf::into_os_string)
+        .unwrap_or_else(|| program.to_os_string())
 }
 
 /// <https://learn.microsoft.com/windows/win32/procthread/process-creation-flags>
