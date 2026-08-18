@@ -66,7 +66,7 @@ else
     [ -n "${GITHUB_TOKEN:-}" ] && auth="-H \"Authorization: Bearer $GITHUB_TOKEN\""
     VERSION="$(eval curl -fsSL $auth "https://api.github.com/repos/$REPO/releases/latest" \
       | tr ',' '\n' | grep -m1 '"tag_name"' | cut -d'"' -f4)" || true
-    [ -n "$VERSION" ] || fail "could not resolve the latest release of $REPO. If the repository is private, set GITHUB_TOKEN; otherwise pass --version vX.Y.Z"
+    [ -n "$VERSION" ] || fail "could not resolve the latest release of $REPO. If none has been published yet, build from source (see README.md) or pass --version vX.Y.Z"
   fi
   BASE="https://github.com/$REPO/releases/download/$VERSION"
 fi
