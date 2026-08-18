@@ -1269,6 +1269,15 @@ pub const IMAGE_PINS: &[TemplatePin] = &[
         repository: "yanwk/comfyui-boot",
         accelerator: Backend::Cuda,
     },
+    // Same engine as `comfyui`, separate CONSENT lane: a provider may host
+    // headless API sessions for automation without inviting interactive
+    // users, or the reverse. Sharing the repository is the point -- one
+    // publisher guarantee, one image cache, one models volume on the host.
+    TemplatePin {
+        template: "comfyui-api",
+        repository: "yanwk/comfyui-boot",
+        accelerator: Backend::Cuda,
+    },
     TemplatePin {
         template: "ollama",
         repository: "ollama/ollama",
@@ -4155,6 +4164,10 @@ mod template_accelerator_tests {
     fn a_host_offers_its_own_vendor_plus_cpu_templates() {
         let cuda = hostable_templates(Backend::Cuda);
         assert!(cuda.contains(&"vllm-openai"));
+        assert!(
+            cuda.contains(&"comfyui-api"),
+            "the programmatic lane rides with the UI one"
+        );
         assert!(
             cuda.contains(&"ollama-cpu"),
             "cpu templates run on gpu hosts too"
