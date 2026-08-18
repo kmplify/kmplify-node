@@ -1,0 +1,146 @@
+# Build and publish kmplify-node for every platform an operator installs on,
+# on each version tag: static musl binaries for Linux (x86_64 + aarch64, the
+# two shapes a PC/VPS/server fleet actually has), both macOS architectures,
+# and Windows. Attaches SHA256SUMS (what scripts/install.sh verifies against)
+# plus the systemd unit and env template the installer's --service path
+# fetches, and pushes the multi-arch inference-only runtime image to
+# ghcr.io/kmplify/kmplify-node.
+#
+# The release is created as a draft and published only when every artifact is
+# attached, so an installer running mid-release can never see a half-uploaded
+# asset list.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # musl + rustls: fully static, zero runtime deps. If the kernel
+          # runs, the binary runs, which is the whole 24/7 fleet story.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          # Native ARM runner rather than cross-compiling: free for public
+          # repos, and a native build cannot lie about linker behaviour.
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: musl linker
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Name the artifact after its target
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          case "${{ matrix.target }}" in
+            *windows*) cp "target/${{ matrix.target }}/release/kmplify-node.exe" "out/kmplify-node-${{ matrix.target }}.exe" ;;
+            *)         cp "target/${{ matrix.target }}/release/kmplify-node"     "out/kmplify-node-${{ matrix.target }}" ;;
+          esac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: out/*
+          if-no-files-found: error
+
+  # Inference-only runtime image, one manifest covering amd64 + arm64, built
+  # from the SAME binaries the release ships rather than compiled a second
+  # time (a second compile is a second chance to differ from what SHA256SUMS
+  # attests).
+  docker:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*-linux-musl
+          path: artifacts
+      - name: Lay out per-arch binaries for the Dockerfile
+        run: |
+          set -euo pipefail
+          mkdir -p dist/amd64 dist/arm64
+          cp artifacts/bin-x86_64-unknown-linux-musl/kmplify-node-x86_64-unknown-linux-musl dist/amd64/kmplify-node
+          cp artifacts/bin-aarch64-unknown-linux-musl/kmplify-node-aarch64-unknown-linux-musl dist/arm64/kmplify-node
+          chmod 755 dist/*/kmplify-node
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: packaging/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/kmplify/kmplify-node:${{ github.ref_name }}
+            ghcr.io/kmplify/kmplify-node:latest
+
+  release:
+    needs: [build, docker]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: artifacts
+          merge-multiple: true
+      - name: Assemble assets and SHA256SUMS
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cp artifacts/kmplify-node-* release/
+          # What install.sh --service fetches, versioned with the binaries so
+          # unit and binary can never skew.
+          cp packaging/kmplify-node.service release/
+          cp packaging/kmplify-node.env.example release/
+          cd release
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      # Draft first. `install.sh` resolves `releases/latest` and then fetches
+      # SHA256SUMS, so a release that exists while its assets are still
+      # uploading is a real failure window: the installer would find the
+      # version, fail to verify it, and refuse to install. A draft is not
+      # "latest", so that window cannot be observed.
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          draft: true
+      # Everything is attached by here; flip it live in one step.
+      - name: Publish once every asset is attached
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${{ github.ref_name }}" --draft=false --repo "${{ github.repository }}"
