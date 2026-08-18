@@ -41,13 +41,32 @@ because vLLM's V1 engine needs UVA and WSL2's GPU paravirtualization lacks
 it. A native-Linux CUDA box running this binary is the highest-value kind of
 node a fabric can have.
 
+## Install
+
+The fast path, which fetches the release binary for this machine, verifies
+it against SHA256SUMS, installs the systemd unit and env template, and runs
+the preflight:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kmplify/kmplify-node/main/scripts/install.sh | sudo sh -s -- --service
+```
+
+Then edit `/etc/kmplify-node.env` (ceilings, templates, country) and:
+
+```sh
+systemctl enable --now kmplify-node
+```
+
+An inference-only node can instead run as a container; see "Docker" below.
+
 ## Build
 
 ```sh
 # Native (any OS, for development):
 cargo build --release
 
-# Fully-static Linux release (needs only Docker):
+# Fully-static Linux release (needs only Docker; builds the host's
+# architecture, x86_64 or aarch64):
 docker build -f packaging/Dockerfile.node-build -o dist-node .
 # -> dist-node/kmplify-node
 ```
@@ -81,6 +100,27 @@ loudly instead of deploying a broken node:
 ```sh
 kmplify-node check
 ```
+
+## Docker (inference-only)
+
+The published image serves the host's models but cannot host container
+sessions: a session host must drive the host's Docker daemon and see its
+GPU, which a containerised worker cannot. The worker detects that and
+advertises itself inference-only, so this never promises the fabric
+something the node cannot deliver.
+
+```sh
+docker run -d --name kmplify-node --restart unless-stopped \
+  --network host \
+  -v kmplify-node-data:/data \
+  -e PROVIDER_COUNTRY=DE \
+  ghcr.io/kmplify/kmplify-node
+```
+
+`--network host` (Linux) lets the default `OLLAMA_BASE` reach the host's
+Ollama; elsewhere set `OLLAMA_BASE=http://host.docker.internal:11434`. The
+volume keeps the node's anonymous identity across container replacements;
+without it every recreation joins the fabric as a brand-new peer.
 
 ## Run as a service
 

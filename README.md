@@ -44,15 +44,36 @@ unless you separately link it for payouts.
 
 ## Install
 
+One line, on Linux (x86_64/aarch64) and macOS. It downloads the release
+binary for this machine, verifies it against the release's SHA256SUMS, and
+ends with the `check` preflight:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kmplify/kmplify-node/main/scripts/install.sh | sh
+```
+
+For a 24/7 server or VPS, let it also set up the systemd service (creates
+the `kmplify` user, installs the unit and `/etc/kmplify-node.env`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kmplify/kmplify-node/main/scripts/install.sh | sudo sh -s -- --service
+```
+
+As a container (inference-only; container sessions need the binary on the
+host, where it can drive Docker and see the GPU):
+
+```bash
+docker run -d --name kmplify-node --network host -v kmplify-node-data:/data ghcr.io/kmplify/kmplify-node
+```
+
+Or from source:
+
 ```bash
 cargo install --git https://github.com/kmplify/kmplify-node
 ```
 
-Or build it:
-
-```bash
-git clone https://github.com/kmplify/kmplify-node && cd kmplify-node && cargo build --release
-```
+Prebuilt binaries, their SHA256SUMS, the systemd unit and the env template
+are attached to every [GitHub release](https://github.com/kmplify/kmplify-node/releases).
 
 ## Run
 
