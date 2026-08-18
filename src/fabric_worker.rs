@@ -17,6 +17,7 @@
 //! Everything arriving over the socket is input to be validated, clamped or
 //! refused, never an instruction to carry out.
 
+use crate::gpu::Backend;
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -1228,27 +1229,103 @@ fn is_fabric_volume(name: &str, target: &str) -> bool {
 /// ComfyUI template was repinned cu124 to cu126 in flight, and a node pinned
 /// to the exact string would have refused every session until it was rebuilt.
 /// The tag and digest are free, the publisher is not.
+/// What this build knows about a workload template: the image publisher it
+/// is allowed to run, and the accelerator that image needs.
+///
+/// One table rather than two keyed by the same ids, because the second table
+/// is where the drift starts. An embedder deciding which templates to offer
+/// and the node deciding which image may run are asking about the same row.
+pub struct TemplatePin {
+    pub template: &'static str,
+    /// The image REPOSITORY, never a full reference: see IMAGE_PINS.
+    pub repository: &'static str,
+    /// The GPU stack the image needs. `Cpu` runs anywhere Docker does.
+    pub accelerator: Backend,
+}
+
 /// Public so an embedder can ASSERT against it rather than hand-copying it.
 /// The KMPLIFY desktop app advertises its own default template list, and
 /// nothing could check the two agreed: a template it offered but this table
 /// did not pin would be scheduled and then refused at the pull, failing the
 /// session after placement instead of never being placed.
-pub const IMAGE_PINS: &[(&str, &str)] = &[
-    ("vllm-openai", "vllm/vllm-openai"),
-    ("vllm-openai-lmcache", "lmcache/vllm-openai"),
-    ("comfyui", "yanwk/comfyui-boot"),
-    ("ollama", "ollama/ollama"),
-    ("ollama-cpu", "ollama/ollama"),
-    ("echo-test", "traefik/whoami"),
-    // Vendor variants (protocol v2.8). Pinned here ahead of the gateway
-    // cataloguing them: a pin for a template nobody schedules is inert,
-    // whereas a MISSING pin is a refusal at the pull, so the safe order is
-    // pin first, catalogue second. An AMD or Intel host that opts into one
-    // of these gets the same publisher guarantee an NVIDIA host already had.
-    ("vllm-rocm", "rocm/vllm"),
-    ("ollama-rocm", "ollama/ollama"),
-    ("vllm-oneapi", "intel/llm-scaler-vllm"),
+///
+/// The value is a REPOSITORY, not a full reference: the gateway may bump a
+/// tag (cu124 -> cu126 happened once already) or pin a digest without every
+/// deployed node refusing the session, but it can never substitute a
+/// different publisher. The tag and digest are free, the publisher is not.
+pub const IMAGE_PINS: &[TemplatePin] = &[
+    TemplatePin {
+        template: "vllm-openai",
+        repository: "vllm/vllm-openai",
+        accelerator: Backend::Cuda,
+    },
+    TemplatePin {
+        template: "vllm-openai-lmcache",
+        repository: "lmcache/vllm-openai",
+        accelerator: Backend::Cuda,
+    },
+    TemplatePin {
+        template: "comfyui",
+        repository: "yanwk/comfyui-boot",
+        accelerator: Backend::Cuda,
+    },
+    TemplatePin {
+        template: "ollama",
+        repository: "ollama/ollama",
+        accelerator: Backend::Cuda,
+    },
+    TemplatePin {
+        template: "ollama-cpu",
+        repository: "ollama/ollama",
+        accelerator: Backend::Cpu,
+    },
+    TemplatePin {
+        template: "echo-test",
+        repository: "traefik/whoami",
+        accelerator: Backend::Cpu,
+    },
+    // Vendor variants. Pinned here ahead of a host ever running one: a pin
+    // for a template nobody schedules is inert, whereas a MISSING pin is a
+    // refusal at the pull, so the safe order is pin first, catalogue second.
+    TemplatePin {
+        template: "vllm-rocm",
+        repository: "rocm/vllm",
+        accelerator: Backend::Rocm,
+    },
+    TemplatePin {
+        template: "ollama-rocm",
+        repository: "ollama/ollama",
+        accelerator: Backend::Rocm,
+    },
+    TemplatePin {
+        template: "vllm-oneapi",
+        repository: "intel/llm-scaler-vllm",
+        accelerator: Backend::OneApi,
+    },
 ];
+
+/// The accelerator a known template needs, or `None` for one this build has
+/// never heard of (including operator-supplied extra pins, which carry no
+/// accelerator).
+pub fn template_accelerator(template: &str) -> Option<Backend> {
+    IMAGE_PINS
+        .iter()
+        .find(|p| p.template == template)
+        .map(|p| p.accelerator)
+}
+
+/// Templates a host with this accelerator could actually host.
+///
+/// CPU templates are included for every backend: they need no passthrough,
+/// so they run anywhere Docker does, including on a Mac where the GPU cannot
+/// be reached from a container at all.
+pub fn hostable_templates(backend: Backend) -> Vec<&'static str> {
+    IMAGE_PINS
+        .iter()
+        .filter(|p| p.accelerator == Backend::Cpu || p.accelerator == backend)
+        .map(|p| p.template)
+        .collect()
+}
 
 /// Operator-supplied pins, `template=repository` separated by commas.
 ///
@@ -1306,7 +1383,7 @@ pub fn image_allowed_for(template: &str, image: &str) -> bool {
     let repo = image_repository(image);
     IMAGE_PINS
         .iter()
-        .any(|(t, pinned)| *t == template && repo == *pinned)
+        .any(|p| p.template == template && repo == p.repository)
         || extra_image_pins()
             .iter()
             .any(|(t, pinned)| t == template && &repo == pinned)
@@ -1932,8 +2009,8 @@ async fn start_workload(
              (expected {:?})",
             IMAGE_PINS
                 .iter()
-                .find(|(t, _)| *t == template)
-                .map(|(_, repo)| *repo)
+                .find(|p| p.template == template)
+                .map(|p| p.repository)
                 .unwrap_or("no pin for this template"),
         ));
         workload_status(
@@ -3817,6 +3894,7 @@ mod volume_rule_tests {
 #[cfg(test)]
 mod image_pin_tests {
     use super::{image_allowed_for, image_repository, IMAGE_PINS};
+    use crate::gpu::Backend;
 
     #[test]
     fn repository_survives_every_spelling_of_docker_hub() {
@@ -3902,7 +3980,15 @@ mod image_pin_tests {
     /// unmatchable, since the left side of the comparison never has one.
     #[test]
     fn pin_table_holds_repositories_only() {
-        for (template, repo) in IMAGE_PINS {
+        for p in IMAGE_PINS {
+            let (template, repo) = (p.template, p.repository);
+            // Metal can never host a container session, so a template
+            // requiring it could only ever be refused.
+            assert_ne!(
+                p.accelerator,
+                Backend::Metal,
+                "{template} pins an unhostable accelerator"
+            );
             assert!(!repo.contains('@'), "{template} pins a digest: {repo}");
             assert!(
                 !repo.rsplit('/').next().unwrap_or(repo).contains(':'),
@@ -4054,5 +4140,76 @@ mod host_memory_tests {
     #[test]
     fn gpu_ceiling_never_exceeds_installed_ram() {
         assert!(gpu_addressable_mb() <= host_ram_mb());
+    }
+}
+
+#[cfg(test)]
+mod template_accelerator_tests {
+    use super::{hostable_templates, template_accelerator, IMAGE_PINS};
+    use crate::gpu::Backend;
+
+    /// What an embedder asks before deciding what to advertise. Offering a
+    /// template this host cannot serve is worse than offering none: the
+    /// gateway places a session on it and the node then refuses.
+    #[test]
+    fn a_host_offers_its_own_vendor_plus_cpu_templates() {
+        let cuda = hostable_templates(Backend::Cuda);
+        assert!(cuda.contains(&"vllm-openai"));
+        assert!(
+            cuda.contains(&"ollama-cpu"),
+            "cpu templates run on gpu hosts too"
+        );
+        assert!(!cuda.contains(&"vllm-rocm"));
+
+        let rocm = hostable_templates(Backend::Rocm);
+        assert!(rocm.contains(&"vllm-rocm") && rocm.contains(&"ollama-rocm"));
+        assert!(!rocm.contains(&"vllm-openai"));
+
+        let intel = hostable_templates(Backend::OneApi);
+        assert!(intel.contains(&"vllm-oneapi"));
+        assert!(!intel.contains(&"vllm-rocm") && !intel.contains(&"vllm-openai"));
+    }
+
+    /// A Mac has a real GPU and still cannot pass it into a container, so it
+    /// may only ever offer the CPU templates.
+    #[test]
+    fn metal_and_cpu_hosts_offer_only_cpu_templates() {
+        for b in [Backend::Metal, Backend::Cpu] {
+            let offered = hostable_templates(b);
+            assert!(
+                !offered.is_empty(),
+                "{b:?} should still offer cpu templates"
+            );
+            for t in &offered {
+                assert_eq!(
+                    template_accelerator(t),
+                    Some(Backend::Cpu),
+                    "{b:?} offered {t}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_templates_have_no_accelerator() {
+        assert_eq!(template_accelerator("not-a-template"), None);
+        assert_eq!(template_accelerator(""), None);
+    }
+
+    /// Every template a host may offer must also be pinned, or the session is
+    /// placed and then refused at the pull.
+    #[test]
+    fn everything_offerable_is_pinned() {
+        for b in [
+            Backend::Cuda,
+            Backend::Rocm,
+            Backend::OneApi,
+            Backend::Metal,
+            Backend::Cpu,
+        ] {
+            for t in hostable_templates(b) {
+                assert!(IMAGE_PINS.iter().any(|p| p.template == t), "{t} unpinned");
+            }
+        }
     }
 }
