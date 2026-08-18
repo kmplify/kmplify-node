@@ -16,11 +16,23 @@ FROM rust:1-alpine AS build
 RUN apk add --no-cache musl-dev git
 WORKDIR /src
 COPY Cargo.toml Cargo.lock build.rs ./
+# NOTICE is compiled INTO the binary (kmplify_node::NOTICE, the Apache-2.0
+# attribution embedders must ship), so the build fails without it.
+COPY NOTICE LICENSE ./
 COPY src ./src
 # The build stamp reads git; a tarball build simply goes unstamped.
 COPY .git ./.git
-RUN rustup target add x86_64-unknown-linux-musl \
- && cargo build --release --target x86_64-unknown-linux-musl
+# Native per-arch: buildx sets TARGETARCH, so the same file produces the
+# x86_64 binary on amd64 and the aarch64 one on arm64 (Apple Silicon, ARM
+# VPS) without a cross toolchain.
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+      arm64) MUSL_TARGET=aarch64-unknown-linux-musl ;; \
+      *)     MUSL_TARGET=x86_64-unknown-linux-musl ;; \
+    esac \
+ && rustup target add "$MUSL_TARGET" \
+ && cargo build --release --target "$MUSL_TARGET" \
+ && cp "target/$MUSL_TARGET/release/kmplify-node" /kmplify-node.out
 
 FROM scratch AS export
-COPY --from=build /src/target/x86_64-unknown-linux-musl/release/kmplify-node /kmplify-node
+COPY --from=build /kmplify-node.out /kmplify-node

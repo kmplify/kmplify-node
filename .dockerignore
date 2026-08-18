@@ -1,0 +1,6 @@
+# Keep the docker context small: target/ alone is gigabytes of build cache.
+# dist/ is NOT ignored: the runtime Dockerfile copies the prebuilt binary
+# from there.
+target/
+dist-node/
+.github/
