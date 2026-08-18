@@ -1,1 +1,165 @@
-kmplify-node OpenSource
+# kmplify-node
+
+The provider agent for the KMPLIFY GPU Fabric. It lends a machine's GPU, CPU
+and locally-served models to a fabric, over a single outbound connection.
+
+This is the half of the fabric that runs on **your** machine, and it is open
+source for exactly that reason. Deciding to lend a stranger your GPU is not a
+decision anyone should make about a binary they cannot read.
+
+```
+        your machine                        someone else's
+  ┌───────────────────────┐            ┌──────────────────────┐
+  │  kmplify-node         │  outbound  │  gateway             │
+  │  (this repository)    │═══════════▶│  scheduler, registry │
+  │                       │  WebSocket │  billing, catalog    │
+  │  local model server   │            │                      │
+  │  optional containers  │            │  (not open source)   │
+  └───────────────────────┘            └──────────────────────┘
+```
+
+## What it does
+
+- **Serves inference** from a local OpenAI-compatible endpoint (Ollama, vLLM,
+  LiteLLM, TGI, llama.cpp) to consumers on the fabric. Prompts and responses
+  pass through your machine and the model runs on your hardware.
+- **Advertises honestly**: real GPU model and VRAM, physical cores rather than
+  threads, cgroup limits rather than the host's numbers when containerised.
+- **Optionally hosts container sessions** (vLLM, ComfyUI, Ollama) on your GPU.
+  Off by default. This is opt-in per template, and never inferred from the fact
+  that you have the hardware.
+- **Enforces your ceilings**: CPU, VRAM, RAM and disk caps you set are applied
+  on this side, not requested politely from the other.
+
+## What it does not do
+
+It never listens on a port. It opens one outbound WebSocket and everything,
+including the HTTP relay to a hosted session, travels back over it. Joining a
+fabric does not expose your machine to the internet, and you do not need to
+forward a port, open a firewall or own a domain.
+
+It has no account. A node registers anonymously and gets an opaque id and
+token; there is no email, no PII, and nothing tying the machine to a person
+unless you separately link it for payouts.
+
+## Install
+
+```bash
+cargo install --git https://github.com/kmplify/kmplify-node
+```
+
+Or build it:
+
+```bash
+git clone https://github.com/kmplify/kmplify-node && cd kmplify-node && cargo build --release
+```
+
+## Run
+
+Check the configuration before joining anything. This connects to nothing; it
+resolves the config, probes Docker, `nvidia-smi` and your model endpoint, and
+tells you what the fabric would see:
+
+```bash
+kmplify-node check
+```
+
+Then join:
+
+```bash
+kmplify-node
+```
+
+A node that lists no models will connect, count as online, and have every job
+refused by the scheduler, so `check` fails loudly on that rather than letting
+you deploy something that looks healthy and serves nothing.
+
+## Configuration
+
+Environment variables only, so a service manager, a container and a shell all
+configure it the same way.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PROVIDER_GATEWAY_URL` | the public fabric | Gateway to join. Point it at your own. |
+| `OLLAMA_BASE` | `http://127.0.0.1:11434` | Any OpenAI-compatible endpoint, despite the name. |
+| `PROVIDER_WORKLOADS` | *empty* | Container template ids to host. Empty means sessions are off. |
+| `PROVIDER_COUNTRY` | *empty* | ISO alpha-2, so consumers can prefer EU capacity. Self-declared, see below. |
+| `PROVIDER_SHARE_INFERENCE` | `true` | Serve model jobs at all. |
+| `PROVIDER_SHARE_CPU` | `false` | Offer CPU and RAM as lendable capacity. |
+| `PROVIDER_MAX_CPUS` | *unset* | Ceiling on cores lent to sessions. |
+| `PROVIDER_MAX_VRAM_MB` | *unset* | Ceiling on advertised VRAM. |
+| `PROVIDER_MAX_RAM_MB` | *unset* | Ceiling on advertised RAM. |
+| `PROVIDER_MAX_DISK_GB` | *unset* | Ceiling on disk sessions may fill. |
+| `PROVIDER_APPROVAL_MODE` | `auto` | `manual` holds each session for your approval. |
+| `COLIBRI_BASE` | *empty* | Optional second upstream for MoE streaming. |
+| `KMPLIFY_NODE_DIR` | `$XDG_CONFIG_HOME/kmplify-node` | Where the node identity is stored. |
+| `KMPLIFY_CUDA` | autodetect | Force CUDA detection on (`1`) or off (`0`). |
+| `KMPLIFY_FABRIC_EXTRA_IMAGE_PINS` | *empty* | Extra `template=repository` image pins. See below. |
+
+`PROVIDER_COUNTRY` is self-declared and the gateway cannot verify it. It exists
+so consumers can *prefer* EU/EEA capacity, which is a data-residency preference
+and not an attestation. Declaring a country you are not in defeats the point
+for the consumer, not for you.
+
+## Trust model
+
+The gateway schedules. The node decides what its own hardware does. Every rule
+below is enforced here, in code you can read, and none of them depend on the
+gateway behaving:
+
+- **Sessions are opt-in per template.** No `PROVIDER_WORKLOADS`, no containers.
+- **Images are pinned on this side.** Each template maps to an image repository
+  in [`src/fabric_worker.rs`](src/fabric_worker.rs), and a `workload_start`
+  whose image does not match is refused before anything is pulled. Enabling the
+  `ollama` template means `ollama/ollama` and nothing else. Tags and digests
+  are free to move, publishers are not, and a template id this build has never
+  heard of is refused rather than waved through. Running your own gateway with
+  your own catalog means adding pins explicitly with
+  `KMPLIFY_FABRIC_EXTRA_IMAGE_PINS="my-template=my-org/my-image"`, which is a
+  sentence you should have to write down rather than inherit.
+- **No host mounts.** Only `kmplify-fabric-*` named volumes onto absolute
+  paths, so `-v /:/host` cannot be smuggled through a template.
+- **Containers are boxed**: `--cap-drop ALL`, `--security-opt no-new-privileges`,
+  memory and PID caps, and a 127.0.0.1-only port binding. GPU passthrough is
+  the only privilege granted.
+- **Ceilings are clamped here.** A session's memory cap, CPU share and readiness
+  timeout all arrive as requests and are clamped locally, so a gateway cannot
+  pin a container on your machine indefinitely or hand it the whole box.
+- **Stopping means stopping.** SIGTERM tears down every hosted session before
+  the process exits, and a container that fails to die is reported rather than
+  optimistically declared gone.
+
+If you find a gap in any of this, please read [SECURITY.md](SECURITY.md) before
+opening a public issue.
+
+## Running your own fabric
+
+Nothing here is specific to the public KMPLIFY gateway. Point
+`PROVIDER_GATEWAY_URL` at your own, implement the gateway side of
+[PROTOCOL.md](PROTOCOL.md), and this node will serve it. That is a supported
+use, not a tolerated one.
+
+## Relationship to the rest of KMPLIFY
+
+KMPLIFY is a private AI stack: local models, retrieval over your own documents,
+and a fabric that lets machines lend each other capacity. The products around
+this node are commercial and closed.
+
+The line is deliberate and it is not going to move: **what runs on your machine
+is open, what runs on ours is not.** The scheduler, registry, billing and
+marketplace are the business. The agent on your hardware is something you are
+entitled to audit, and that is worth more to us as source than as a secret.
+
+The same worker powers the KMPLIFY desktop app's provider mode. This repository
+is the headless build of it.
+
+## Contributing
+
+Yes, please, especially hardware coverage and the trust rules. See
+[CONTRIBUTING.md](CONTRIBUTING.md). Contributions require a
+[CLA](CLA.md).
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
