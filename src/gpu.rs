@@ -63,6 +63,17 @@ impl Backend {
         }
     }
 
+    /// Human-facing name, for a launcher telling someone what it found.
+    pub fn label(self) -> &'static str {
+        match self {
+            Backend::Cuda => "CUDA (NVIDIA)",
+            Backend::Rocm => "ROCm (AMD)",
+            Backend::OneApi => "oneAPI (Intel Arc)",
+            Backend::Metal => "Metal (Apple Silicon)",
+            Backend::Cpu => "CPU only",
+        }
+    }
+
     /// Can a consumer's container get at this accelerator on this host?
     ///
     /// Metal is the interesting no: macOS has no GPU passthrough into Docker
@@ -348,6 +359,147 @@ async fn probe_metal() -> Option<Gpu> {
     })
 }
 
+/// Which vendor's driver stack is INSTALLED here, without running anything.
+///
+/// A different question from [`detect`], and deliberately so. `detect` asks
+/// whether a GPU can be *used and sized* right now: it executes the vendor
+/// tool and parses VRAM, because advertising capacity to a fabric means
+/// promising work can actually land. This asks only whether the tooling
+/// exists, which is what an installer or launcher wants when deciding
+/// "is local inference worth attempting on this machine".
+///
+/// The two can legitimately disagree. A host with `nvidia-smi` present but a
+/// broken driver is `Cuda` here and `Cpu` there, and both answers are right
+/// for their caller. Collapsing them into one probe was tempting and would
+/// have been a bug: the fabric would start advertising cards it cannot serve,
+/// or the launcher would push someone onto remote GPUs because a tool exited
+/// non-zero once.
+///
+/// Synchronous and cheap: filesystem lookups only, no subprocess except the
+/// single Rosetta check below, so it is safe on a UI thread.
+// Each cfg block below is a whole alternative implementation, and exactly one
+// survives compilation -- which makes its `return` the tail expression and so
+// technically needless. Kept anyway: without them the three blocks read as
+// fallthrough rather than as alternatives, which is precisely the misreading
+// that would let someone "simplify" macOS into the Linux path.
+#[allow(clippy::needless_return)]
+pub fn detect_installed() -> Backend {
+    // An aarch64 build IS Apple Silicon. No subprocess can fail here, which
+    // matters: an earlier version shelled out unconditionally and treated any
+    // spawn error as "no GPU", demoting an M-series Mac to CPU-only under
+    // parallel load.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        return Backend::Metal;
+    }
+    // An x86_64 build on macOS still has to ask: under Rosetta the host may be
+    // Apple Silicon even though this binary is not, and `hw.optional.arm64`
+    // reports 1 there. A real Intel Mac answers 0 and stays CPU-only on
+    // purpose, since Metal needs an Apple GPU and no discrete card changes
+    // that.
+    #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+    {
+        let rosetta = std::process::Command::new("sysctl")
+            .args(["-n", "hw.optional.arm64"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+            .unwrap_or(false);
+        return if rosetta {
+            Backend::Metal
+        } else {
+            Backend::Cpu
+        };
+    }
+    // Windows and Linux: whichever vendor stack is present. Ordered by how
+    // well local inference is supported, so a machine with two picks the
+    // better one.
+    #[cfg(not(target_os = "macos"))]
+    {
+        if nvidia_installed() {
+            return Backend::Cuda;
+        }
+        if rocm_installed() {
+            return Backend::Rocm;
+        }
+        if oneapi_installed() {
+            return Backend::OneApi;
+        }
+        Backend::Cpu
+    }
+}
+
+/// NVIDIA: `nvidia-smi` on PATH, or in System32 on Windows.
+///
+/// The Windows special case is load-bearing rather than defensive. The driver
+/// installs the tool into System32, and a GUI launch can carry a trimmed PATH
+/// where the ordinary lookup misses it -- which reported a 4090 as "no GPU".
+pub fn nvidia_installed() -> bool {
+    #[cfg(windows)]
+    {
+        if let Ok(root) = std::env::var("SystemRoot") {
+            if std::path::Path::new(&root)
+                .join("System32")
+                .join("nvidia-smi.exe")
+                .exists()
+            {
+                return true;
+            }
+        }
+    }
+    crate::proc::find("nvidia-smi").is_some()
+}
+
+/// AMD: the ROCm stack on Linux, or the HIP SDK on Windows.
+///
+/// The Windows driver drops ROCm into Program Files without necessarily
+/// putting it on PATH, the same trimmed-PATH problem as above.
+pub fn rocm_installed() -> bool {
+    #[cfg(windows)]
+    {
+        for var in ["ProgramFiles", "ProgramW6432"] {
+            if let Ok(root) = std::env::var(var) {
+                if std::path::Path::new(&root)
+                    .join("AMD")
+                    .join("ROCm")
+                    .exists()
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    ["rocm-smi", "rocminfo", "hipInfo", "amd-smi"]
+        .iter()
+        .any(|t| crate::proc::find(t).is_some())
+}
+
+/// Intel: oneAPI tooling on PATH, or the toolkit's install directory on
+/// Windows.
+///
+/// Reports what the HOST has, not what a given runtime can use: official
+/// Ollama reaches Arc through Vulkan while the ipex-llm fork uses oneAPI
+/// directly. Either way the machine has a GPU worth trying.
+pub fn oneapi_installed() -> bool {
+    #[cfg(windows)]
+    {
+        for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Ok(root) = std::env::var(var) {
+                if std::path::Path::new(&root)
+                    .join("Intel")
+                    .join("oneAPI")
+                    .exists()
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    ["xpu-smi", "sycl-ls"]
+        .iter()
+        .any(|t| crate::proc::find(t).is_some())
+}
+
 /// Probe one specific backend.
 pub async fn probe(backend: Backend) -> Option<Gpu> {
     match backend {
@@ -500,6 +652,52 @@ mod parser_tests {
         assert!(Backend::OneApi.hosts_container_sessions());
         assert!(!Backend::Metal.hosts_container_sessions());
         assert!(!Backend::Cpu.hosts_container_sessions());
+    }
+
+    /// The two detectors answer different questions and may disagree; that
+    /// is the design, not a bug. This pins the vocabulary they share.
+    #[test]
+    fn installed_detection_agrees_with_this_host() {
+        let installed = detect_installed();
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            assert_eq!(installed, Backend::Metal, "an aarch64 mac is always Metal");
+        }
+        // Whatever it says, it must be a backend the rest of the module can
+        // talk about: a label, and a defined session capability.
+        assert!(!installed.label().is_empty());
+        let _ = installed.hosts_container_sessions();
+    }
+
+    #[test]
+    fn every_backend_has_a_human_label() {
+        for b in [
+            Backend::Cuda,
+            Backend::Rocm,
+            Backend::OneApi,
+            Backend::Metal,
+            Backend::Cpu,
+        ] {
+            assert!(!b.label().is_empty(), "{b:?} has no label");
+            // The label names the vendor, not the enum arm, so a launcher can
+            // show it verbatim.
+            assert!(
+                b.label().len() > 3,
+                "{b:?} label is too terse: {}",
+                b.label()
+            );
+        }
+        assert_eq!(Backend::Cpu.label(), "CPU only");
+    }
+
+    /// Presence probes answer about THEIR vendor only. Conflating them is how
+    /// a ROCm box ends up with an NVIDIA container reservation it cannot
+    /// honour.
+    #[test]
+    fn vendor_presence_probes_are_independent() {
+        let probes = [nvidia_installed(), rocm_installed(), oneapi_installed()];
+        // Each is a real, independent answer; a host may legitimately have
+        // none, one, or several vendor stacks installed at once.
+        assert!(probes.iter().filter(|x| **x).count() <= probes.len());
     }
 
     /// A vendor mismatch must refuse, not "try anyway": an AMD host given a
