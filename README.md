@@ -74,6 +74,11 @@ A node that lists no models will connect, count as online, and have every job
 refused by the scheduler, so `check` fails loudly on that rather than letting
 you deploy something that looks healthy and serves nothing.
 
+To run it as a service on a headless box, including the fully-static musl
+build that executes on any Linux distribution, see
+[docs/HEADLESS-NODE.md](docs/HEADLESS-NODE.md) and the systemd unit in
+[packaging/](packaging/).
+
 ## Configuration
 
 Environment variables only, so a service manager, a container and a shell all

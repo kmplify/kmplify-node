@@ -312,6 +312,9 @@ impl Default for WorkerConfig {
             max_shared_disk_gb: None,
             share_inference: true,
             share_cpu: false,
+            // None = report this crate's version, which is correct for
+            // everything except an embedder with its own release cycle.
+            client_version: None,
             approval_mode: "auto".to_string(),
             cuda: false,
             events: None,
@@ -378,6 +381,15 @@ pub struct WorkerConfig {
     /// A working NVIDIA stack was detected on this host (nvidia-smi).
     /// Advertised to the gateway so CUDA templates schedule here.
     pub cuda: bool,
+    /// What to report as this build's version on the hello frame.
+    ///
+    /// `None` reports this crate's version, which is what the standalone
+    /// node wants. An embedder with its own release cycle (the KMPLIFY
+    /// desktop app, whose provider mode is this same worker) sets its own
+    /// version here: the question the field answers on the gateway is
+    /// "which build is that peer running", and the only useful answer names
+    /// the thing that was actually installed.
+    pub client_version: Option<String>,
     /// Optional sink for user-facing events (see EventSink).
     pub events: Option<EventSink>,
 }
@@ -820,7 +832,13 @@ async fn apple_chip_name() -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-pub(crate) async fn nvidia_vram_mb() -> Option<u64> {
+/// Total VRAM of the first NVIDIA GPU in MB, or `None` without a working
+/// nvidia-smi.
+///
+/// Public because it is useful to anything sizing work to the local card,
+/// not only to the worker: the KMPLIFY desktop app picks a coding-model
+/// profile with it.
+pub async fn nvidia_vram_mb() -> Option<u64> {
     let out = crate::proc::command("nvidia-smi")
         .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
         .output()
@@ -2995,7 +3013,7 @@ async fn session(
         // for weeks by inferring it from which frames the node failed to
         // answer — an inference that was wrong at least once, because the
         // peer had been rebuilt since the last observation.
-        "version": crate::version_string(),
+        "version": cfg.client_version.as_deref().unwrap_or_else(|| crate::version_string()),
         "country": cfg.country,
         // Admission mode (v2.4). Absent/unknown reads as "auto" on the
         // gateway, so older gateways and workers stay compatible both ways.

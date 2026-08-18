@@ -1,0 +1,26 @@
+# Build environment for the fully-static Linux kmplify-node binary.
+#
+# Produces ONE binary that executes on any GUI-less Linux distribution:
+# Ubuntu, Debian, openSUSE, CachyOS/Arch, Alpine, anything with a kernel.
+# The musl target links everything statically and the crate is OpenSSL-free
+# (rustls throughout), so there is no glibc version or system library to
+# disagree about.
+#
+#   docker build -f packaging/Dockerfile.node-build -o dist-node .
+#   -> dist-node/kmplify-node
+#
+# This is a BUILD image. The node itself runs on the host, next to the host's
+# Docker daemon, not inside a container: it needs to see the real GPU and the
+# real docker socket.
+FROM rust:1-alpine AS build
+RUN apk add --no-cache musl-dev git
+WORKDIR /src
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY src ./src
+# The build stamp reads git; a tarball build simply goes unstamped.
+COPY .git ./.git
+RUN rustup target add x86_64-unknown-linux-musl \
+ && cargo build --release --target x86_64-unknown-linux-musl
+
+FROM scratch AS export
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/kmplify-node /kmplify-node
