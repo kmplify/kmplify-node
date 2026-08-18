@@ -1248,7 +1248,6 @@ pub const IMAGE_PINS: &[(&str, &str)] = &[
     ("vllm-rocm", "rocm/vllm"),
     ("ollama-rocm", "ollama/ollama"),
     ("vllm-oneapi", "intel/llm-scaler-vllm"),
-    ("ollama-oneapi", "intel/llm-scaler-vllm"),
 ];
 
 /// Operator-supplied pins, `template=repository` separated by commas.
