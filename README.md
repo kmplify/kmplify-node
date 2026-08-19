@@ -1,6 +1,6 @@
 # kmplify-node
 
-The provider agent for the KMPLIFY GPU Fabric. It lends a machine's GPU, CPU
+The provider agent for the KMPLIFY Compute Fabric. It lends a machine's GPU, CPU
 and locally-served models to a fabric, over a single outbound connection.
 
 This is the half of the fabric that runs on **your** machine, and it is open
