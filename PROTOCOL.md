@@ -1,4 +1,4 @@
-# KMPLIFY GPU Fabric protocol
+# KMPLIFY Compute Fabric protocol
 
 The wire contract between a **node** (this repository) and a **gateway**.
 Published so a provider can verify what their machine agreed to, and so
