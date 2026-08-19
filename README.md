@@ -235,3 +235,8 @@ Yes, please, especially hardware coverage and the trust rules. See
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+The licence covers the code, not the name: KMPLIFY and kmplify-node are
+trademarks, and modified versions need their own name. What that means in
+practice, including everything you may do without asking, is spelled out in
+[TRADEMARKS.md](TRADEMARKS.md).
