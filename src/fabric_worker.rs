@@ -141,6 +141,23 @@ fn stopped_cell() -> &'static Stopped {
     STOPPED_CELL.get_or_init(|| Arc::new(Mutex::new(std::collections::HashSet::new())))
 }
 
+/// The vector replica store, one per process (protocol v3.0). Built from
+/// the first config that asks for it; the node dir and ceiling do not
+/// change at runtime.
+fn vectors_store(cfg: &WorkerConfig) -> crate::vectors::SharedStore {
+    static STORE: std::sync::OnceLock<crate::vectors::SharedStore> = std::sync::OnceLock::new();
+    STORE
+        .get_or_init(|| {
+            let dir = cfg
+                .creds_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            Arc::new(crate::vectors::Store::new(&dir, cfg.vectors.clone()))
+        })
+        .clone()
+}
+
 /// What peers are running on this machine right now.
 pub async fn hosted_sessions() -> Vec<HostedSession> {
     hosted_cell().lock().await.clone()
@@ -321,6 +338,8 @@ impl Default for WorkerConfig {
             cuda: false,
             accelerator: crate::gpu::Backend::Cpu,
             events: None,
+            functions: Default::default(),
+            vectors: Default::default(),
         }
     }
 }
@@ -430,6 +449,12 @@ pub struct WorkerConfig {
     pub client_version: Option<String>,
     /// Optional sink for user-facing events (see EventSink).
     pub events: Option<EventSink>,
+    /// Signed Wasm function hosting (protocol v3.0, src/functions.rs).
+    /// Off by default; needs a trusted catalog key to do anything.
+    pub functions: crate::functions::FunctionsConfig,
+    /// Vector collection hosting (protocol v3.0, src/vectors.rs). Off by
+    /// default; the ceiling is the owner's disk grant for indexes.
+    pub vectors: crate::vectors::VectorsConfig,
 }
 
 impl WorkerConfig {
@@ -3327,6 +3352,7 @@ async fn session(
     stop: &mut watch::Receiver<bool>,
 ) -> Result<(), String> {
     let creds = credentials(client, cfg).await?;
+    let store = vectors_store(cfg);
     // No models advertised = no inference jobs scheduled here. That is the
     // OFF state of the "Share GPU inference" switch, not an error — the
     // worker may be connected purely to lend CPU/RAM or run sessions.
@@ -3391,6 +3417,13 @@ async fn session(
         // Admission mode (v2.4). Absent/unknown reads as "auto" on the
         // gateway, so older gateways and workers stay compatible both ways.
         "approval": cfg.approval_mode,
+        // Protocol v3.0 lanes. Null when not offered; pre-v3 gateways ignore
+        // the keys, v3 gateways read them as capability blocks.
+        "functions": cfg.functions.capability(),
+        "vectors": store.capability().await,
+        // Collections replicated here, so the gateway can tell this node to
+        // drop any it no longer knows (same reconciliation as sessions).
+        "collections": store.collection_ids().await,
         // What this machine actually IS (v2.4): real CPU model, cores and
         // total RAM. Independent of cpu_share, which says only what was
         // volunteered — a GPU peer still has a CPU worth naming.
@@ -3591,9 +3624,17 @@ async fn session(
                         // one ping interval stale, which is well inside the
                         // gateway's own freshness window) and the refresh
                         // runs detached afterwards.
+                        let vectors_used = if cfg.vectors.enabled {
+                            Some(store.used_mb().await)
+                        } else {
+                            None
+                        };
                         let pong = {
                             let t = telemetry.lock().await;
                             let mut p = json!({"type": "pong"});
+                            if let Some(u) = vectors_used {
+                                p["vectors_used_mb"] = json!(u);
+                            }
                             if let Some(used) = t.gpu_used_mb {
                                 p["gpu_used_mb"] = json!(used);
                             }
@@ -3759,6 +3800,12 @@ async fn session(
                             }
                         }
                     }
+                    Some("job") if frame["kind"].as_str() == Some("function") => {
+                        tokio::spawn(run_function(sink.clone(), client.clone(), cfg.clone(), frame));
+                    }
+                    Some("job") if frame["kind"].as_str().is_some_and(|k| k.starts_with("vector_")) => {
+                        tokio::spawn(run_vector_job(sink.clone(), store.clone(), frame));
+                    }
                     Some("job") => {
                         tokio::spawn(run_job(
                             sink.clone(),
@@ -3829,6 +3876,22 @@ async fn session(
                         // closes the socket to the container.
                         relays.lock().await.remove(&id);
                     }
+                    // Gateway reconciliation (v3.0): a collection this node
+                    // announced that the registry no longer knows.
+                    Some("vector_drop") => {
+                        let store = store.clone();
+                        let payload = json!({"collection": frame["collection"]});
+                        tokio::spawn(async move {
+                            match store.drop_collection(&payload).await {
+                                Ok(v) if v["dropped"] == true => log(format!(
+                                    "dropped vector collection {} on the gateway's instruction",
+                                    payload["collection"].as_str().unwrap_or("?")
+                                )),
+                                Ok(_) => {}
+                                Err(e) => log(format!("vector_drop refused: {e}")),
+                            }
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -3850,6 +3913,12 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
     // usage at all — exactly the "CPU peers have no detail" complaint, on
     // the deployment where nobody is watching a window to notice.
     crate::hostcpu::start();
+    if cfg.vectors.enabled {
+        let loaded = vectors_store(&cfg).load().await;
+        if loaded > 0 {
+            log(format!("vector store: {loaded} collection(s) restored"));
+        }
+    }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
         .build()
@@ -3919,6 +3988,113 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
             }
         }
     }
+}
+
+/// A `kind: "function"` job: verify, fetch, run in the sandbox, answer.
+///
+/// Every refusal is a `done`-less `error` frame naming the reason, so a
+/// gateway that sent a manifest this node will not honour learns why in
+/// one round trip instead of by timeout.
+async fn run_function(
+    sink: Arc<Mutex<WsSink>>,
+    client: reqwest::Client,
+    cfg: WorkerConfig,
+    frame: Value,
+) {
+    use crate::functions as f;
+    let job_id = frame["id"].as_str().unwrap_or_default().to_string();
+    let send = |sink: Arc<Mutex<WsSink>>, msg: Value| async move {
+        let _ = sink.lock().await.send(Message::Text(msg.to_string())).await;
+    };
+    let fail = |msg: String| {
+        let sink = sink.clone();
+        let job_id = job_id.clone();
+        async move {
+            send(sink, json!({"type": "error", "id": job_id, "message": msg})).await;
+        }
+    };
+    if !cfg.functions.enabled || cfg.functions.trusted_pubkey.is_empty() {
+        fail("this node does not host functions".into()).await;
+        return;
+    }
+    let manifest = match f::Manifest::from_frame(&frame["payload"]) {
+        Ok(m) => m,
+        Err(e) => {
+            fail(format!("refused: {e}")).await;
+            return;
+        }
+    };
+    if let Err(e) = f::verify_manifest(&manifest, &cfg.functions.trusted_pubkey) {
+        fail(format!("refused: {e}")).await;
+        return;
+    }
+    let node_dir = cfg
+        .creds_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let module = match f::fetch_module(&client, &node_dir, &cfg.gateway_url, &manifest).await {
+        Ok(m) => m,
+        Err(e) => {
+            fail(e).await;
+            return;
+        }
+    };
+    let input = frame["payload"]["input_b64"]
+        .as_str()
+        .and_then(b64_decode)
+        .unwrap_or_default();
+    let args: Vec<String> = frame["payload"]["args"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let limits = f::effective_limits(&manifest, &cfg.functions);
+    let id = manifest.id.clone();
+    // The guest runs on the blocking pool: a function may legitimately take
+    // seconds, and the socket loop must keep answering pings meanwhile.
+    let outcome =
+        tokio::task::spawn_blocking(move || f::run_module(&module, &input, &args, limits)).await;
+    match outcome {
+        Ok(Ok(result)) => {
+            log(format!(
+                "function {id} ran for a peer: exit {} in {} ms",
+                result.exit_code, result.duration_ms
+            ));
+            send(
+                sink,
+                json!({"type": "done", "id": job_id, "data": result.to_value()}),
+            )
+            .await;
+        }
+        Ok(Err(e)) => fail(e).await,
+        Err(e) => fail(format!("function runner panicked: {e}")).await,
+    }
+}
+
+/// A `kind: "vector_*"` job against the local replica store.
+async fn run_vector_job(
+    sink: Arc<Mutex<WsSink>>,
+    store: crate::vectors::SharedStore,
+    frame: Value,
+) {
+    let job_id = frame["id"].as_str().unwrap_or_default().to_string();
+    let payload = &frame["payload"];
+    let result = match frame["kind"].as_str().unwrap_or("") {
+        "vector_upsert" => store.upsert(payload).await,
+        "vector_query" => store.query(payload).await,
+        "vector_delete" => store.delete(payload).await,
+        "vector_drop" => store.drop_collection(payload).await,
+        other => Err(format!("unknown vector job kind {other:?}")),
+    };
+    let msg = match result {
+        Ok(data) => json!({"type": "done", "id": job_id, "data": data}),
+        Err(e) => json!({"type": "error", "id": job_id, "message": e}),
+    };
+    let _ = sink.lock().await.send(Message::Text(msg.to_string())).await;
 }
 
 pub fn default_creds_path(data_dir: &Path) -> PathBuf {

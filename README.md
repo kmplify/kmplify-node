@@ -34,6 +34,11 @@ decision anyone should make about a binary they cannot read.
   that you have the hardware.
 - **Enforces your ceilings**: CPU, VRAM, RAM and disk caps you set are applied
   on this side, not requested politely from the other.
+- **Optionally runs signed Wasm functions** in an in-process WASI sandbox
+  (stdin/stdout only, no files, no network), only for a catalog key you chose
+  to trust, and **optionally lends vector storage** for replicated RAG
+  indexes whose payloads are opaque to you. Both off by default; protocol
+  v3.0 in [PROTOCOL.md](PROTOCOL.md).
 
 ### Hardware support
 
@@ -169,6 +174,12 @@ configure it the same way.
 | `KMPLIFY_GPU_BACKEND` | autodetect | Force the accelerator: `cuda`, `rocm`, `oneapi`, `metal`, `cpu`. |
 | `KMPLIFY_CUDA` | autodetect | Older CUDA-only override (`1`/`0`). Still honoured. |
 | `KMPLIFY_FABRIC_EXTRA_IMAGE_PINS` | *empty* | Extra `template=repository` image pins. See below. |
+| `PROVIDER_FUNCTIONS` | `false` | Host signed Wasm functions (needs a build with `--features wasm`). |
+| `PROVIDER_FUNCTIONS_PUBKEY` | *empty* | Hex Ed25519 key of the function catalog to trust. Empty = refuse all. |
+| `PROVIDER_MAX_FUNCTION_MB` | `256` | Per-call memory ceiling (hard cap 1024). |
+| `PROVIDER_MAX_FUNCTION_MS` | `30000` | Per-call wall-clock ceiling (hard cap 300000). |
+| `PROVIDER_SHARE_VECTORS` | `false` | Lend storage for replicated vector collections. |
+| `PROVIDER_MAX_VECTOR_MB` | `1024` | Ceiling on stored collections. |
 
 `PROVIDER_COUNTRY` is self-declared and the gateway cannot verify it. It exists
 so consumers can *prefer* EU/EEA capacity, which is a data-residency preference
