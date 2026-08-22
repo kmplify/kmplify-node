@@ -11,9 +11,22 @@
 # asset list.
 name: Release
 
+# Two ways in, one release:
+#   * a `vX.Y.Z` tag, pushed by hand (the manual path, kept for hotfixes);
+#   * a push to main that changes Cargo.toml, where the crate version is
+#     read and released automatically under `v<version>` if no such tag
+#     exists yet. Bumping `version` in Cargo.toml and merging IS the release
+#     action, so nobody has to remember the tag step, and a tag can never
+#     name a version the manifest does not carry.
+#
+# The `resolve` job decides; everything else keys off its outputs so a push
+# to main for an already-released version is a no-op rather than a failed
+# or duplicated release.
 on:
   push:
     tags: ["v*"]
+    branches: [main]
+    paths: ["Cargo.toml"]
   workflow_dispatch:
 
 permissions:
@@ -21,7 +34,42 @@ permissions:
   packages: write
 
 jobs:
+  resolve:
+    name: resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: v
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          tag="v${version}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null \
+             || gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "$tag already exists; nothing to release"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "releasing $tag from main"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: resolve
+    if: needs.resolve.outputs.release == 'true'
     name: build (${{ matrix.target }})
     strategy:
       fail-fast: false
@@ -75,7 +123,7 @@ jobs:
   # time (a second compile is a second chance to differ from what SHA256SUMS
   # attests).
   docker:
-    needs: build
+    needs: [resolve, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -103,11 +151,11 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/kmplify/kmplify-node:${{ github.ref_name }}
+            ghcr.io/kmplify/kmplify-node:${{ needs.resolve.outputs.tag }}
             ghcr.io/kmplify/kmplify-node:latest
 
   release:
-    needs: [build, docker]
+    needs: [resolve, build, docker]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -133,8 +181,13 @@ jobs:
       # uploading is a real failure window: the installer would find the
       # version, fail to verify it, and refuse to install. A draft is not
       # "latest", so that window cannot be observed.
+      # `tag_name` + `target_commitish` create the tag when the run came
+      # from main (the automatic path) and simply match it when the run came
+      # from a pushed tag.
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: release/*
           generate_release_notes: true
           fail_on_unmatched_files: true
@@ -143,4 +196,4 @@ jobs:
       - name: Publish once every asset is attached
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "${{ github.ref_name }}" --draft=false --repo "${{ github.repository }}"
+        run: gh release edit "${{ needs.resolve.outputs.tag }}" --draft=false --repo "${{ github.repository }}"
