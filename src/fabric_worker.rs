@@ -453,6 +453,40 @@ fn log(msg: impl std::fmt::Display) {
     println!("[fabric-worker] {msg}");
 }
 
+/// Write a file only its owner may read.
+///
+/// The credential file holds the node's gateway token, and the invitation
+/// mirror lists contracts consumers hold against this node. `tokio::fs::write`
+/// creates files with the process umask, which on a typical Linux host is
+/// 0644: every local account could read the token and impersonate the node.
+/// A headless box is exactly where other accounts exist. Mode is set at
+/// creation, not afterwards, so there is no window with a readable file.
+async fn write_private(path: &Path, bytes: Vec<u8>) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .await?;
+        // An existing file keeps its old mode on open; re-assert it so a
+        // credential written by an older build is tightened on first use.
+        let _ = tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await;
+        f.write_all(&bytes).await?;
+        f.flush().await
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::fs::write(path, bytes).await
+    }
+}
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 /// Register-or-load this install's ONE fabric identity — shared between
 /// provider mode (sharing this GPU) and consumer mode (inference_source
 ///=peer): a node is its own customer and its own vendor as far as the
@@ -481,7 +515,12 @@ pub async fn ensure_identity(gateway_url: &str, creds_path: &Path) -> Result<Cre
     if let Some(parent) = creds_path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
-    let _ = tokio::fs::write(creds_path, serde_json::to_vec(&creds).unwrap()).await;
+    if let Err(e) = write_private(creds_path, serde_json::to_vec(&creds).unwrap()).await {
+        log(format!(
+            "could not persist the node credential at {}: {e} (the node will re-register on next start)",
+            creds_path.display()
+        ));
+    }
     log(format!(
         "registered as anonymous node {}…",
         &creds.node_id[..8.min(creds.node_id.len())]
@@ -534,7 +573,12 @@ pub async fn register_identity(
     if let Some(parent) = creds_path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
-    let _ = tokio::fs::write(creds_path, serde_json::to_vec(&creds).unwrap()).await;
+    if let Err(e) = write_private(creds_path, serde_json::to_vec(&creds).unwrap()).await {
+        log(format!(
+            "could not persist the re-registered credential at {}: {e}",
+            creds_path.display()
+        ));
+    }
     let kept = previous
         .as_ref()
         .is_some_and(|c| c.node_id == creds.node_id);
@@ -649,7 +693,7 @@ async fn sync_invitations(
     if let Some(parent) = mirror_path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
-    tokio::fs::write(&mirror_path, serde_json::to_vec_pretty(&live).unwrap())
+    write_private(&mirror_path, serde_json::to_vec_pretty(&live).unwrap())
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -1293,6 +1337,21 @@ pub const IMAGE_PINS: &[TemplatePin] = &[
         repository: "traefik/whoami",
         accelerator: Backend::Cpu,
     },
+    // Speech: one OpenAI-compatible server for BOTH directions, speech to
+    // text (/v1/audio/transcriptions, faster-whisper) and text to speech
+    // (/v1/audio/speech, Kokoro). Two template ids for the same publisher,
+    // one per accelerator, so a CPU peer can lend transcription without ever
+    // being offered the CUDA image.
+    TemplatePin {
+        template: "speaches",
+        repository: "ghcr.io/speaches-ai/speaches",
+        accelerator: Backend::Cuda,
+    },
+    TemplatePin {
+        template: "speaches-cpu",
+        repository: "ghcr.io/speaches-ai/speaches",
+        accelerator: Backend::Cpu,
+    },
     // Vendor variants. Pinned here ahead of a host ever running one: a pin
     // for a template nobody schedules is inert, whereas a MISSING pin is a
     // refusal at the pull, so the safe order is pin first, catalogue second.
@@ -1678,8 +1737,8 @@ async fn fetch_model(
         .await;
         return;
     }
-    if !url.starts_with("https://") {
-        report("error", "refused: model URLs must be https".into()).await;
+    if let Err(why) = model_url_ok(&url) {
+        report("error", format!("refused: {why}")).await;
         return;
     }
 
@@ -1738,32 +1797,23 @@ async fn fetch_model(
     }
 
     report("fetching", format!("downloading {path}")).await;
-    let script = format!(
-        "set -e; mkdir -p \"$(dirname /m/{path})\"; \
-         wget --no-verbose -O /m/{path}.part '{url}'; \
-         mv /m/{path}.part /m/{path}"
-    );
-    let out = crate::proc::command("docker")
-        .args([
-            "run",
-            "--rm",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
-            "--memory",
-            "512m",
-            "--pids-limit",
-            "64",
-            "-v",
-            &format!("{volume}:/m"),
-            "alpine:3.20",
-            "sh",
-            "-c",
-            &script,
-        ])
-        .output()
-        .await;
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--rm".into(),
+        "--cap-drop".into(),
+        "ALL".into(),
+        "--security-opt".into(),
+        "no-new-privileges".into(),
+        "--memory".into(),
+        "512m".into(),
+        "--pids-limit".into(),
+        "64".into(),
+        "-v".into(),
+        format!("{volume}:/m"),
+        FETCH_IMAGE.into(),
+    ];
+    args.extend(fetch_script_args(&path, &url));
+    let out = crate::proc::command("docker").args(&args).output().await;
     match out {
         Ok(o) if o.status.success() => {
             log(format!("fetched model {path} for a peer"));
@@ -1786,8 +1836,153 @@ async fn fetch_model(
     }
 }
 
+/// The throwaway downloader image for model fetches. Pinned by tag, not
+/// digest, for the same reason the template pins are repositories: the
+/// publisher is the trust decision, the exact build is free to move.
+const FETCH_IMAGE: &str = "alpine:3.20";
+
+/// Where a model may be fetched FROM, decided on this side.
+///
+/// Mirrors the gateway's own allowlist (gateway/app/workloads.py
+/// MODEL_HOSTS) on purpose: the download runs inside this provider's
+/// network, so an open URL is a blind SSRF against the LAN, and the node
+/// must not depend on the gateway having checked. Kept identical rather
+/// than broader so a fetch the gateway accepts is never refused here for a
+/// reason neither side names.
+pub const MODEL_FETCH_HOSTS: &[&str] = &[
+    "huggingface.co",
+    "cdn-lfs.huggingface.co",
+    "cdn-lfs-us-1.huggingface.co",
+    "civitai.com",
+    "github.com",
+    "objects.githubusercontent.com",
+    "raw.githubusercontent.com",
+];
+
+/// Is this a URL the node is willing to hand to a downloader?
+///
+/// https only, an allowlisted host, no userinfo (`https://host@evil/` puts
+/// the real destination after the `@`), and nothing a shell or a header
+/// could misread: quotes, whitespace, control characters. The URL is
+/// passed as an argument rather than interpolated into a script, so the
+/// character rules are belt and braces rather than the only line.
+pub fn model_url_ok(url: &str) -> Result<(), String> {
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| "model URLs must be https".to_string())?;
+    if url
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '\'' | '"' | '`' | '\\'))
+    {
+        return Err("model URL contains characters that are never part of a download link".into());
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains('@') {
+        return Err("model URL must not carry credentials".into());
+    }
+    let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
+    let host = host.to_ascii_lowercase();
+    if host.is_empty() {
+        return Err("model URL has no host".into());
+    }
+    if !MODEL_FETCH_HOSTS.contains(&host.as_str()) {
+        return Err(format!(
+            "'{host}' is not an allowed model host on this node (allowed: {})",
+            MODEL_FETCH_HOSTS.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// The container command for a model fetch: `sh -c SCRIPT sh PATH URL`.
+///
+/// The script reads its inputs as `$1` and `$2`, so neither the path nor
+/// the URL is ever part of the shell text. The previous version formatted
+/// both into the script string, which made a single quote in a URL the end
+/// of the quoted argument and the start of a command running on the
+/// provider's machine. The `.part` rename stays: a half file with the real
+/// name would look like a working model to ComfyUI.
+fn fetch_script_args(path: &str, url: &str) -> Vec<String> {
+    const SCRIPT: &str = "set -e; \
+        mkdir -p \"$(dirname \"/m/$1\")\"; \
+        wget --no-verbose -O \"/m/$1.part\" \"$2\"; \
+        mv \"/m/$1.part\" \"/m/$1\"";
+    vec![
+        "sh".into(),
+        "-c".into(),
+        SCRIPT.into(),
+        "sh".into(),
+        path.to_string(),
+        url.to_string(),
+    ]
+}
+
 fn container_name(session: &str) -> String {
     format!("kmplify-fabric-{}", &session[..12.min(session.len())])
+}
+
+/// The loopback URL a relayed request or socket is sent to.
+///
+/// `path` and `query` arrive from the gateway. The gateway prefixes every
+/// path with `/`, but this node does not take that on trust: without a
+/// leading slash, `http://127.0.0.1:PORT` followed by `@other-host/` names
+/// a different machine entirely, and the node is the process with a view
+/// of the provider's LAN. Control characters and whitespace are refused
+/// rather than encoded because nothing legitimate sends them.
+fn container_url(scheme: &str, host_port: u16, path: &str, query: &str) -> Option<String> {
+    let clean = |s: &str| !s.chars().any(|c| c.is_control() || c.is_whitespace());
+    if !clean(path) || !clean(query) {
+        return None;
+    }
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    Some(if query.is_empty() {
+        format!("{scheme}://127.0.0.1:{host_port}{path}")
+    } else {
+        format!("{scheme}://127.0.0.1:{host_port}{path}?{query}")
+    })
+}
+
+/// Container memory for a session, in GB.
+///
+/// The gateway's `mem_gb` is a request; what the container gets is decided
+/// here, the way `session_cpus` decides cores. Until now the only clamp was
+/// a flat 1..64, so a 64 GB request on a 16 GB host passed straight to
+/// `docker run --memory 64g`, which Docker accepts: no cap at all, and the
+/// README's promise that a gateway cannot hand a container the whole box
+/// was not true for RAM. The operator's ceiling wins when set; otherwise
+/// the owner keeps a quarter of the machine, at least 4 GB, so an LLM
+/// server that spills past its cgroup thrashes inside its share instead of
+/// swapping the host.
+fn session_mem_gb(
+    requested: Option<u64>,
+    host_ram_mb: u64,
+    operator_max_ram_mb: Option<u64>,
+) -> u64 {
+    let host_gb = (host_ram_mb / 1024).max(1);
+    let ceiling = match operator_max_ram_mb {
+        Some(m) if m > 0 => (m / 1024).clamp(1, host_gb),
+        _ => {
+            let reserve = (host_gb / 4).max(4);
+            host_gb.saturating_sub(reserve).max(1)
+        }
+    };
+    requested.unwrap_or(8).clamp(1, 64).min(ceiling)
+}
+
+/// May this environment variable name be passed to `docker run -e`?
+///
+/// Names are restricted to the POSIX identifier shape. Docker itself takes
+/// anything, and a name carrying `=` or a newline would let one entry set
+/// two variables, or none, in ways a template author never wrote down.
+fn env_key_ok(key: &str) -> bool {
+    let mut chars = key.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && key.len() <= 128
 }
 
 async fn send_frame(sink: &Arc<Mutex<WsSink>>, msg: Value) {
@@ -2153,7 +2348,19 @@ async fn start_workload(
     // LLM server that spills weights or KV cache past a too-small cgroup cap
     // doesn't fail cleanly, it thrashes — which consumers experienced as a
     // "running" session that took minutes per answer.
-    let mem_gb = frame["mem_gb"].as_u64().unwrap_or(8).clamp(1, 64);
+    let mem_gb = session_mem_gb(
+        frame["mem_gb"].as_u64(),
+        host_ram_mb(),
+        cfg.max_shared_ram_mb,
+    );
+    if frame["mem_gb"].as_u64().is_some_and(|asked| asked > mem_gb) {
+        log(format!(
+            "session {session}: memory request {} GB clamped to {mem_gb} GB (host {} GB, operator cap {:?} MB)",
+            frame["mem_gb"].as_u64().unwrap_or(0),
+            host_ram_mb() / 1024,
+            cfg.max_shared_ram_mb
+        ));
+    }
 
     // CPU cap, for the same reason memory has one — and it was missing.
     //
@@ -2229,10 +2436,17 @@ async fn start_workload(
     }
     if let Some(env) = frame["env"].as_object() {
         for (k, v) in env {
-            if let Some(v) = v.as_str() {
-                args.push("-e".into());
-                args.push(format!("{k}={v}"));
+            let Some(v) = v.as_str() else { continue };
+            // Container-scoped either way (cap-drop, no mounts), but a name
+            // that is not a name is a template bug worth refusing loudly.
+            if !env_key_ok(k) || v.contains('\0') {
+                log(format!(
+                    "refusing env entry {k:?} for session {session}: not a variable name"
+                ));
+                continue;
             }
+            args.push("-e".into());
+            args.push(format!("{k}={v}"));
         }
     }
     args.push(image.clone());
@@ -2527,10 +2741,13 @@ async fn ws_open(sink: Arc<Mutex<WsSink>>, sessions: Sessions, relays: RelaySock
 
     let path = frame["path"].as_str().unwrap_or("/");
     let query = frame["query"].as_str().unwrap_or("");
-    let url = if query.is_empty() {
-        format!("ws://127.0.0.1:{host_port}{path}")
-    } else {
-        format!("ws://127.0.0.1:{host_port}{path}?{query}")
+    let Some(url) = container_url("ws", host_port, path, query) else {
+        send_frame(
+            &sink,
+            json!({"type": "ws_error", "ws_id": ws_id, "message": "refused: malformed relay path"}),
+        )
+        .await;
+        return;
     };
 
     let (stream, _) = match connect_async(&url).await {
@@ -2587,6 +2804,23 @@ async fn ws_open(sink: Arc<Mutex<WsSink>>, sessions: Sessions, relays: RelaySock
     });
 }
 
+/// Headers that describe the hop, not the request, and must not cross the
+/// relay into the container. `host` would address the wrong server,
+/// `content-length`/`transfer-encoding` are rewritten by the client that
+/// actually sends the bytes, and the rest are connection management.
+const RELAY_STRIPPED_HEADERS: &[&str] = &[
+    "host",
+    "connection",
+    "content-length",
+    "transfer-encoding",
+    "keep-alive",
+    "upgrade",
+    "te",
+    "trailers",
+    "proxy-authenticate",
+    "proxy-authorization",
+];
+
 async fn relay_http(
     sink: Arc<Mutex<WsSink>>,
     sessions: Sessions,
@@ -2608,10 +2842,14 @@ async fn relay_http(
     let method = frame["method"].as_str().unwrap_or("GET").to_uppercase();
     let path = frame["path"].as_str().unwrap_or("/");
     let query = frame["query"].as_str().unwrap_or("");
-    let url = if query.is_empty() {
-        format!("http://127.0.0.1:{host_port}{path}")
-    } else {
-        format!("http://127.0.0.1:{host_port}{path}?{query}")
+    let Some(url) = container_url("http", host_port, path, query) else {
+        send_frame(
+            &sink,
+            json!({"type": "http_resp", "req_id": req_id, "status": 400,
+            "headers": {}, "body_b64": b64_encode(b"refused: malformed relay path")}),
+        )
+        .await;
+        return;
     };
 
     let mut req = client.request(
@@ -2621,8 +2859,9 @@ async fn relay_http(
     if let Some(headers) = frame["headers"].as_object() {
         for (k, v) in headers {
             // Hop-by-hop / addressing headers must not leak through a relay.
-            let kl = k.to_ascii_lowercase();
-            if kl == "host" || kl == "connection" || kl == "content-length" {
+            // Same set the gateway strips, so the two ends agree on what a
+            // relayed request looks like by the time it reaches the app.
+            if RELAY_STRIPPED_HEADERS.contains(&k.to_ascii_lowercase().as_str()) {
                 continue;
             }
             if let Some(v) = v.as_str() {
@@ -4224,5 +4463,166 @@ mod template_accelerator_tests {
                 assert!(IMAGE_PINS.iter().any(|p| p.template == t), "{t} unpinned");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::{
+        container_url, env_key_ok, fetch_script_args, model_url_ok, session_mem_gb,
+        MODEL_FETCH_HOSTS,
+    };
+
+    /// The hole this closes: a quote in the URL used to end the quoted
+    /// argument inside `sh -c "... '{url}' ..."` and start a command on the
+    /// provider's machine. The URL is now an argv entry the script reads as
+    /// `$2`, so the script text is a constant whatever the inputs are.
+    #[test]
+    fn fetch_inputs_never_enter_the_script_text() {
+        let hostile = "https://huggingface.co/x/resolve/main/m.safetensors'; touch /m/pwned; '";
+        let argv = fetch_script_args("checkpoints/m.safetensors", hostile);
+        assert_eq!(argv[0], "sh");
+        assert_eq!(argv[1], "-c");
+        assert!(
+            !argv[2].contains("huggingface"),
+            "url leaked into the script"
+        );
+        assert!(
+            !argv[2].contains("checkpoints"),
+            "path leaked into the script"
+        );
+        assert_eq!(argv[3], "sh", "positional $0");
+        assert_eq!(argv[4], "checkpoints/m.safetensors");
+        assert_eq!(argv[5], hostile);
+        // And the vetting upstream refuses it anyway.
+        assert!(model_url_ok(hostile).is_err());
+    }
+
+    #[test]
+    fn model_urls_are_https_on_allowlisted_hosts_only() {
+        assert!(model_url_ok("https://huggingface.co/a/b/resolve/main/m.safetensors").is_ok());
+        assert!(model_url_ok("https://civitai.com/api/download/models/1234").is_ok());
+        assert!(
+            model_url_ok("https://HUGGINGFACE.CO/a/b").is_ok(),
+            "host is case-insensitive"
+        );
+        assert!(
+            model_url_ok("https://huggingface.co:443/a/b").is_ok(),
+            "explicit port"
+        );
+
+        assert!(
+            model_url_ok("http://huggingface.co/a/b").is_err(),
+            "plain http"
+        );
+        assert!(
+            model_url_ok("https://evil.example/m.safetensors").is_err(),
+            "unknown host"
+        );
+        assert!(
+            model_url_ok("https://192.168.1.10/m.safetensors").is_err(),
+            "LAN address"
+        );
+        assert!(
+            model_url_ok("https://huggingface.co@evil.example/m").is_err(),
+            "userinfo trick"
+        );
+        assert!(model_url_ok("https://evil.example.huggingface.co.attacker.io/m").is_err());
+        assert!(
+            model_url_ok("https://huggingface.co/a b").is_err(),
+            "whitespace"
+        );
+        assert!(
+            model_url_ok("https://huggingface.co/a\"b").is_err(),
+            "quote"
+        );
+        assert!(
+            model_url_ok("https://huggingface.co/a\nb").is_err(),
+            "control char"
+        );
+        assert!(model_url_ok("").is_err());
+    }
+
+    /// The list must stay identical to the gateway's MODEL_HOSTS: a fetch
+    /// the gateway accepts and this node refuses fails with a message that
+    /// names neither side.
+    #[test]
+    fn fetch_host_allowlist_matches_the_gateway() {
+        let mut ours: Vec<&str> = MODEL_FETCH_HOSTS.to_vec();
+        ours.sort_unstable();
+        let mut gateway = vec![
+            "huggingface.co",
+            "cdn-lfs.huggingface.co",
+            "cdn-lfs-us-1.huggingface.co",
+            "civitai.com",
+            "github.com",
+            "objects.githubusercontent.com",
+            "raw.githubusercontent.com",
+        ];
+        gateway.sort_unstable();
+        assert_eq!(ours, gateway);
+    }
+
+    /// The attack: a path without a leading slash turns the loopback host
+    /// into userinfo, and `@other-host` becomes the real destination. The
+    /// node is the process that can see the provider's LAN.
+    #[test]
+    fn relay_paths_always_stay_on_loopback() {
+        assert_eq!(
+            container_url("http", 4321, "/api/tags", ""),
+            Some("http://127.0.0.1:4321/api/tags".into())
+        );
+        assert_eq!(
+            container_url("ws", 4321, "/ws", "clientId=abc"),
+            Some("ws://127.0.0.1:4321/ws?clientId=abc".into())
+        );
+        assert_eq!(
+            container_url("http", 4321, "@10.0.0.5:22/", ""),
+            Some("http://127.0.0.1:4321/@10.0.0.5:22/".into()),
+            "a missing slash is prepended, never reinterpreted"
+        );
+        assert_eq!(container_url("http", 4321, "/a\r\nHost: x", ""), None);
+        assert_eq!(container_url("http", 4321, "/a", "x=1\n"), None);
+        assert_eq!(container_url("http", 4321, "/a b", ""), None);
+    }
+
+    /// Memory is decided the way cores are: the gateway asks, the node
+    /// grants within what the owner keeps.
+    #[test]
+    fn session_memory_is_bounded_by_the_host_and_the_operator() {
+        // 16 GB host, no operator cap: owner keeps max(4 GB, a quarter) = 4.
+        assert_eq!(session_mem_gb(Some(64), 16 * 1024, None), 12);
+        assert_eq!(session_mem_gb(Some(8), 16 * 1024, None), 8);
+        assert_eq!(
+            session_mem_gb(None, 16 * 1024, None),
+            8,
+            "default request is 8"
+        );
+        // 64 GB host: owner keeps a quarter (16), so 48 is the most a session gets.
+        assert_eq!(session_mem_gb(Some(64), 64 * 1024, None), 48);
+        assert_eq!(session_mem_gb(Some(24), 64 * 1024, None), 24);
+        // Operator ceiling wins, in either direction, never above the host.
+        assert_eq!(session_mem_gb(Some(24), 64 * 1024, Some(16 * 1024)), 16);
+        assert_eq!(session_mem_gb(Some(64), 32 * 1024, Some(30 * 1024)), 30);
+        assert_eq!(session_mem_gb(Some(64), 32 * 1024, Some(999 * 1024)), 32);
+        // A tiny host still gets a container that can start.
+        assert_eq!(session_mem_gb(Some(8), 2 * 1024, None), 1);
+        assert_eq!(
+            session_mem_gb(Some(0), 16 * 1024, None),
+            1,
+            "zero is clamped up"
+        );
+    }
+
+    #[test]
+    fn env_keys_are_identifiers() {
+        assert!(env_key_ok("LMCACHE_CHUNK_SIZE"));
+        assert!(env_key_ok("_x1"));
+        assert!(!env_key_ok(""));
+        assert!(!env_key_ok("1ABC"));
+        assert!(!env_key_ok("A=B"));
+        assert!(!env_key_ok("A B"));
+        assert!(!env_key_ok("A\nB"));
+        assert!(!env_key_ok("--privileged"));
     }
 }
