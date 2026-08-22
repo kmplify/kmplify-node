@@ -3413,6 +3413,13 @@ async fn session(
         // own field rather than folded into `version` because the gateway
         // truncates that one to 32 chars; older gateways ignore this key.
         "worker_version": crate::version_string(),
+        // Which SYSTEM this build runs on, from the compiler, not probed at
+        // runtime: "macos"/"linux"/"windows" and "aarch64"/"x86_64". The
+        // gateway keeps these per node for an anonymous install count by
+        // platform; they name a hardware class, never a machine. Older
+        // gateways ignore the keys.
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
         "country": cfg.country,
         // Admission mode (v2.4). Absent/unknown reads as "auto" on the
         // gateway, so older gateways and workers stay compatible both ways.
