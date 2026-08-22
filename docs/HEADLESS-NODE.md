@@ -83,7 +83,7 @@ into its stack `.env`:
 | Variable | Default | Meaning |
 |---|---|---|
 | `PROVIDER_GATEWAY_URL` | the public fabric | gateway to join |
-| `PROVIDER_WORKLOADS` | *(empty = sessions off)* | template ids to host, e.g. `vllm-openai,vllm-openai-lmcache,comfyui,ollama,echo-test`. Running other people's containers is opt-in here exactly as in the app. |
+| `PROVIDER_WORKLOADS` | *(empty = sessions off)* | template ids to host, e.g. `vllm-openai,vllm-openai-lmcache,comfyui,ollama,speaches,echo-test`. Running other people's containers is opt-in here exactly as in the app. |
 | `PROVIDER_MAX_CPUS` | half the host | ceiling on CPUs lent to sessions |
 | `PROVIDER_MAX_VRAM_MB` | card total | ceiling on advertised VRAM |
 | `PROVIDER_MAX_DISK_GB` | unbounded | ceiling on disk sessions may fill |
@@ -169,8 +169,8 @@ the scheduler reads advertised VRAM as capacity.
 
 ## Scope, honestly
 
-- Serves: fabric container sessions (vLLM / ComfyUI / Ollama / echo-test
-  templates) and host-Ollama model inference.
+- Serves: fabric container sessions (vLLM / ComfyUI / Ollama / speech STT+TTS /
+  echo-test templates) and host-Ollama model inference.
 - Does **not** serve LlamaCPP: that is a backend engine, not a fabric
   template. It joins this node the day someone adds a llamacpp template to
   the gateway catalog, which is a template addition rather than a node
