@@ -28,7 +28,8 @@ decision anyone should make about a binary they cannot read.
   container flags per vendor. See the matrix below.
 - **Advertises honestly**: real GPU model and VRAM, physical cores rather than
   threads, cgroup limits rather than the host's numbers when containerised.
-- **Optionally hosts container sessions** (vLLM, ComfyUI, Ollama) on your GPU.
+- **Optionally hosts container sessions** (vLLM, ComfyUI, Ollama, speech
+  to text and text to speech) on your GPU.
   Off by default. This is opt-in per template, and never inferred from the fact
   that you have the hardware.
 - **Enforces your ceilings**: CPU, VRAM, RAM and disk caps you set are applied
@@ -154,7 +155,7 @@ configure it the same way.
 |---|---|---|
 | `PROVIDER_GATEWAY_URL` | the public fabric | Gateway to join. Point it at your own. |
 | `OLLAMA_BASE` | `http://127.0.0.1:11434` | Any OpenAI-compatible endpoint, despite the name. |
-| `PROVIDER_WORKLOADS` | *empty* | Container template ids to host. Empty means sessions are off. |
+| `PROVIDER_WORKLOADS` | *empty* | Container template ids to host (`vllm-openai`, `vllm-openai-lmcache`, `comfyui`, `comfyui-api`, `ollama`, `ollama-cpu`, `speaches`, `speaches-cpu`). Empty means sessions are off. |
 | `PROVIDER_COUNTRY` | *empty* | ISO alpha-2, so consumers can prefer EU capacity. Self-declared, see below. |
 | `PROVIDER_SHARE_INFERENCE` | `true` | Serve model jobs at all. |
 | `PROVIDER_SHARE_CPU` | `false` | Offer CPU and RAM as lendable capacity. |
@@ -198,6 +199,15 @@ gateway behaving:
 - **Ceilings are clamped here.** A session's memory cap, CPU share and readiness
   timeout all arrive as requests and are clamped locally, so a gateway cannot
   pin a container on your machine indefinitely or hand it the whole box.
+  Memory follows the same rule as cores: your `PROVIDER_MAX_RAM_MB` wins, and
+  without one a session never takes more than three quarters of the host.
+- **Model downloads are vetted twice.** Only https, only an allowlist of
+  model hosts (Hugging Face, Civitai, GitHub), only into the template's model
+  volume. The URL is handed to the downloader as an argument, never
+  interpolated into a shell command.
+- **The relay stays on loopback.** Relayed requests and sockets can only
+  reach the session container on 127.0.0.1; a path that tried to name
+  another host is refused.
 - **Stopping means stopping.** SIGTERM tears down every hosted session before
   the process exits, and a container that fails to die is reported rather than
   optimistically declared gone.
