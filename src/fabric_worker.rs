@@ -1310,6 +1310,38 @@ pub struct TemplatePin {
     pub repository: &'static str,
     /// The GPU stack the image needs. `Cpu` runs anywhere Docker does.
     pub accelerator: Backend,
+    /// The MOST network this template may ever be given on this node.
+    ///
+    /// A ceiling, not an instruction. The gateway sends what the catalog
+    /// asked for and this caps it, so a hostile or compromised gateway can
+    /// only ever ask for less than the build already allows. Same reasoning
+    /// as `repository`: the far end of a socket does not get to widen what
+    /// runs on someone else's machine.
+    pub network: Network,
+}
+
+/// What a workload container may reach.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Network {
+    /// `--network none`: no interface but loopback. Cannot reach the
+    /// provider's LAN, cannot phone home, cannot exfiltrate.
+    None,
+    /// Docker's default bridge: outbound internet. Needed by every image that
+    /// downloads model weights on first use, which is most of the catalog.
+    Egress,
+}
+
+impl Network {
+    /// Parse a `network` field from a workload_start frame.
+    ///
+    /// Anything unrecognised, including absent, is `None`. A typo in a
+    /// catalog must not read as permission.
+    pub fn from_frame(v: Option<&str>) -> Network {
+        match v {
+            Some("egress") => Network::Egress,
+            _ => Network::None,
+        }
+    }
 }
 
 /// Public so an embedder can ASSERT against it rather than hand-copying it.
@@ -1327,16 +1359,19 @@ pub const IMAGE_PINS: &[TemplatePin] = &[
         template: "vllm-openai",
         repository: "vllm/vllm-openai",
         accelerator: Backend::Cuda,
+        network: Network::Egress,
     },
     TemplatePin {
         template: "vllm-openai-lmcache",
         repository: "lmcache/vllm-openai",
         accelerator: Backend::Cuda,
+        network: Network::Egress,
     },
     TemplatePin {
         template: "comfyui",
         repository: "yanwk/comfyui-boot",
         accelerator: Backend::Cuda,
+        network: Network::Egress,
     },
     // Same engine as `comfyui`, separate CONSENT lane: a provider may host
     // headless API sessions for automation without inviting interactive
@@ -1346,21 +1381,25 @@ pub const IMAGE_PINS: &[TemplatePin] = &[
         template: "comfyui-api",
         repository: "yanwk/comfyui-boot",
         accelerator: Backend::Cuda,
+        network: Network::Egress,
     },
     TemplatePin {
         template: "ollama",
         repository: "ollama/ollama",
         accelerator: Backend::Cuda,
+        network: Network::Egress,
     },
     TemplatePin {
         template: "ollama-cpu",
         repository: "ollama/ollama",
         accelerator: Backend::Cpu,
+        network: Network::Egress,
     },
     TemplatePin {
         template: "echo-test",
         repository: "traefik/whoami",
         accelerator: Backend::Cpu,
+        network: Network::None,
     },
     // Speech: one OpenAI-compatible server for BOTH directions, speech to
     // text (/v1/audio/transcriptions, faster-whisper) and text to speech
@@ -1371,11 +1410,13 @@ pub const IMAGE_PINS: &[TemplatePin] = &[
         template: "speaches",
         repository: "ghcr.io/speaches-ai/speaches",
         accelerator: Backend::Cuda,
+        network: Network::Egress,
     },
     TemplatePin {
         template: "speaches-cpu",
         repository: "ghcr.io/speaches-ai/speaches",
         accelerator: Backend::Cpu,
+        network: Network::Egress,
     },
     // Vendor variants. Pinned here ahead of a host ever running one: a pin
     // for a template nobody schedules is inert, whereas a MISSING pin is a
@@ -1384,16 +1425,19 @@ pub const IMAGE_PINS: &[TemplatePin] = &[
         template: "vllm-rocm",
         repository: "rocm/vllm",
         accelerator: Backend::Rocm,
+        network: Network::Egress,
     },
     TemplatePin {
         template: "ollama-rocm",
         repository: "ollama/ollama",
         accelerator: Backend::Rocm,
+        network: Network::Egress,
     },
     TemplatePin {
         template: "vllm-oneapi",
         repository: "intel/llm-scaler-vllm",
         accelerator: Backend::OneApi,
+        network: Network::Egress,
     },
 ];
 
@@ -1480,6 +1524,27 @@ pub fn image_allowed_for(template: &str, image: &str) -> bool {
         || extra_image_pins()
             .iter()
             .any(|(t, pinned)| t == template && &repo == pinned)
+}
+
+/// The network this node will actually give `template`, given what the
+/// gateway asked for.
+///
+/// The lesser of the two, always. The compiled-in ceiling is what this build
+/// believes the template needs; the frame is what the gateway asked for. A
+/// gateway may ask for less than the ceiling and get it, which is how a
+/// catalog tightens a template without waiting for a node release. It may not
+/// ask for more.
+///
+/// An unpinned template (an operator's extra pin, or one this build predates)
+/// has no ceiling to consult and gets `None`: the safe end, since nothing here
+/// vouches for what it would reach.
+pub fn network_for(template: &str, requested: Network) -> Network {
+    let ceiling = IMAGE_PINS
+        .iter()
+        .find(|p| p.template == template)
+        .map(|p| p.network)
+        .unwrap_or(Network::None);
+    ceiling.min(requested)
 }
 
 /// Remove a session container and everything it owns, and CHECK that it went.
@@ -2421,6 +2486,17 @@ async fn start_workload(
         "-p".into(),
         format!("127.0.0.1:0:{port}"),
     ];
+    // Protocol v3.2. `--network none` leaves the container loopback only: it
+    // cannot reach the provider's LAN, cannot call home, cannot exfiltrate
+    // what it was given. Most of the catalog cannot run this way because it
+    // downloads model weights on first use, so the catalog says which do, and
+    // this node's own pin caps that. The published port is a host-side
+    // mapping and keeps working either way.
+    let net = network_for(&template, Network::from_frame(frame["network"].as_str()));
+    if net == Network::None {
+        args.push("--network".into());
+        args.push("none".into());
+    }
     if let Some(need) = required {
         // Per vendor: --gpus all for CUDA, the kfd/dri devices for ROCm,
         // the render node for Intel. None of them widen the sandbox.
@@ -4652,8 +4728,8 @@ mod template_accelerator_tests {
 #[cfg(test)]
 mod hardening_tests {
     use super::{
-        container_url, env_key_ok, fetch_script_args, model_url_ok, session_mem_gb,
-        MODEL_FETCH_HOSTS,
+        container_url, env_key_ok, fetch_script_args, model_url_ok, network_for, session_mem_gb,
+        Network, MODEL_FETCH_HOSTS,
     };
 
     /// The hole this closes: a quote in the URL used to end the quoted
@@ -4795,6 +4871,34 @@ mod hardening_tests {
             1,
             "zero is clamped up"
         );
+    }
+
+    #[test]
+    fn network_ceiling_is_the_lesser_of_pin_and_request() {
+        // A gateway asking for egress on a template pinned to none is the
+        // shape of the attack this exists to stop.
+        assert_eq!(network_for("echo-test", Network::Egress), Network::None);
+        assert_eq!(network_for("echo-test", Network::None), Network::None);
+        // vLLM downloads weights on first use, so its ceiling is egress...
+        assert_eq!(network_for("vllm-openai", Network::Egress), Network::Egress);
+        // ...but a catalog may still tighten it without a node release.
+        assert_eq!(network_for("vllm-openai", Network::None), Network::None);
+        // Nothing vouches for an unpinned template, so it gets the safe end.
+        assert_eq!(
+            network_for("not-a-template", Network::Egress),
+            Network::None
+        );
+    }
+
+    #[test]
+    fn unknown_network_values_read_as_none() {
+        assert_eq!(Network::from_frame(Some("egress")), Network::Egress);
+        assert_eq!(Network::from_frame(Some("none")), Network::None);
+        // A typo must never read as permission.
+        assert_eq!(Network::from_frame(Some("EGRESS")), Network::None);
+        assert_eq!(Network::from_frame(Some("bridge")), Network::None);
+        assert_eq!(Network::from_frame(Some("")), Network::None);
+        assert_eq!(Network::from_frame(None), Network::None);
     }
 
     #[test]
