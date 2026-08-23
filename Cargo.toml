@@ -47,8 +47,23 @@ reqwest = { version = "0.12", default-features = false, features = [
 # usual sources describe the container's VM, not the machine whose capacity
 # is being advertised.
 sysinfo = "0.32"
+sha2 = "0.10.9"
+ed25519-dalek = "2.1.1"
+# Optional Wasm runtime for the functions lane (src/functions.rs). Off by
+# default: the runtime is a large dependency and most providers never host
+# functions. Both crates must share one major version.
+wasmtime = { version = "23", optional = true, default-features = false, features = ["cranelift", "runtime", "wat"] }
+wasmtime-wasi = { version = "23", optional = true, default-features = false, features = ["preview1"] }
 
 [profile.release]
 codegen-units = 16
 lto = "thin"
 strip = true
+
+[features]
+default = []
+# Host signed Wasm functions in an in-process sandbox (wasmtime, WASI p1).
+wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
+
+[dev-dependencies]
+wat = "1.243.0"

@@ -22,6 +22,11 @@
 //!                          (default: $XDG_CONFIG_HOME|~/.config /kmplify-node)
 //!   KMPLIFY_GPU_BACKEND    force the accelerator: cuda|rocm|oneapi|metal|cpu
 //!   KMPLIFY_CUDA           older CUDA-only override: 1/0
+//!   PROVIDER_FUNCTIONS     host signed Wasm functions (true/false, default off)
+//!   PROVIDER_FUNCTIONS_PUBKEY  hex Ed25519 key of the catalog to trust
+//!   PROVIDER_MAX_FUNCTION_MB / _MS   per-call memory and wall-clock ceilings
+//!   PROVIDER_SHARE_VECTORS lend vector-collection storage (default off)
+//!   PROVIDER_MAX_VECTOR_MB ceiling on stored collections (default 1024)
 //!
 //! `kmplify-node check` prints the resolved configuration, the detected
 //! accelerators and the host probes (docker, vendor SMI tools, the model
@@ -134,6 +139,28 @@ async fn resolve_config() -> WorkerConfig {
         },
         cuda: accel == kmplify_node::gpu::Backend::Cuda,
         accelerator: accel,
+        // Protocol v3.0 lanes, both opt-in. Functions additionally need the
+        // gateway's function key, or the node trusts nothing and refuses all.
+        functions: kmplify_node::functions::FunctionsConfig {
+            enabled: env_opt("PROVIDER_FUNCTIONS")
+                .map(|v| v == "true")
+                .unwrap_or(false),
+            trusted_pubkey: env_opt("PROVIDER_FUNCTIONS_PUBKEY").unwrap_or_default(),
+            max_memory_mb: env_opt("PROVIDER_MAX_FUNCTION_MB")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(256),
+            max_ms: env_opt("PROVIDER_MAX_FUNCTION_MS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30_000),
+        },
+        vectors: kmplify_node::vectors::VectorsConfig {
+            enabled: env_opt("PROVIDER_SHARE_VECTORS")
+                .map(|v| v == "true")
+                .unwrap_or(false),
+            max_mb: env_opt("PROVIDER_MAX_VECTOR_MB")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1024),
+        },
         // This binary IS the crate, so its own version is the right answer.
         client_version: None,
         events: None, // headless: the log IS the surface
@@ -166,6 +193,32 @@ async fn run_check(cfg: &WorkerConfig) -> i32 {
     println!(
         "  ceilings   : cpus={:?} vram_mb={:?} disk_gb={:?}",
         cfg.max_shared_cpus, cfg.max_shared_vram_mb, cfg.max_shared_disk_gb
+    );
+    println!(
+        "  functions  : {}",
+        if !cfg.functions.enabled {
+            "OFF (set PROVIDER_FUNCTIONS=true to opt in)".to_string()
+        } else if cfg.functions.trusted_pubkey.is_empty() {
+            "ENABLED BUT TRUSTS NO KEY -- set PROVIDER_FUNCTIONS_PUBKEY; every job will be refused"
+                .to_string()
+        } else if !kmplify_node::functions::runtime_available() {
+            "enabled, but this build has no Wasm runtime (build with --features wasm)".to_string()
+        } else {
+            format!(
+                "wasmtime, key {}…, {} MB / {} ms per call",
+                &cfg.functions.trusted_pubkey[..8.min(cfg.functions.trusted_pubkey.len())],
+                cfg.functions.max_memory_mb,
+                cfg.functions.max_ms
+            )
+        }
+    );
+    println!(
+        "  vectors    : {}",
+        if cfg.vectors.enabled {
+            format!("ON, up to {} MB of collections", cfg.vectors.max_mb)
+        } else {
+            "OFF (set PROVIDER_SHARE_VECTORS=true to opt in)".to_string()
+        }
     );
     println!();
     println!("accelerator");
