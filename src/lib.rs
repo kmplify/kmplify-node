@@ -15,9 +15,11 @@
 //! the operator's view.
 
 pub mod fabric_worker;
+pub mod functions;
 pub mod gpu;
 pub mod hostcpu;
 pub mod proc;
+pub mod vectors;
 
 /// This crate's NOTICE, compiled in.
 ///
