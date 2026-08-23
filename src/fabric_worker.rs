@@ -1526,6 +1526,23 @@ pub fn image_allowed_for(template: &str, image: &str) -> bool {
             .any(|(t, pinned)| t == template && &repo == pinned)
 }
 
+/// Is this a tmpfs path we will mount under a read-only rootfs?
+///
+/// The value arrives over the socket, so it is checked rather than trusted.
+/// Absolute, not the root itself, no traversal, no separators that would let
+/// one entry become several docker arguments. `/` is refused specifically:
+/// mounting a tmpfs there hides the image and turns --read-only into theatre.
+pub fn tmpfs_path_ok(path: &str) -> bool {
+    !path.is_empty()
+        && path.starts_with('/')
+        && path != "/"
+        && !path.contains("..")
+        && !path.contains(':')
+        && !path.contains(',')
+        && !path.contains(char::is_whitespace)
+        && !path.contains('\0')
+}
+
 /// The network this node will actually give `template`, given what the
 /// gateway asked for.
 ///
@@ -2496,6 +2513,31 @@ async fn start_workload(
     if net == Network::None {
         args.push("--network".into());
         args.push("none".into());
+    }
+    // Protocol v3.3. A read-only rootfs means a workload cannot rewrite its
+    // own image at run time, so whatever it pulls in cannot persist into the
+    // next session on this machine. Named volumes are mounted rw OVER this and
+    // keep working, which is why a model cache is unaffected.
+    //
+    // Only honoured, never invented: a gateway that does not ask for it gets
+    // today's behaviour. This is a restriction, so a gateway declining to
+    // apply it gains nothing it does not already have, and there is no ceiling
+    // to enforce the way there is for the network.
+    if frame["read_only"].as_bool().unwrap_or(false) {
+        args.push("--read-only".into());
+        // Writable paths, in memory only: nothing here touches the provider's
+        // disk. Capped so a hostile catalog cannot mount a thousand of them.
+        let wanted = frame["tmpfs"].as_array().cloned().unwrap_or_default();
+        for path in wanted.iter().filter_map(|v| v.as_str()).take(8) {
+            if tmpfs_path_ok(path) {
+                args.push("--tmpfs".into());
+                args.push(path.to_string());
+            } else {
+                log(format!(
+                    "refusing tmpfs path {path:?} for session {session}"
+                ));
+            }
+        }
     }
     if let Some(need) = required {
         // Per vendor: --gpus all for CUDA, the kfd/dri devices for ROCm,
@@ -4729,7 +4771,7 @@ mod template_accelerator_tests {
 mod hardening_tests {
     use super::{
         container_url, env_key_ok, fetch_script_args, model_url_ok, network_for, session_mem_gb,
-        Network, MODEL_FETCH_HOSTS,
+        tmpfs_path_ok, Network, MODEL_FETCH_HOSTS,
     };
 
     /// The hole this closes: a quote in the URL used to end the quoted
@@ -4871,6 +4913,21 @@ mod hardening_tests {
             1,
             "zero is clamped up"
         );
+    }
+
+    #[test]
+    fn tmpfs_paths_are_validated_not_trusted() {
+        assert!(tmpfs_path_ok("/tmp"));
+        assert!(tmpfs_path_ok("/var/run"));
+        // "/" would hide the image and make --read-only meaningless.
+        assert!(!tmpfs_path_ok("/"));
+        assert!(!tmpfs_path_ok(""));
+        assert!(!tmpfs_path_ok("tmp"));
+        assert!(!tmpfs_path_ok("/tmp/../etc"));
+        // Separators docker would read as more than one option.
+        assert!(!tmpfs_path_ok("/tmp:rw"));
+        assert!(!tmpfs_path_ok("/tmp,size=9g"));
+        assert!(!tmpfs_path_ok("/tmp /etc"));
     }
 
     #[test]
