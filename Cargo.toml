@@ -1,6 +1,6 @@
 [package]
 name = "kmplify-node"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.77"
 description = "Provider agent for the KMPLIFY Compute Fabric: lend a machine's GPU, CPU and local models to a fabric over one outbound connection."
