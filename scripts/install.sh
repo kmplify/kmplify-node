@@ -141,3 +141,4 @@ if [ "$DO_CHECK" = 1 ]; then
 fi
 say ""
 say "done. Start lending with: kmplify-node   (or the systemd service)"
+say "watch and control it with: kmplify-node tui"

@@ -93,12 +93,119 @@ into its stack `.env`:
 | `KMPLIFY_CUDA` | autodetected | force CUDA advertising `1`/`0` |
 
 Always start with the preflight — it prints the resolved configuration and
-probes docker/nvidia-smi/Ollama without connecting, and exits non-zero when
-sessions are offered but Docker is unreachable, so provisioning scripts fail
-loudly instead of deploying a broken node:
+probes docker/nvidia-smi/the gateway/Ollama without connecting, and exits
+non-zero when the host cannot serve as configured, so provisioning scripts
+fail loudly instead of deploying a broken node:
 
 ```sh
-kmplify-node check
+kmplify-node check          # 0 ready · 1 cannot serve · 2 bad configuration
+kmplify-node check --json   # the same verdict, for a script
+```
+
+Every variable above also has a flag that sets it (`--gateway`,
+`--workloads`, `--max-vram-mb`, `--no-share-inference`, …), which is handy
+for trying a setting before writing it into a unit file:
+
+```sh
+kmplify-node check --gateway https://fabric.example --workloads vllm-openai
+```
+
+## The terminal dashboard
+
+`kmplify-node tui` is how a GUI-less machine is operated: it shows link
+state, advertised models, the peers running here and the log, and it drives
+the node — pause and resume sharing (`p`), reconnect (`c`), evict a session
+(`e`), stop the node (`x`), write a snapshot for a bug report (`w`).
+
+```sh
+kmplify-node tui
+```
+
+It attaches to the node already running on this machine and leaves it running
+when you quit. With no node running it starts one, and quitting stops it.
+
+The node publishes `status.json` in `KMPLIFY_NODE_DIR` (mode 0600) and reads
+commands dropped as files into `control/` there. Nothing listens on a port,
+which also means the dashboard must run as the user that owns that directory.
+For the systemd install below, that is the `kmplify` user:
+
+```sh
+sudo -u kmplify KMPLIFY_NODE_DIR=/var/lib/kmplify-node kmplify-node tui
+```
+
+### What this machine lends (key `5`)
+
+The sharing screen is the desktop app's "Provide this machine's Resources"
+panel: switches for inference, per-template container sessions, CPU/RAM and
+manual approval; ceilings for cores, VRAM, RAM and disk; country and colibri
+upstream. `space` toggles, `←/→` moves a ceiling (`shift` for a bigger step),
+`enter` edits a field, `d` hands a row back to the environment, `s` applies —
+which reconnects the node so the fabric hears the new terms. Hosted sessions
+survive it.
+
+The same without a terminal:
+
+```sh
+kmplify-node set max-cpus=6 share-cpu=true
+kmplify-node set workloads=vllm-openai,comfyui   # empty value = sessions off
+kmplify-node set --clear max-cpus                # back to /etc/kmplify-node.env
+kmplify-node set --list
+```
+
+Both write `settings.json` in `KMPLIFY_NODE_DIR` (mode 0600 — it can hold the
+colibri key) and signal the running node, which re-advertises within a second;
+a node that is offline picks the change up on its next connection. **A stored
+choice overrides the environment**, so an operator standing at the machine
+beats a unit file written months ago. `kmplify-node check` prints every such
+override, and `set --clear KEY` removes one.
+
+### Activity monitor (key `7`)
+
+CPU, GPU, VRAM and RAM live, each with a bar and five minutes of history, a
+bar per logical CPU, and what the fabric is holding right now (sessions, cores
+promised to peers, jobs, disk). The home screen carries the same four meters
+in miniature.
+
+GPU utilization comes from `nvidia-smi` / `rocm-smi` and is sampled every few
+seconds — a node lending its cycles should not spend them on being watched.
+Where a platform will not report a figure (macOS exposes GPU load only to
+privileged tools) the panel says so instead of drawing a zero.
+
+### Who may use it (key `6`)
+
+Consumers waiting for a decision (`a` approve, `n` deny, `b` block, `u` clear
+the rule), consumers seen recently and how their work arrived, and the
+invitations this node has minted (`i` new, `h` hold or resume, `v` revoke).
+
+Turning on manual approval without this screen would be a trap: the node
+would park every unknown consumer and nobody at the terminal could let them
+in. The screen talks to the gateway as the node, with the credential in
+`KMPLIFY_NODE_DIR`; an unreachable gateway costs the screen and nothing else.
+
+### Admission from a script
+
+The mode is a setting like any other, and the decisions have their own verbs,
+so a machine with no terminal in front of it is still yours to govern:
+
+```sh
+kmplify-node set approval-mode=manual   # unknown consumers wait for you
+kmplify-node peers                      # who is waiting, who is using it
+kmplify-node peers approve node-9abc    # standing rule: they are in
+kmplify-node peers block anon-1a2b3c4d  # refused in every mode
+kmplify-node peers clear node-9abc      # back to whatever the mode says
+kmplify-node peers invite "Anna's phone"   # prints the invitation id
+kmplify-node peers revoke <invitation-id>
+```
+
+`peers` talks to the gateway with the node's stored credential, so it works
+whether or not the node is currently running — approving from cron is fine.
+Invitations bypass manual admission by design: minting one is the approval.
+
+For scripts and monitoring, the same snapshot without the full screen:
+
+```sh
+kmplify-node status          # human-readable, exit 1 when no node is running
+kmplify-node status --json   # every field, including live CPU/RAM/VRAM
 ```
 
 ## Docker (inference-only)
@@ -121,6 +228,13 @@ docker run -d --name kmplify-node --restart unless-stopped \
 Ollama; elsewhere set `OLLAMA_BASE=http://host.docker.internal:11434`. The
 volume keeps the node's anonymous identity across container replacements;
 without it every recreation joins the fabric as a brand-new peer.
+
+The dashboard attaches from inside the container, where the node directory
+and the running worker are:
+
+```sh
+docker exec -it kmplify-node kmplify-node tui
+```
 
 ## Run as a service
 
