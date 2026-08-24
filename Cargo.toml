@@ -1,8 +1,13 @@
 [package]
 name = "kmplify-node"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-rust-version = "1.77"
+# What the dependency floor actually is, now that both lanes ship by default:
+# ratatui asks for 1.88 and wasmtime for 1.95. Claiming 1.77 while the tree
+# needs 1.95 only turns a clear "update your toolchain" into a wall of
+# unresolved-import errors. Operators install release binaries; the people
+# who see this are building from source, and they have rustup.
+rust-version = "1.95"
 description = "Provider agent for the KMPLIFY Compute Fabric: lend a machine's GPU, CPU and local models to a fabric over one outbound connection."
 authors = ["KMPLIFY"]
 license = "Apache-2.0"
@@ -55,11 +60,13 @@ ed25519-dalek = "2.1.1"
 # ratatui re-exports the crossterm it was built against, so the terminal
 # backend can never be a mismatched second version.
 ratatui = { version = "0.30", optional = true }
-# Optional Wasm runtime for the functions lane (src/functions.rs). Off by
-# default: the runtime is a large dependency and most providers never host
-# functions. Both crates must share one major version.
-wasmtime = { version = "23", optional = true, default-features = false, features = ["cranelift", "runtime", "wat"] }
-wasmtime-wasi = { version = "23", optional = true, default-features = false, features = ["preview1"] }
+# The Wasm runtime for the functions lane (src/functions.rs). Both crates
+# must share one major version. Kept CURRENT rather than pinned old: this is
+# the sandbox that stands between other people's code and an operator's
+# machine, and it was 25 majors behind — which is also where the Windows
+# trap path was broken.
+wasmtime = { version = "48", optional = true, default-features = false, features = ["cranelift", "runtime", "wat"] }
+wasmtime-wasi = { version = "48", optional = true, default-features = false, features = ["p1"] }
 
 [profile.release]
 codegen-units = 16
@@ -67,10 +74,18 @@ lto = "thin"
 strip = true
 
 [features]
-default = ["tui"]
+# Both lanes ship in the released binaries. The functions lane was optional
+# for a year and the result was a fabric where the gateway could sign and
+# schedule a function and NOT ONE node could run it: the runtime was absent
+# from every build anyone actually installed. A capability that ships turned
+# off in every artifact is a capability that does not exist.
+default = ["tui", "wasm"]
 # `kmplify-node tui`: watch and control the node from a terminal.
 tui = ["dep:ratatui"]
 # Host signed Wasm functions in an in-process sandbox (wasmtime, WASI p1).
+# Costs ~8 MB of binary; hosting functions is still opt-in at RUNTIME
+# (PROVIDER_FUNCTIONS, plus a catalog key to trust), so what this decides is
+# only whether an operator who opts in has an engine to do it with.
 wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
 
 [dev-dependencies]

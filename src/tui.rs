@@ -619,7 +619,7 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
             // slower file-writing cadence. The GPU probe is a subprocess, so
             // it still goes every other second.
             if !app.attached() {
-                status::sample_host(accel, ticks % 2 == 0).await;
+                status::sample_host(accel, ticks.is_multiple_of(2)).await;
             }
             app.refresh();
             ticks = ticks.wrapping_add(1);
@@ -1528,6 +1528,52 @@ impl App {
             }
         }
         rows.push(SharingRow::Section(
+            "protocol v3.0 lanes — computing that is not a model",
+        ));
+        rows.push(SharingRow::Toggle {
+            key: "functions",
+            label: "Signed Wasm functions",
+            on: d.functions.unwrap_or(s.functions_enabled),
+            note: {
+                let key = d
+                    .functions_pubkey
+                    .clone()
+                    .unwrap_or_else(|| s.functions_pubkey.clone());
+                if key.is_empty() {
+                    "needs the catalog key below, or every call is refused".into()
+                } else {
+                    format!("{} calls served", s.jobs.functions)
+                }
+            },
+            editable: true,
+            overridden: d.functions.is_some(),
+        });
+        rows.push(SharingRow::Field {
+            key: "functions-pubkey",
+            label: "Catalog key to trust",
+            shown: {
+                let key = d
+                    .functions_pubkey
+                    .clone()
+                    .unwrap_or_else(|| s.functions_pubkey.clone());
+                if key.is_empty() {
+                    "none — GET /v1/functions has it".into()
+                } else {
+                    format!("{}…", &key[..16.min(key.len())])
+                }
+            },
+            overridden: d.functions_pubkey.is_some(),
+        });
+        rows.push(SharingRow::Toggle {
+            key: "share-vectors",
+            label: "Vector collections (peers' RAG indexes)",
+            on: d.share_vectors.unwrap_or(s.vectors_enabled),
+            note: format!("{} of {} MB used", s.vectors_used_mb, s.vectors_max_mb),
+            editable: true,
+            overridden: d.share_vectors.is_some(),
+        });
+
+        rows.push(SharingRow::Section(
             "ceilings — peer sessions never exceed these",
         ));
         rows.push(SharingRow::Ceiling {
@@ -1658,6 +1704,8 @@ impl App {
                         self.draft.approval_mode =
                             Some(if value { "manual" } else { "auto" }.to_string())
                     }
+                    "functions" => self.draft.functions = Some(value),
+                    "share-vectors" => self.draft.share_vectors = Some(value),
                     _ => {}
                 }
             }
@@ -1745,6 +1793,14 @@ impl App {
                     .colibri_base
                     .clone()
                     .unwrap_or_else(|| self.snap.baseline.colibri.clone()),
+            ),
+            "functions-pubkey" => (
+                "Catalog key to trust: 64 hex characters, empty to trust none",
+                false,
+                self.draft
+                    .functions_pubkey
+                    .clone()
+                    .unwrap_or_else(|| self.snap.functions_pubkey.clone()),
             ),
             _ => ("Colibri API key (never shown)", true, String::new()),
         };

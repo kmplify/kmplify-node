@@ -82,6 +82,21 @@ pub struct Settings {
     /// Ceiling on disk sessions may fill, in GB (`PROVIDER_MAX_DISK_GB`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_disk_gb: Option<u64>,
+    /// Host signed Wasm functions (`PROVIDER_FUNCTIONS`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub functions: Option<bool>,
+    /// The catalog key those functions must be signed with
+    /// (`PROVIDER_FUNCTIONS_PUBKEY`). Without it the node trusts nothing and
+    /// refuses every function, which is why it is settable next to the switch
+    /// rather than only in a unit file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub functions_pubkey: Option<String>,
+    /// Lend storage for replicated vector collections (`PROVIDER_SHARE_VECTORS`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share_vectors: Option<bool>,
+    /// Ceiling on those collections in MB (`PROVIDER_MAX_VECTOR_MB`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_vector_mb: Option<u64>,
     /// Show what an installed rewards companion reports (`PROVIDER_REWARDS`).
     ///
     /// Deliberately NOT applied to `WorkerConfig`: the worker has no idea
@@ -108,6 +123,10 @@ pub const KEYS: &[(&str, &str)] = &[
     ("max-vram-mb", "PROVIDER_MAX_VRAM_MB"),
     ("max-ram-mb", "PROVIDER_MAX_RAM_MB"),
     ("max-disk-gb", "PROVIDER_MAX_DISK_GB"),
+    ("functions", "PROVIDER_FUNCTIONS"),
+    ("functions-pubkey", "PROVIDER_FUNCTIONS_PUBKEY"),
+    ("share-vectors", "PROVIDER_SHARE_VECTORS"),
+    ("max-vector-mb", "PROVIDER_MAX_VECTOR_MB"),
     ("rewards", "PROVIDER_REWARDS"),
 ];
 
@@ -184,6 +203,22 @@ impl Settings {
         if let Some(v) = self.max_disk_gb {
             cfg.max_shared_disk_gb = (v > 0).then_some(v);
         }
+        if let Some(v) = self.functions {
+            cfg.functions.enabled = v;
+        }
+        if let Some(v) = &self.functions_pubkey {
+            cfg.functions.trusted_pubkey = v.clone();
+        }
+        if let Some(v) = self.share_vectors {
+            cfg.vectors.enabled = v;
+        }
+        // Zero would mean "lend no storage", which is what the switch above
+        // is for; a ceiling of nothing is not a ceiling.
+        if let Some(v) = self.max_vector_mb {
+            if v > 0 {
+                cfg.vectors.max_mb = v;
+            }
+        }
     }
 
     /// Human lines naming every override that contradicts the environment.
@@ -242,6 +277,20 @@ impl Settings {
         }
         if let Some(v) = &self.colibri_base {
             note("COLIBRI_BASE", from_env.colibri_base.clone(), v.clone());
+        }
+        if let Some(v) = self.functions {
+            note(
+                "PROVIDER_FUNCTIONS",
+                from_env.functions.enabled.to_string(),
+                v.to_string(),
+            );
+        }
+        if let Some(v) = self.share_vectors {
+            note(
+                "PROVIDER_SHARE_VECTORS",
+                from_env.vectors.enabled.to_string(),
+                v.to_string(),
+            );
         }
         // Deliberately no line for the colibri API key: reporting a secret to
         // say it differs is still reporting it.
@@ -321,6 +370,21 @@ impl Settings {
             "max-vram-mb" => self.max_vram_mb = Some(parse_num::<u64>(key, value)?),
             "max-ram-mb" => self.max_ram_mb = Some(parse_num::<u64>(key, value)?),
             "max-disk-gb" => self.max_disk_gb = Some(parse_num::<u64>(key, value)?),
+            "functions" => self.functions = Some(parse_bool(key, value)?),
+            "functions-pubkey" => {
+                let v = value.to_ascii_lowercase();
+                // 32 bytes of Ed25519, hex. Checked here because the failure
+                // it prevents is silent: a mistyped key refuses every job
+                // with a signature error and looks like the gateway's fault.
+                if !v.is_empty() && (v.len() != 64 || !v.chars().all(|c| c.is_ascii_hexdigit())) {
+                    return Err(format!(
+                        "{key} must be 64 hex characters (the \"pubkey\" from GET /v1/functions)"
+                    ));
+                }
+                self.functions_pubkey = Some(v);
+            }
+            "share-vectors" => self.share_vectors = Some(parse_bool(key, value)?),
+            "max-vector-mb" => self.max_vector_mb = Some(parse_num::<u64>(key, value)?),
             "rewards" => self.rewards = Some(parse_bool(key, value)?),
             _ => {
                 return Err(format!(
@@ -346,6 +410,10 @@ impl Settings {
             "max-vram-mb" => self.max_vram_mb = None,
             "max-ram-mb" => self.max_ram_mb = None,
             "max-disk-gb" => self.max_disk_gb = None,
+            "functions" => self.functions = None,
+            "functions-pubkey" => self.functions_pubkey = None,
+            "share-vectors" => self.share_vectors = None,
+            "max-vector-mb" => self.max_vector_mb = None,
             "rewards" => self.rewards = None,
             _ => {
                 return Err(format!(
@@ -385,6 +453,19 @@ impl Settings {
         push("max-vram-mb", self.max_vram_mb.map(|v| v.to_string()));
         push("max-ram-mb", self.max_ram_mb.map(|v| v.to_string()));
         push("max-disk-gb", self.max_disk_gb.map(|v| v.to_string()));
+        push("functions", self.functions.map(|v| v.to_string()));
+        push(
+            "functions-pubkey",
+            self.functions_pubkey.as_ref().map(|k| {
+                if k.is_empty() {
+                    "(cleared)".into()
+                } else {
+                    format!("{}…", &k[..8.min(k.len())])
+                }
+            }),
+        );
+        push("share-vectors", self.share_vectors.map(|v| v.to_string()));
+        push("max-vector-mb", self.max_vector_mb.map(|v| v.to_string()));
         push("rewards", self.rewards.map(|v| v.to_string()));
         out
     }
@@ -559,6 +640,41 @@ mod tests {
     }
 
     #[test]
+    fn the_v3_lanes_are_switchable_without_touching_a_unit_file() {
+        // The runtime ships in every released binary now, so the difference
+        // between "can host functions" and "cannot" is these two lines.
+        let mut s = Settings::default();
+        s.set("functions", "true").unwrap();
+        s.set("functions-pubkey", &"ab".repeat(32)).unwrap();
+        s.set("share-vectors", "yes").unwrap();
+        s.set("max-vector-mb", "4096").unwrap();
+        let mut cfg = env_cfg();
+        s.apply(&mut cfg);
+        assert!(cfg.functions.enabled);
+        assert_eq!(cfg.functions.trusted_pubkey, "ab".repeat(32));
+        assert!(cfg.vectors.enabled);
+        assert_eq!(cfg.vectors.max_mb, 4096);
+    }
+
+    #[test]
+    fn a_mistyped_catalog_key_is_refused_where_it_is_typed() {
+        // Otherwise it fails much later, as a signature error on every job,
+        // which reads as the gateway's fault rather than a typo.
+        let mut s = Settings::default();
+        assert!(s.set("functions-pubkey", "not-a-key").is_err());
+        assert!(s.set("functions-pubkey", &"a".repeat(63)).is_err());
+        assert!(s.set("functions-pubkey", &"zz".repeat(32)).is_err());
+        s.set("functions-pubkey", &"AB".repeat(32)).unwrap();
+        assert_eq!(
+            s.functions_pubkey.as_deref(),
+            Some("ab".repeat(32).as_str())
+        );
+        // Emptying it is how an operator says "trust nothing again".
+        s.set("functions-pubkey", "").unwrap();
+        assert_eq!(s.functions_pubkey.as_deref(), Some(""));
+    }
+
+    #[test]
     fn the_listing_never_prints_the_colibri_key() {
         let mut s = Settings::default();
         s.set("colibri-key", "super-secret").unwrap();
@@ -599,7 +715,10 @@ mod tests {
             // dashboard offers a row nothing can write.
             assert!(s.clear(key).is_ok(), "{key} not clearable");
             let sample = match *key {
-                "share-inference" | "share-cpu" => "true",
+                "share-inference" | "share-cpu" | "functions" | "share-vectors" | "rewards" => {
+                    "true"
+                }
+                "functions-pubkey" => &"a".repeat(64),
                 "approval-mode" => "auto",
                 "country" => "DE",
                 "colibri" => "http://127.0.0.1:5000",

@@ -240,6 +240,10 @@ pub struct Snapshot {
     pub delivered: Delivered,
 
     pub functions_enabled: bool,
+    /// The catalog key this node trusts, or empty. Public by nature — it is a
+    /// verification key — and a node that trusts none refuses every function,
+    /// which an operator has to be able to SEE.
+    pub functions_pubkey: String,
     pub vectors_enabled: bool,
     pub vectors_used_mb: u64,
     pub vectors_max_mb: u64,
@@ -599,8 +603,8 @@ pub async fn publish_loop(
     let tmp = path.with_extension("json.tmp");
     let mut tick: u32 = 0;
     loop {
-        sample_host(accel, tick % GPU_EVERY == 0).await;
-        if tick % DISK_EVERY == 0 {
+        sample_host(accel, tick.is_multiple_of(GPU_EVERY)).await;
+        if tick.is_multiple_of(DISK_EVERY) {
             let used = crate::fabric_worker::fabric_disk_used_mb().await;
             update(move |s| s.fabric_disk_mb = used);
         }

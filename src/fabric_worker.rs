@@ -128,6 +128,7 @@ fn publish_config(cfg: &WorkerConfig) {
         s.max_disk_gb = cfg.max_shared_disk_gb;
         s.colibri = cfg.colibri_base.clone();
         s.functions_enabled = cfg.functions.enabled;
+        s.functions_pubkey = cfg.functions.trusted_pubkey.clone();
         s.vectors_enabled = cfg.vectors.enabled;
         s.vectors_max_mb = cfg.vectors.max_mb;
         if let Some(v) = &cfg.client_version {
@@ -2835,7 +2836,7 @@ async fn start_workload(
         // about a crash from second 20. Every third tick keeps the docker
         // exec chatter down while still reporting a death within ~3s.
         ticks += 1;
-        if ticks % 3 == 0 {
+        if ticks.is_multiple_of(3) {
             if let Some(code) = container_exit(&name).await {
                 let tail = container_log_tail(&name, 15).await;
                 sessions.lock().await.remove(&session);
