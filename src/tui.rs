@@ -54,6 +54,10 @@ const POLL: Duration = Duration::from_millis(1000);
 /// enough for a busy gateway, short enough that a wedged one is obvious.
 const GATEWAY_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// How often the dashboard asks a rewards companion. Minutes, because a
+/// balance is not a live metric and asking costs a process spawn.
+const REWARDS_POLL: Duration = Duration::from_secs(120);
+
 /// How often the peers screen re-asks while it is open. Consumers arrive and
 /// leave on human timescales; polling harder would only add gateway load.
 const PEERS_POLL: Duration = Duration::from_secs(5);
@@ -173,12 +177,15 @@ enum View {
     Activity,
 }
 
-/// Something a spawned gateway call has to say.
-enum PeerMsg {
+/// Something a spawned background call has to say: the gateway about peers,
+/// or an optional rewards companion about payouts.
+enum BgMsg {
     Loaded(Result<Peers, String>),
     /// A decision or an invitation change: a line for the footer, and a
     /// reason to refetch.
     Acted(Result<String, String>),
+    /// What a rewards companion reports, or why it could not be asked.
+    Rewards(Result<kmplify_node::rewards::Report, String>),
 }
 
 /// A text setting being typed into.
@@ -247,11 +254,15 @@ struct App {
     peers_loading: bool,
     /// Rolling measurements behind the activity screen and the home meters.
     meters: Meters,
+    /// What an optional rewards companion last said. `None` until asked, and
+    /// nothing is asked unless the operator switched rewards on.
+    rewards: Option<Result<kmplify_node::rewards::Report, String>>,
+    last_rewards_ask: Instant,
     last_peers_fetch: Instant,
     /// Where gateway work reports back to. The screen must keep painting
     /// while a request is in flight, so every call is spawned and answers
     /// here.
-    peer_tx: tokio::sync::mpsc::UnboundedSender<PeerMsg>,
+    peer_tx: tokio::sync::mpsc::UnboundedSender<BgMsg>,
     /// The node's credential, for talking to the gateway as this node.
     creds_path: PathBuf,
     gateway: String,
@@ -539,7 +550,7 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
     // The stored sharing choices are the starting point of the draft, so the
     // screen opens showing what this node is actually applying.
     let stored = Settings::load(&dir);
-    let (peer_tx, mut peer_rx) = tokio::sync::mpsc::unbounded_channel::<PeerMsg>();
+    let (peer_tx, mut peer_rx) = tokio::sync::mpsc::unbounded_channel::<BgMsg>();
     let mut app = App {
         attached_to: attach_mode.then(|| dir.clone()),
         node_dir: dir,
@@ -552,6 +563,8 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
         peers_sel: 0,
         peers_loading: false,
         meters: Meters::default(),
+        rewards: None,
+        last_rewards_ask: Instant::now() - REWARDS_POLL,
         last_peers_fetch: Instant::now(),
         peer_tx,
         creds_path,
@@ -626,6 +639,9 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
         {
             app.fetch_peers();
         }
+        if app.last_rewards_ask.elapsed() >= REWARDS_POLL {
+            app.fetch_rewards();
+        }
         tokio::select! {
             key = keys_rx.recv() => match key {
                 Some(k) => app.on_key(k),
@@ -635,7 +651,7 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
             },
             msg = peer_rx.recv() => {
                 if let Some(msg) = msg {
-                    app.on_peer_msg(msg);
+                    app.on_bg_msg(msg);
                 }
             }
             _ = tokio::time::sleep(FRAME) => {}
@@ -1072,6 +1088,26 @@ fn draw_work(f: &mut Frame, app: &App, area: Rect) {
                 s.vectors_used_mb,
                 s.vectors_max_mb
             )),
+        ]));
+    }
+    if let Some(rewards) = &app.rewards {
+        lines.push(Line::from(vec![
+            field("rewards"),
+            match rewards {
+                Ok(r) => Span::styled(
+                    kmplify_node::rewards::summary_short(r),
+                    Style::new().fg(if r.testnet {
+                        // A test-network balance is not money, and the colour
+                        // says so before the number does.
+                        Color::Yellow
+                    } else if r.linked {
+                        Color::Green
+                    } else {
+                        MUTED
+                    }),
+                ),
+                Err(e) => Span::styled(e.clone(), Style::new().fg(MUTED)),
+            },
         ]));
     }
     if !s.link_detail.is_empty() && s.link != Link::Online {
@@ -2058,6 +2094,26 @@ impl App {
         Ok((gateway, creds.token))
     }
 
+    /// Ask the rewards companion, if the operator switched it on. Slow on
+    /// purpose: a balance moves on the timescale of hours, and a dashboard
+    /// that spawns a process every second to watch one is a dashboard that
+    /// costs its owner the machine they are trying to rent out.
+    fn fetch_rewards(&mut self) {
+        let stored = Settings::load(&self.node_dir);
+        let companion = kmplify_node::rewards::Companion::resolve(stored.rewards_enabled());
+        if companion == kmplify_node::rewards::Companion::Off {
+            self.rewards = None;
+            self.last_rewards_ask = Instant::now();
+            return;
+        }
+        self.last_rewards_ask = Instant::now();
+        let (tx, dir) = (self.peer_tx.clone(), self.node_dir.clone());
+        tokio::spawn(async move {
+            let out = kmplify_node::rewards::ask(&companion, &dir).await;
+            let _ = tx.send(BgMsg::Rewards(out));
+        });
+    }
+
     fn fetch_peers(&mut self) {
         let (gateway, token) = match self.gateway_auth() {
             Ok(v) => v,
@@ -2071,7 +2127,7 @@ impl App {
         let tx = self.peer_tx.clone();
         tokio::spawn(async move {
             let out = peers::fetch(&gateway, &token, GATEWAY_TIMEOUT).await;
-            let _ = tx.send(PeerMsg::Loaded(out));
+            let _ = tx.send(BgMsg::Loaded(out));
         });
     }
 
@@ -2098,7 +2154,7 @@ impl App {
             let out = peers::decide(&gateway, &token, &consumer, decision, GATEWAY_TIMEOUT)
                 .await
                 .map(|()| format!("{short} {verb}"));
-            let _ = tx.send(PeerMsg::Acted(out));
+            let _ = tx.send(BgMsg::Acted(out));
         });
         self.say("asking the gateway…");
     }
@@ -2113,7 +2169,7 @@ impl App {
             let out = peers::invite(&gateway, &token, &label, GATEWAY_TIMEOUT)
                 .await
                 .map(|inv| format!("invitation {} minted", inv.invitation_id));
-            let _ = tx.send(PeerMsg::Acted(out));
+            let _ = tx.send(BgMsg::Acted(out));
         });
         self.say("minting…");
     }
@@ -2146,7 +2202,7 @@ impl App {
                         "invitation resumed".to_string()
                     }
                 });
-            let _ = tx.send(PeerMsg::Acted(out));
+            let _ = tx.send(BgMsg::Acted(out));
         });
     }
 
@@ -2160,7 +2216,7 @@ impl App {
             let out = peers::revoke(&gateway, &token, &id, GATEWAY_TIMEOUT)
                 .await
                 .map(|()| "invitation revoked".to_string());
-            let _ = tx.send(PeerMsg::Acted(out));
+            let _ = tx.send(BgMsg::Acted(out));
         });
     }
 
@@ -2192,9 +2248,9 @@ impl App {
         true
     }
 
-    fn on_peer_msg(&mut self, msg: PeerMsg) {
+    fn on_bg_msg(&mut self, msg: BgMsg) {
         match msg {
-            PeerMsg::Loaded(Ok(p)) => {
+            BgMsg::Loaded(Ok(p)) => {
                 self.peers_loading = false;
                 self.peers_error.clear();
                 self.peers = Some(p);
@@ -2204,17 +2260,18 @@ impl App {
                     self.peer_move(1);
                 }
             }
-            PeerMsg::Loaded(Err(e)) => {
+            BgMsg::Loaded(Err(e)) => {
                 self.peers_loading = false;
                 self.peers_error = e;
             }
-            PeerMsg::Acted(Ok(msg)) => {
+            BgMsg::Acted(Ok(msg)) => {
                 self.say(msg);
                 // The answer is on the gateway, so re-read rather than
                 // guessing what the decision did to the lists.
                 self.fetch_peers();
             }
-            PeerMsg::Acted(Err(e)) => self.say(format!("gateway refused: {e}")),
+            BgMsg::Acted(Err(e)) => self.say(format!("gateway refused: {e}")),
+            BgMsg::Rewards(r) => self.rewards = Some(r),
         }
     }
 }
@@ -2717,6 +2774,8 @@ mod tests {
             peers_sel: 0,
             peers_loading: false,
             meters: Meters::default(),
+            rewards: None,
+            last_rewards_ask: Instant::now(),
             last_peers_fetch: Instant::now(),
             peer_tx: tokio::sync::mpsc::unbounded_channel().0,
             creds_path: std::env::temp_dir().join("fabric_node.json"),
@@ -3150,7 +3209,7 @@ mod tests {
         // No fetch has answered yet: the screen renders a waiting line rather
         // than an empty box or a panic.
         assert_eq!(a.peer_rows().len(), 1);
-        a.on_peer_msg(PeerMsg::Loaded(Err("connection refused".into())));
+        a.on_bg_msg(BgMsg::Loaded(Err("connection refused".into())));
         assert_eq!(a.peers_error, "connection refused");
         assert!(!a.peers_loading);
     }

@@ -43,6 +43,9 @@ pub enum Cmd {
     /// Who may use this machine: list them, and decide — the dashboard's
     /// peers screen for scripts and shells with no terminal.
     Peers,
+    /// What this node delivered, and what an optional rewards companion
+    /// makes of it.
+    Rewards,
     Version,
     Help,
 }
@@ -205,6 +208,7 @@ pub fn usage() -> String {
          \x20 kmplify-node id                  print this install's node id\n\
          \x20 kmplify-node set KEY=VALUE …     change what this machine lends, durably\n\
          \x20 kmplify-node peers [VERB …]      who may use it; approve, block, invite\n\
+         \x20 kmplify-node rewards             delivered work, and an optional payout companion\n\
          \x20 kmplify-node version | help\n\
          \n\
          DASHBOARD\n\
@@ -314,6 +318,7 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
                 "id" | "node-id" => Cmd::Id,
                 "set" | "config" => Cmd::Set,
                 "peers" | "consumers" => Cmd::Peers,
+                "rewards" | "earnings" => Cmd::Rewards,
                 "version" => Cmd::Version,
                 "help" => Cmd::Help,
                 other => return Err(format!("unknown command `{other}`")),

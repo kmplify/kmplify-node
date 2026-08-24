@@ -93,6 +93,13 @@ It has no account. A node registers anonymously and gets an opaque id and
 token; there is no email, no PII, and nothing tying the machine to a person
 unless you separately link it for payouts.
 
+It holds no wallet. No key material, no address, no chain client, no token —
+being paid is an optional companion program that reads what this node
+publishes and settles against the fabric's own signed receipts. See
+[docs/REWARDS.md](docs/REWARDS.md) for the boundary and
+[`kmplify-node rewards`](#rewards--what-it-delivered-and-optionally-what-that-earns)
+for what an operator sees.
+
 ## Install
 
 One line, on Linux (x86_64/aarch64) and macOS. It downloads the release
@@ -161,6 +168,7 @@ so a machine with no desktop is no harder to run than one with a window.
 | `kmplify-node status` | Is it serving right now, and how hard is the machine working. `--json`. |
 | `kmplify-node set` | Change what this machine lends, durably and without a restart. |
 | `kmplify-node peers` | Who may use it — list, approve, deny, block, invite, revoke. `--json`. |
+| `kmplify-node rewards` | What this node delivered, and what an optional payout companion says. |
 | `kmplify-node id` | Print this install's node id, the handle consumers pin and invite. |
 | `kmplify-node version` · `help` | Version and build stamp; the full flag list. |
 
@@ -285,6 +293,7 @@ kmplify-node set --clear max-cpus   # back to whatever the unit file says
 | `country` | `PROVIDER_COUNTRY` | ISO alpha-2, for consumers who want EU capacity |
 | `colibri` · `colibri-key` | `COLIBRI_BASE` · `COLIBRI_API_KEY` | second upstream for frontier MoE models |
 | `max-cpus` · `max-vram-mb` · `max-ram-mb` · `max-disk-gb` | the matching `PROVIDER_MAX_*` | ceilings peer sessions never exceed |
+| `rewards` | `PROVIDER_REWARDS` | may the node ask an installed payout companion |
 
 Writes `settings.json` in the node directory (mode 0600 — it can hold the
 colibri key) and nudges the running node, which re-advertises within a second;
@@ -342,6 +351,55 @@ Invitations are meant to be scripted:
 ```bash
 INVITE=$(kmplify-node peers invite "Anna's phone")
 ```
+
+### `rewards` — what it delivered, and (optionally) what that earns
+
+The node lends hardware. It holds no wallet, signs no transaction and knows no
+token — being paid is a **separate program** an operator installs on purpose.
+This command shows the node's own half either way:
+
+```bash
+kmplify-node rewards
+```
+
+```
+this node
+  node id  : 44802ebc90e24de18825b90af320edfe
+  gateway  : https://fabric.kmplify.io
+
+delivered since this node started (6h 12m)
+  jobs     : 914 answered in 742.1 s of compute
+  sessions : 3 hosted, 14h 24m of machine time
+  (the node's own count — the fabric's signed receipts are what settle)
+
+rewards companion
+  off. Rewards are optional and this node needs nothing to serve.
+```
+
+Install a companion and switch it on, and the same command — and the
+dashboard's home screen — shows what it reports:
+
+```bash
+kmplify-node set rewards=on
+```
+
+```
+rewards companion
+  /usr/local/bin/chaingence-plugin
+  TESTNET  12.40 tEURC pending  ·  0.00 tEURC paid  ·  evm:base-sepolia
+```
+
+Two deliberate acts are required, because running another program is not
+something a node should do because a binary happened to be on `PATH`. The
+node publishes `identity.json` — its public node id, never its credential —
+and the delivered-work counters above; a companion reads those and settles
+against the fabric's signed receipts. Nothing about serving depends on it, and
+a companion that is missing, slow or unhappy costs one line of output and
+nothing else.
+
+The full contract, including what the node will never do, is in
+[docs/REWARDS.md](docs/REWARDS.md). Payout rails are testnet-only today: a
+balance that cannot be spent is labelled `TESTNET` everywhere it appears.
 
 ## The terminal dashboard
 
@@ -499,6 +557,7 @@ falling back to a default the operator did not choose.
 | `PROVIDER_FUNCTIONS_PUBKEY` | *empty* | Hex Ed25519 key of the function catalog to trust. Empty = refuse all. |
 | `PROVIDER_MAX_FUNCTION_MB` | `256` | Per-call memory ceiling (hard cap 1024). |
 | `PROVIDER_MAX_FUNCTION_MS` | `30000` | Per-call wall-clock ceiling (hard cap 300000). |
+| `PROVIDER_REWARDS` | `false` | May the node ask an installed payout companion for a status line. See [docs/REWARDS.md](docs/REWARDS.md). |
 | `PROVIDER_SHARE_VECTORS` | `false` | Lend storage for replicated vector collections. |
 | `PROVIDER_MAX_VECTOR_MB` | `1024` | Ceiling on stored collections. |
 
