@@ -22,11 +22,60 @@ KillSignal=SIGTERM
 TimeoutStopSec=90
 Restart=on-failure
 RestartSec=10
-# Needs the docker socket; run as a user in the docker group rather than root
-# where policy allows.
 User=kmplify
+# SECURITY: membership of the `docker` group is EQUIVALENT TO ROOT on this
+# host. Anyone who can reach the docker socket can start a container that
+# mounts the whole filesystem and escape to root from there — that is a
+# property of Docker's design, not of this unit. It is here because hosting
+# container sessions needs the socket, and it is worth knowing you are
+# granting it.
+#
+# A node that hosts sessions runs OTHER PEOPLE'S WORKLOADS, so treat any bug
+# in this process as a potential path to root on this machine. If that is not
+# acceptable, the options in order of preference are:
+#   1. Run rootless Docker or Podman and point the node at that socket.
+#   2. Put a socket proxy in front that exposes only the container verbs the
+#      node uses, and give the node the proxy instead of the real socket.
+#   3. Drop this line and PROVIDER_WORKLOADS, and lend inference only. The
+#      node then needs no socket at all.
 Group=docker
 StateDirectory=kmplify-node
+
+# ---- sandboxing -------------------------------------------------------------
+# Cheap, and it narrows what a compromised worker can reach beyond the socket
+# it legitimately needs. Note this does NOT contain the docker-group grant
+# above: a process that can talk to the socket can ask the daemon (which is
+# outside all of this) to do what it likes.
+#
+# MemoryDenyWriteExecute is deliberately ABSENT: the Wasm functions lane
+# compiles guest modules at run time and needs W^X pages, so setting it would
+# break the feature rather than harden it.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+# `full` rather than `strict`: strict makes /var read-only too, and the socket
+# path under /run must stay writable to connect to it.
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# The worker opens outbound TCP to its gateway and a unix socket to docker.
+# AF_NETLINK is included deliberately: name resolution and interface
+# enumeration reach for it on Linux, and leaving it out buys nothing while
+# turning DNS into an intermittent, very hard-to-diagnose failure.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# It needs no capabilities of its own; the docker daemon does the privileged
+# work on the other side of the socket.
+CapabilityBoundingSet=
+AmbientCapabilities=
 
 [Install]
 WantedBy=multi-user.target
