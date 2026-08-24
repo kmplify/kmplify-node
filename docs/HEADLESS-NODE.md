@@ -182,6 +182,26 @@ would park every unknown consumer and nobody at the terminal could let them
 in. The screen talks to the gateway as the node, with the credential in
 `KMPLIFY_NODE_DIR`; an unreachable gateway costs the screen and nothing else.
 
+### The v3.0 lanes: functions and vector collections
+
+Both ship in the released binaries — the Wasm runtime is compiled in — and
+both stay off until an operator switches them on:
+
+```sh
+# the key this fabric signs its function catalog with
+kmplify-node set functions=true \
+  functions-pubkey="$(curl -s https://fabric.kmplify.io/v1/functions | jq -r .pubkey)"
+
+# hold peers' RAG indexes (payloads are opaque to you), up to 4 GB
+kmplify-node set share-vectors=true max-vector-mb=4096
+```
+
+`kmplify-node check` reports both, and refuses to look ready when functions
+are on without a key: a node that trusts no key refuses every call, which
+otherwise looks like the gateway's fault. Sandbox terms — memory, fuel and
+wall-clock — come from the signed manifest and are clamped again here by
+`PROVIDER_MAX_FUNCTION_MB` / `_MS`.
+
 ### Admission from a script
 
 The mode is a setting like any other, and the decisions have their own verbs,
