@@ -167,7 +167,7 @@ pub fn module_url_ok(url: &str, gateway_url: &str) -> bool {
 }
 
 pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -339,8 +339,8 @@ pub fn run_module(
     limits: Limits,
 ) -> Result<RunResult, String> {
     use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
-    use wasmtime_wasi::pipe::{MemoryInputPipe, MemoryOutputPipe};
-    use wasmtime_wasi::preview1::{self, WasiP1Ctx};
+    use wasmtime_wasi::p1::{self, WasiP1Ctx};
+    use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
     use wasmtime_wasi::WasiCtxBuilder;
 
     struct State {
@@ -351,14 +351,16 @@ pub fn run_module(
     let mut config = Config::new();
     config.consume_fuel(true);
     config.epoch_interruption(true);
-    // The guest sees no host memory beyond its own linear memory.
-    config.static_memory_maximum_size(0);
+    // No virtual-memory reservation ahead of the guest's own linear memory:
+    // the guest gets what it grows into and no window onto anything else.
+    // (`static_memory_maximum_size` before wasmtime 29.)
+    config.memory_reservation(0);
     let engine = Engine::new(&config).map_err(|e| format!("wasm engine: {e}"))?;
     let module =
         Module::new(&engine, module).map_err(|e| format!("module does not compile: {e}"))?;
 
     let mut linker: Linker<State> = Linker::new(&engine);
-    preview1::add_to_linker_sync(&mut linker, |s: &mut State| &mut s.wasi)
+    p1::add_to_linker_sync(&mut linker, |s: &mut State| &mut s.wasi)
         .map_err(|e| format!("wasi linker: {e}"))?;
 
     let stdout = MemoryOutputPipe::new(MAX_OUTPUT_BYTES);

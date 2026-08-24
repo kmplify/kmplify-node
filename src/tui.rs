@@ -619,7 +619,7 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
             // slower file-writing cadence. The GPU probe is a subprocess, so
             // it still goes every other second.
             if !app.attached() {
-                status::sample_host(accel, ticks % 2 == 0).await;
+                status::sample_host(accel, ticks.is_multiple_of(2)).await;
             }
             app.refresh();
             ticks = ticks.wrapping_add(1);
