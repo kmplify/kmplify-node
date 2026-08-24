@@ -128,70 +128,245 @@ are attached to every [GitHub release](https://github.com/kmplify/kmplify-node/r
 
 ## Run
 
-Check the configuration before joining anything. This connects to nothing; it
-resolves the config, probes Docker, `nvidia-smi`, the gateway and your model
-endpoint, and tells you what the fabric would see:
+Two commands, in this order. The first connects to nothing and tells you
+whether this machine can actually serve; the second joins the fabric.
 
 ```bash
 kmplify-node check
 ```
 
-Then join:
-
 ```bash
 kmplify-node
 ```
 
-A node that lists no models will connect, count as online, and have every job
-refused by the scheduler, so `check` fails loudly on that rather than letting
-you deploy something that looks healthy and serves nothing. It exits `0` when
-the host is ready, `1` when it is not, and `2` when the configuration is
-wrong, so a provisioning script can branch on it. `--json` gives the same
-verdict in a form a script can read.
+Then watch and steer it from a terminal:
 
-### Commands
+```bash
+kmplify-node tui
+```
+
+Everything below is the detail behind those three.
+
+## The CLI
+
+One binary, seven commands. Everything an operator does to a node — preflight
+it, run it, watch it, change what it lends, decide who may use it — is here,
+so a machine with no desktop is no harder to run than one with a window.
 
 | Command | What it does |
 |---|---|
 | `kmplify-node` / `run` | Join the fabric and serve. Logs to stdout, stops cleanly on SIGTERM. |
 | `kmplify-node tui` | Terminal dashboard: watch **and control** the node. |
 | `kmplify-node check` | Preflight this host. Connects to nothing. `--json`, `--timeout SECS`. |
-| `kmplify-node status` | One-shot report of the node running here. `--json`. |
-| `kmplify-node id` | Print this install's node id, the handle consumers pin and invite. |
+| `kmplify-node status` | Is it serving right now, and how hard is the machine working. `--json`. |
 | `kmplify-node set` | Change what this machine lends, durably and without a restart. |
-| `kmplify-node peers` | Who may use it — list, approve, block, invite. |
-| `kmplify-node version` | Version and build stamp. |
+| `kmplify-node peers` | Who may use it — list, approve, deny, block, invite, revoke. `--json`. |
+| `kmplify-node id` | Print this install's node id, the handle consumers pin and invite. |
+| `kmplify-node version` · `help` | Version and build stamp; the full flag list. |
 
-Every configuration variable also has a flag (`--gateway`, `--workloads`,
-`--max-vram-mb`, `--no-share-inference`, …). A flag sets the variable it names
-rather than living beside it, so there is one configuration surface and `check`
-always reports what `run` would use. `kmplify-node help` lists them all.
+**One configuration surface.** Settings are environment variables, so a
+service manager, a container and a shell all configure it the same way — and
+every one also has a flag that *sets that variable* rather than living beside
+it. `--gateway https://…` is `PROVIDER_GATEWAY_URL=https://…`, no more and no
+less, which is what lets `check` report exactly what `run` would use.
 
-### The terminal dashboard
+**Exit codes**, so a provisioning script can branch: `0` ready or a clean
+stop, `1` this host cannot serve as configured (or nothing is running), `2`
+the command line or the configuration is wrong. A value that cannot be read —
+a ceiling that is not a number, a country that is not alpha-2 — stops the node
+at startup naming the variable, rather than falling back to a default nobody
+chose.
+
+### `check` — will this host actually serve?
+
+Run it first. It connects to nothing: it resolves the configuration, probes
+Docker, the vendor GPU tools, the gateway and your model endpoint, and tells
+you what the fabric would see.
+
+```bash
+kmplify-node check
+```
+
+```
+kmplify-node 0.2.0+c8ba618
+
+configuration
+  gateway    : https://fabric.kmplify.io
+  creds      : ~/.config/kmplify-node/fabric_node.json
+  ollama     : http://127.0.0.1:11434
+  inference  : ON
+  sessions   : OFF (set PROVIDER_WORKLOADS to opt in)
+  ceilings   : cpus=None vram_mb=None ram_mb=None disk_gb=None
+
+accelerator
+  metal      : Apple M2 Max (49152 MB) <- advertised
+  advertised : metal
+
+probes
+  gateway    : reachable (http 405)
+  docker     : 29.6.2
+  models     : 17 (qwen3:0.6b, bge-m3:567m, gemma4:12b-mlx, …)
+
+WARNING: PROVIDER_COUNTRY is undeclared, so the gateway records XX and
+         consumers filtering for EU residency will not see this node
+
+ready.
+```
+
+A node that lists no models will connect, count as online, and have every job
+refused by the scheduler — so `check` fails loudly on that rather than letting
+you deploy something that looks healthy and serves nothing. Probes run
+concurrently with a per-probe timeout, so a wedged Docker socket cannot hang
+it. `--json` gives the same verdict, warnings and errors in a form a script
+can read.
+
+Flags are handy for trying a setting before writing it into a unit file:
+
+```bash
+kmplify-node check --workloads vllm-openai --max-vram-mb 16000
+```
+
+### `run` — join the fabric and serve
+
+```bash
+kmplify-node
+```
+
+Logs to stdout (journald adds the timestamps). On SIGTERM — what `systemctl
+stop` sends — the worker tears down every hosted session container before
+exiting, so a stopped node leaves nothing of other people's running on your
+GPU. If the worker ever dies unexpectedly the process exits non-zero, so a
+service manager restarts it instead of leaving a healthy-looking process that
+lends nothing.
+
+For a 24/7 box see [docs/HEADLESS-NODE.md](docs/HEADLESS-NODE.md) and the
+systemd unit in [packaging/](packaging/).
+
+### `status` — what is it doing right now?
+
+```bash
+kmplify-node status
+```
+
+```
+ONLINE pid 30736 up 3h 12m
+  node     : 8f2c1a5b90de4a17b3c9d0e5f6a7b8c9
+  gateway  : https://fabric.kmplify.io
+  models   : qwen3:0.6b, bge-m3:567m, gemma4:12b-mlx, …
+  load     : cpu 38%  gpu 70%  ram 41/64 GB
+  jobs     : 2 active, 914 finished, 3 errors, avg 812 ms
+  sessions : 1
+```
+
+Exits `1` when no node is running here, so `kmplify-node status >/dev/null ||
+alert` is a monitor. `--json` adds every field the dashboard draws — link
+state, per-core load, VRAM, ceilings, hosted sessions, the log tail — which is
+the machine-readable half of the monitoring story below.
+
+### `set` — change what you lend, without a restart
+
+The dashboard's sharing screen for a shell:
+
+```bash
+kmplify-node set max-cpus=6 share-cpu=true workloads=vllm-openai,comfyui
+```
+
+```bash
+kmplify-node set --list          # what is stored here, and what it overrides
+kmplify-node set --clear max-cpus   # back to whatever the unit file says
+```
+
+| Setting | Overrides | Means |
+|---|---|---|
+| `share-inference` | `PROVIDER_SHARE_INFERENCE` | serve chat and embedding jobs |
+| `share-cpu` | `PROVIDER_SHARE_CPU` | lend spare CPU threads and RAM |
+| `workloads` | `PROVIDER_WORKLOADS` | container templates to host; empty = sessions off |
+| `approval-mode` | `PROVIDER_APPROVAL_MODE` | `auto` or `manual` admission |
+| `country` | `PROVIDER_COUNTRY` | ISO alpha-2, for consumers who want EU capacity |
+| `colibri` · `colibri-key` | `COLIBRI_BASE` · `COLIBRI_API_KEY` | second upstream for frontier MoE models |
+| `max-cpus` · `max-vram-mb` · `max-ram-mb` · `max-disk-gb` | the matching `PROVIDER_MAX_*` | ceilings peer sessions never exceed |
+
+Writes `settings.json` in the node directory (mode 0600 — it can hold the
+colibri key) and nudges the running node, which re-advertises within a second;
+a node that is offline picks the change up on its next connection. **A stored
+choice overrides the environment** — the same contract the desktop app has —
+so a ceiling does not spring back on the next restart. Nothing about that is
+silent: `check` prints every value currently overriding the environment,
+`set --list` shows them, and clearing one restores the unit file's value with
+no restart.
+
+### `peers` — who may use this machine
+
+`auto` (the default) lets any consumer on the fabric use it. `manual` parks
+unknown consumers until you decide: they are told to ask, and they wait.
+Invitations connect in either mode — minting one *is* the approval.
+
+```bash
+kmplify-node set approval-mode=manual
+kmplify-node peers
+```
+
+```
+admission : manual
+
+waiting for a decision (1)
+  anon-1a2b3c4d            waiting 2m       asked for llama3
+      kmplify-node peers approve anon-1a2b3c4d
+
+consumers seen recently (2)
+  node-9abc…               active  via grid selection   last seen 3s   approved
+  anon-deadbeef            idle    via pool             last seen 9m   blocked
+
+invitations (1)
+  7f9b2c9e-4a1d-4e5f-9c3a-2b8d1e6f0a47  Anna's phone         in use
+```
+
+| Verb | What it does |
+|---|---|
+| `peers approve <consumer>` | admit them — a standing rule, so it holds |
+| `peers deny <consumer>` | refuse quietly while manual admission is on |
+| `peers block <consumer>` | refuse in **every** mode |
+| `peers clear <consumer>` | drop the rule; the admission mode decides again |
+| `peers invite [label]` | mint an invitation; the id goes to stdout |
+| `peers revoke <id>` | end an invitation for good |
+
+It talks to the gateway with the node's stored credential rather than through
+the running worker, so approving from cron works whether or not the node is
+up. The listing reports the mode the **gateway** believes, falling back to the
+configured one only while the node is offline — the two differ exactly while a
+change has not been re-advertised, and the gateway's answer is the one that
+decides who gets in.
+
+Invitations are meant to be scripted:
+
+```bash
+INVITE=$(kmplify-node peers invite "Anna's phone")
+```
+
+## The terminal dashboard
 
 A node usually runs where there is no desktop, which used to mean it was
-operated by reading logs. `kmplify-node tui` is the sharing screen from the
-desktop app, in a terminal, on Linux, macOS and Windows alike:
+operated by reading logs. `kmplify-node tui` is the desktop app's provider
+screens in a terminal, on Linux, macOS and Windows alike:
 
 ```bash
 kmplify-node tui
 ```
 
-```
- ◆ kmplify-node   provider · compute fabric · inference        live dashboard
- ONLINE  ·  node 8f2c1a5b90de  ·  fabric.kmplify.io  ·  up 3h 12m  ·  running here
-╭ machine ───────────────────────────────╮╭ sharing ──────────────────────────╮
-│ cuda    NVIDIA GeForce RTX 4090        ││ inference on   7 model(s)         │
-│  ████████████░░░░░  vram 14G / 24G     ││ cpu/ram   on   sessions vllm-o…   │
-│  ██████░░░░░░░░░░░  cpu 38%  4 of 16   ││ jobs      2 active  914 finished  │
-╰────────────────────────────────────────╯╰───────────────────────────────────╯
- q quit   1 home  2 sessions  3 models  4 log   p pause  c reconnect  e evict …
-```
-
 It **attaches** to the node already running here (systemd, Docker, launchd),
 reading the snapshot that node publishes and sending commands back to it, so
 quitting the dashboard leaves the node running. If nothing is running, it
-starts a node itself and quitting stops it.
+starts a node itself and quitting stops it. `--attach` insists on the first,
+`--standalone` on the second.
+
+| Screen | What it shows |
+|---|---|
+| `1` home | link state, four live meters, what is advertised, jobs, sessions, log |
+| `2` sessions | peers' containers running here |
+| `3` models · `4` log | what consumers can ask for; the worker's log |
+| `5` sharing | what this machine lends, and how much of it |
+| `6` peers | who may use it: waiting consumers, active ones, invitations |
+| `7` activity | CPU, GPU, VRAM and RAM live, with history and a bar per core |
 
 | Key | Action |
 |---|---|
@@ -200,48 +375,24 @@ starts a node itself and quitting stops it.
 | `e` | Evict the selected session — the peer's container is stopped and removed. |
 | `x` | Stop the node, tearing down hosted sessions first. |
 | `w` | Write a plain-text snapshot of the dashboard, for a bug report. |
-| `5` | **Sharing** — what this machine lends and how much of it (see below). |
-| `6` | **Peers** — who may use it: waiting consumers, active ones, invitations. |
-| `7` | **Activity** — CPU, GPU, VRAM and RAM live, with history and a bar per core. |
-| `1`–`4` | Home, sessions, models, log. `?` for the full list. |
+| `?` | Every key, including the ones each screen adds. |
 
-### Changing what you lend, without a restart
-
-The dashboard's sharing screen is the desktop app's "Provide this machine's
-Resources" panel: the switches for inference, container sessions per template,
-CPU/RAM and manual approval; the ceilings for cores, VRAM, RAM and disk; the
-country and the colibri upstream. Edits are a draft until `s` applies them, at
-which point the node reconnects so the fabric hears the new terms — hosted
-sessions keep running.
-
-```
- ceilings — peer sessions never exceed these
-  CPU threads             ██████████████████░░░░░░  9 / 12 threads ●
-  VRAM                    ████████████████████████  all of it (48 GB)
-```
-
-The same thing without a terminal, for provisioning scripts and one-off ssh:
+The node publishes `status.json` in its node directory (owner-readable only)
+and accepts commands as files in `control/` there. That is how a dashboard in
+one process drives a node in another **without the node ever listening on a
+port** — the property this whole crate is built around. It also means the
+dashboard must run as the user that owns that directory; for the systemd
+install that is `kmplify`:
 
 ```bash
-kmplify-node set max-cpus=6 share-cpu=true workloads=vllm-openai,comfyui
+sudo -u kmplify KMPLIFY_NODE_DIR=/var/lib/kmplify-node kmplify-node tui
 ```
 
-```bash
-kmplify-node set --clear max-cpus
-```
+### Monitoring: the activity screen (`7`)
 
-Both write `settings.json` in the node directory and nudge the running node,
-which re-advertises within a second. **A stored choice overrides the
-environment** — the same contract the desktop app has always had — so a slider
-does not spring back on the next restart. Nothing about that is silent:
-`kmplify-node check` prints every value that is overriding the environment,
-`set --list` shows them, and a `●` marks them in the dashboard. `d` on a row
-(or `set --clear KEY`) drops the override, and the unit file governs again.
-
-### The activity monitor
-
-`7` is the screen a provider actually wants: how much of this machine is gone
-right now, which no log line answers.
+The question a provider actually has is "how much of my machine is gone right
+now", and no log line answers it. `top` in another window cannot tell peer
+work apart from your own.
 
 ```
 ╭ CPU ───────────────────────────────────╮╭ GPU · cuda ────────────────────────────╮
@@ -249,73 +400,71 @@ right now, which no log line answers.
 │      ▂▃▅▆█▇▅▃▂▁▂▃▅▆█▇▅                  ││    ▁▃▅▆████▇▅▃▁▂▄▆██▇                  │
 │ 13th Gen i9-13900K   5 min: avg 38% …   ││ RTX 4090 · 24576 MB  5 min: avg 52% …  │
 ╰────────────────────────────────────────╯╰────────────────────────────────────────╯
+╭ System RAM ────────────────────────────╮╭ VRAM ──────────────────────────────────╮
+│ ████████████████████  64%  41 / 64 GB   ││ ███████·············  36%  8 / 24 GB   │
+╰────────────────────────────────────────╯╰────────────────────────────────────────╯
 ╭ cores ──────────────────────────────────────────────────────────────────────────╮
 │  0 ███████···  71%    4 ██········  22%    8 █████·····  54%   12 ██········  19%│
+│  1 ██████····  64%    5 █·········  11%    9 ███·······  31%   13 █·········  8% │
+╰─────────────────────────────────────────────────────────────────────────────────╯
+╭ what the fabric is holding ─────────────────────────────────────────────────────╮
+│ sessions 1   cores held 4.0   jobs 2   finished 914   fabric disk 38.2 GB       │
+╰─────────────────────────────────────────────────────────────────────────────────╯
 ```
 
-Four measurements, each with its own colour wherever it appears, a bar, and
-five minutes of history; a bar per logical CPU, which is what tells a pinned
-thread apart from a busy machine; and a line for what the fabric is holding
-(sessions, cores, jobs, disk).
+Four measurements, each with a bar, the reading and **five minutes of
+history**; a bar per logical CPU, which is what tells a pinned thread apart
+from a busy machine; and a line for what peers are holding right now. The home
+screen carries the same four meters in miniature with an inline history strip.
 
-Figures a platform will not report say so rather than drawing a zero — macOS
-exposes GPU load only to privileged tools, and a flat line along the bottom of
-a graph would read as an idle card every time.
+Colour carries meaning rather than decoration: each measurement keeps one
+colour everywhere it appears (CPU cyan, GPU magenta, VRAM green, RAM blue),
+each screen has its own, and a meter tints amber then red as the next request
+stops fitting.
 
-### Who may use it
+GPU load and VRAM come from `nvidia-smi` / `rocm-smi` in a single probe every
+few seconds — a node lending its cycles should not spend them on being
+watched. **Where a platform will not report a figure, the panel says so**
+rather than drawing a zero: macOS exposes GPU load only to privileged tools,
+and unified memory has no distinct "VRAM used", so a flat line along the
+bottom of a graph would read as an idle card every time.
 
-The peers screen (`6`) is the admission half of the same panel, and it exists
-because the sharing screen can turn **manual approval** on: a node in manual
-mode with no way to approve anybody has quietly stopped serving.
+Everything on this screen is in `status.json` too, so `kmplify-node status
+--json` feeds the same numbers to a monitoring system, and an attached
+dashboard graphs exactly what the node measured.
 
-- consumers waiting for a decision — `a` approve, `n` deny, `b` block,
-  `u` clear the standing rule;
-- consumers that have used this machine recently, with how the work arrived
-  (invitation, grid selection, the anonymous pool) and any standing rule;
-- invitations — `i` mints one for a named consumer, `h` holds or resumes it,
-  `v` revokes it for good.
+### Sharing (`5`)
 
-This asks the gateway as the node itself, using the node's own credential; a
-gateway that cannot be reached costs the screen and nothing else — the worker
-carries on serving.
+The desktop app's "Provide this machine's Resources" panel: switches for
+inference, container sessions **per template** (built from what this
+accelerator can actually host, so a Mac is offered none), CPU/RAM and manual
+approval; ceilings for cores, VRAM, RAM and disk; country and colibri
+upstream.
 
-### Admission: automatic, or your say-so
+```
+ what this machine lends
+  [x] GPU inference (chat & embeddings)      7 model(s) advertised
+  [x] CPU & system RAM                     ● 16 cores, 64 GB
+  [ ] Require my approval for new peers      consumers wait until approved
 
-`auto` (the default) lets any consumer on the fabric use this machine.
-`manual` parks unknown consumers until you decide — they are told to ask, and
-they appear here until you do. Invitations connect in either mode: minting one
-*is* the approval.
-
-```bash
-kmplify-node set approval-mode=manual
+ ceilings — peer sessions never exceed these
+  CPU threads             ██████████████░░░░░░  9 / 16 threads ●
+  VRAM                    ████████████████████  all of it (24 GB)
 ```
 
-The switch is also the sharing screen's third checkbox, and either way it
-takes effect on the reconnect it triggers, with no restart. Deciding needs no
-terminal either:
+`space` toggles · `←/→` moves a ceiling (shift for a bigger step) · `enter`
+edits a field · `d` hands a row back to the environment · `s` applies. Edits
+are a **draft** until applied, because a ceiling is re-advertised by
+reconnecting and reconnecting on every arrow key would make the node flap. A
+`●` marks a value that is overriding the environment.
 
-```bash
-kmplify-node peers                        # who is waiting, who is using it
-```
+### Peers (`6`)
 
-```bash
-kmplify-node peers approve node-9abc      # a standing rule, so it holds
-```
-
-`deny` refuses quietly while manual admission is on, `block` refuses in every
-mode, and `clear` drops the rule so the mode decides again. `peers invite
-"Anna's phone"` prints an invitation id on stdout for a script to capture, and
-`peers revoke <id>` ends it. `--json` for anything that has to parse it.
-
-The node also publishes `status.json` in its node directory (owner-readable
-only) and accepts commands as files in `control/` there. That is how a
-dashboard in one process drives a node in another **without the node ever
-listening on a port** — the property this whole crate is built around.
-
-To run it as a service on a headless box, including the fully-static musl
-build that executes on any Linux distribution, see
-[docs/HEADLESS-NODE.md](docs/HEADLESS-NODE.md) and the systemd unit in
-[packaging/](packaging/).
+The same admission work as `kmplify-node peers`, live: `a` approve, `n` deny,
+`b` block, `u` clear the rule, `i` mint an invitation, `h` hold or resume one,
+`v` revoke it. It exists because the sharing screen can turn manual approval
+on, and a node in manual mode with no way to approve anybody has quietly
+stopped serving.
 
 ## Configuration
 
