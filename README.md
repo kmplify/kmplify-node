@@ -196,7 +196,7 @@ kmplify-node check
 ```
 
 ```
-kmplify-node 0.2.0+c8ba618
+kmplify-node 0.3.0+c8ba618
 
 configuration
   gateway    : https://fabric.kmplify.io
