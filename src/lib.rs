@@ -19,6 +19,7 @@ pub mod fabric_worker;
 pub mod functions;
 pub mod gpu;
 pub mod hostcpu;
+pub mod peers;
 pub mod proc;
 pub mod settings;
 pub mod status;

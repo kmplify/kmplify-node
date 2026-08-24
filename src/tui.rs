@@ -37,6 +37,7 @@ use ratatui::Frame;
 use kmplify_node::control::Command;
 use kmplify_node::fabric_worker::{self, WorkerConfig};
 use kmplify_node::gpu::Backend;
+use kmplify_node::peers::{self, Peers};
 use kmplify_node::settings::Settings;
 use kmplify_node::status::{self, Link, Snapshot};
 
@@ -48,6 +49,14 @@ const FRAME: Duration = Duration::from_millis(250);
 /// writes it every [`status::PUBLISH_INTERVAL`]; reading faster only costs
 /// syscalls.
 const POLL: Duration = Duration::from_millis(1000);
+
+/// Ceiling on a gateway call made from the dashboard (the peers screen). Long
+/// enough for a busy gateway, short enough that a wedged one is obvious.
+const GATEWAY_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// How often the peers screen re-asks while it is open. Consumers arrive and
+/// leave on human timescales; polling harder would only add gateway load.
+const PEERS_POLL: Duration = Duration::from_secs(5);
 
 /// Palette, kept to the sixteen ANSI colours so the dashboard looks right on
 /// whatever terminal a server happens to have, light or dark, and never paints
@@ -64,6 +73,16 @@ enum View {
     /// The desktop app's "Provide this machine's Resources" panel: what this
     /// machine lends, and how much of it.
     Sharing,
+    /// Who may use it: waiting consumers, active ones, and invitations.
+    Peers,
+}
+
+/// Something a spawned gateway call has to say.
+enum PeerMsg {
+    Loaded(Result<Peers, String>),
+    /// A decision or an invitation change: a line for the footer, and a
+    /// reason to refetch.
+    Acted(Result<String, String>),
 }
 
 /// A text setting being typed into.
@@ -81,6 +100,9 @@ struct Editing {
 enum Confirm {
     Evict(String),
     Shutdown,
+    /// Revoking is permanent: the consumer holding this invitation loses the
+    /// contract and cannot get it back.
+    Revoke(String),
 }
 
 impl Confirm {
@@ -93,6 +115,10 @@ impl Confirm {
             Confirm::Shutdown => {
                 "Stop this node? Hosted sessions are torn down first.  [y/N]".into()
             }
+            Confirm::Revoke(id) => format!(
+                "Revoke invitation {}? The consumer holding it loses access permanently.  [y/N]",
+                &id[..8.min(id.len())]
+            ),
         }
     }
 }
@@ -117,6 +143,20 @@ struct App {
     sharing_sel: usize,
     /// The text field currently being typed into, if any.
     editing: Option<Editing>,
+    /// Consumers and invitations, as the gateway last reported them. `None`
+    /// until the first fetch answers.
+    peers: Option<Peers>,
+    peers_error: String,
+    peers_sel: usize,
+    peers_loading: bool,
+    last_peers_fetch: Instant,
+    /// Where gateway work reports back to. The screen must keep painting
+    /// while a request is in flight, so every call is spawned and answers
+    /// here.
+    peer_tx: tokio::sync::mpsc::UnboundedSender<PeerMsg>,
+    /// The node's credential, for talking to the gateway as this node.
+    creds_path: PathBuf,
+    gateway: String,
     /// Last thing this dashboard did, shown in the footer.
     notice: String,
     notice_at: Instant,
@@ -134,6 +174,13 @@ impl App {
             Some(dir) => status::read_published(dir).unwrap_or_default(),
             None => status::snapshot(),
         };
+        // The running node's gateway is the authority: attached, this process
+        // may have a different environment entirely, and asking the wrong
+        // gateway about "my consumers" answers about a node that is not this
+        // one.
+        if !self.snap.gateway.is_empty() {
+            self.gateway = self.snap.gateway.clone();
+        }
     }
 
     fn say(&mut self, msg: impl Into<String>) {
@@ -229,6 +276,7 @@ impl App {
                     self.confirm = None;
                     match pending {
                         Confirm::Evict(id) => self.send(Command::StopSession(id)),
+                        Confirm::Revoke(id) => self.revoke_invitation(id),
                         // Standalone, this process IS the node and leaving
                         // the dashboard already tears it down; sending the
                         // command as well would ask the node to stop itself
@@ -260,6 +308,9 @@ impl App {
         if self.view == View::Sharing && self.on_sharing_key(key) {
             return;
         }
+        if self.view == View::Peers && self.on_peers_key(key) {
+            return;
+        }
 
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
@@ -279,6 +330,10 @@ impl App {
                 self.view = View::Sharing;
                 // Row 0 is a section heading.
                 self.sharing_sel = self.sharing_sel.max(1);
+            }
+            KeyCode::Char('6') => {
+                self.view = View::Peers;
+                self.fetch_peers();
             }
             KeyCode::Char('r') => {
                 self.refresh();
@@ -365,6 +420,11 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
         _ => live.is_some(),
     };
 
+    // Captured before the config is handed to a worker: the peers screen
+    // needs both to talk to the gateway as this node.
+    let creds_path = cfg.creds_path.clone();
+    let gateway = cfg.gateway_url.clone();
+
     let node = if attach_mode {
         None
     } else {
@@ -377,6 +437,7 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
     // The stored sharing choices are the starting point of the draft, so the
     // screen opens showing what this node is actually applying.
     let stored = Settings::load(&dir);
+    let (peer_tx, mut peer_rx) = tokio::sync::mpsc::unbounded_channel::<PeerMsg>();
     let mut app = App {
         attached_to: attach_mode.then(|| dir.clone()),
         node_dir: dir,
@@ -384,6 +445,14 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
         saved: stored,
         sharing_sel: 1,
         editing: None,
+        peers: None,
+        peers_error: String::new(),
+        peers_sel: 0,
+        peers_loading: false,
+        last_peers_fetch: Instant::now(),
+        peer_tx,
+        creds_path,
+        gateway,
         snap: live.unwrap_or_default(),
         view: View::Home,
         selected: 0,
@@ -437,6 +506,14 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
         if app.quit {
             break 0;
         }
+        // While the peers screen is open, keep it current: consumers arrive
+        // and leave without this dashboard doing anything.
+        if app.view == View::Peers
+            && !app.peers_loading
+            && app.last_peers_fetch.elapsed() >= PEERS_POLL
+        {
+            app.fetch_peers();
+        }
         tokio::select! {
             key = keys_rx.recv() => match key {
                 Some(k) => app.on_key(k),
@@ -444,6 +521,11 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
                 // expensive `status` command.
                 None => break 1,
             },
+            msg = peer_rx.recv() => {
+                if let Some(msg) = msg {
+                    app.on_peer_msg(msg);
+                }
+            }
             _ = tokio::time::sleep(FRAME) => {}
         }
     };
@@ -479,6 +561,7 @@ fn draw(f: &mut Frame, app: &App) {
         View::Models => draw_models(f, app, body),
         View::Logs => draw_logs(f, app, body),
         View::Sharing => draw_sharing(f, app, body),
+        View::Peers => draw_peers(f, app, body),
     }
     f.render_widget(footer_line(app), footer);
 
@@ -497,6 +580,7 @@ fn header_line(app: &App) -> Paragraph<'static> {
         View::Models => "models",
         View::Logs => "log",
         View::Sharing => "sharing",
+        View::Peers => "peers",
     };
     Paragraph::new(Line::from(vec![
         Span::styled(" ◆ kmplify-node", Style::new().fg(ACCENT).bold()),
@@ -585,11 +669,15 @@ fn footer_line(app: &App) -> Paragraph<'static> {
     };
     let keys = if app.view == View::Sharing {
         format!(
-            " {quit}   1 home  2 sessions  3 models  4 log  5 sharing   space toggle  ←/→ ceiling  d environment  s apply  ? keys"
+            " {quit}   1 home  2 sessions  3 models  4 log  5 sharing  6 peers   space toggle  ←/→ ceiling  d environment  s apply  ? keys"
+        )
+    } else if app.view == View::Peers {
+        format!(
+            " {quit}   1 home … 5 sharing  6 peers   a approve  n deny  b block  u clear  i invite  h hold  v revoke  ? keys"
         )
     } else {
         format!(
-            " {quit}   1 home  2 sessions  3 models  4 log  5 sharing   {pause}  c reconnect  e evict  x stop node  ? keys"
+            " {quit}   1 home  2 sessions  3 models  4 log  5 sharing  6 peers   {pause}  c reconnect  e evict  x stop node  ? keys"
         )
     };
     // The notice replaces the key hints for a few seconds after an action, so
@@ -947,7 +1035,7 @@ fn draw_overlay(f: &mut Frame, title: &str, body: String) {
 }
 
 fn help_text() -> String {
-    "1/h home   2/s sessions   3/m models   4/l log   5/g sharing\n\
+    "1/h home  2/s sessions  3/m models  4/l log  5/g sharing  6 peers\n\
      ↑/↓ or j/k   move (log: scroll back)\n\
      p  pause or resume sharing — stays connected, advertises nothing\n\
      c  reconnect to the gateway now\n\
@@ -957,7 +1045,10 @@ fn help_text() -> String {
      \n\
      sharing (5): space toggles, ←/→ moves a ceiling (shift for a bigger\n\
      step), enter edits a field, d hands one back to the environment,\n\
-     s applies — which reconnects so the fabric hears the new terms."
+     s applies — which reconnects so the fabric hears the new terms.\n\
+     \n\
+     peers (6): a approve, n deny, b block, u clear the standing rule,\n\
+     i mint an invitation, h hold or resume one, v revoke it."
         .into()
 }
 
@@ -1435,6 +1526,10 @@ impl App {
             KeyCode::Enter => {
                 let (k, value) = (edit.key, edit.buffer.clone());
                 self.editing = None;
+                if k == "invite-label" {
+                    self.mint_invitation(value);
+                    return;
+                }
                 match self.draft.set(k, &value) {
                     Ok(()) => self.say(format!("{k} set — s applies it")),
                     Err(e) => self.say(e),
@@ -1647,6 +1742,408 @@ fn sharing_line(row: &SharingRow, selected: bool, width: usize) -> Line<'static>
     }
 }
 
+// ------------------------------------------------------------------ peers
+
+/// One line of the peers screen.
+enum PeerRow {
+    Section(String),
+    Note(String),
+    Pending(peers::Pending),
+    Consumer(peers::Consumer),
+    Invitation(peers::Invitation),
+}
+
+impl PeerRow {
+    fn selectable(&self) -> bool {
+        matches!(
+            self,
+            PeerRow::Pending(_) | PeerRow::Consumer(_) | PeerRow::Invitation(_)
+        )
+    }
+}
+
+impl App {
+    fn peer_rows(&self) -> Vec<PeerRow> {
+        let mut rows = Vec::new();
+        let Some(p) = &self.peers else {
+            rows.push(PeerRow::Section("waiting for the gateway…".into()));
+            return rows;
+        };
+        rows.push(PeerRow::Section(format!(
+            "waiting for a decision ({})",
+            p.pending.len()
+        )));
+        if p.pending.is_empty() {
+            rows.push(PeerRow::Note(
+                if self.snap.approval_mode == "manual" {
+                    "Nobody is waiting. New consumers appear here until you decide."
+                } else {
+                    "Admission is automatic, so nobody has to wait. Turn on manual approval in the sharing screen to vet consumers first."
+                }
+                .into(),
+            ));
+        }
+        for x in &p.pending {
+            rows.push(PeerRow::Pending(x.clone()));
+        }
+        rows.push(PeerRow::Section(format!(
+            "consumers seen recently ({})",
+            p.consumers.len()
+        )));
+        if p.consumers.is_empty() {
+            rows.push(PeerRow::Note(
+                "No consumer has used this machine recently.".into(),
+            ));
+        }
+        for x in &p.consumers {
+            rows.push(PeerRow::Consumer(x.clone()));
+        }
+        let live: Vec<&peers::Invitation> = p.invitations.iter().filter(|i| !i.revoked).collect();
+        rows.push(PeerRow::Section(format!("invitations ({})", live.len())));
+        if live.is_empty() {
+            rows.push(PeerRow::Note(
+                "None minted. An invitation is a contract with one consumer: they pin their inference to this machine, and it bypasses manual approval.".into(),
+            ));
+        }
+        for x in live {
+            rows.push(PeerRow::Invitation(x.clone()));
+        }
+        rows
+    }
+
+    fn peer_move(&mut self, step: isize) {
+        let rows = self.peer_rows();
+        if rows.is_empty() {
+            return;
+        }
+        let mut i = self.peers_sel as isize;
+        for _ in 0..rows.len() {
+            i += step;
+            if i < 0 {
+                i = rows.len() as isize - 1;
+            }
+            if i >= rows.len() as isize {
+                i = 0;
+            }
+            if rows[i as usize].selectable() {
+                self.peers_sel = i as usize;
+                return;
+            }
+        }
+        self.peers_sel = 0;
+    }
+
+    /// The node's gateway and token, or a reason there are none.
+    fn gateway_auth(&self) -> Result<(String, String), String> {
+        let gateway = if self.gateway.is_empty() {
+            self.snap.gateway.clone()
+        } else {
+            self.gateway.clone()
+        };
+        if gateway.is_empty() {
+            return Err("no gateway known yet".into());
+        }
+        let creds = peers::credential(&self.creds_path)
+            .ok_or_else(|| format!("no credential at {}", self.creds_path.display()))?;
+        Ok((gateway, creds.token))
+    }
+
+    fn fetch_peers(&mut self) {
+        let (gateway, token) = match self.gateway_auth() {
+            Ok(v) => v,
+            Err(e) => {
+                self.peers_error = e;
+                return;
+            }
+        };
+        self.peers_loading = true;
+        self.last_peers_fetch = Instant::now();
+        let tx = self.peer_tx.clone();
+        tokio::spawn(async move {
+            let out = peers::fetch(&gateway, &token, GATEWAY_TIMEOUT).await;
+            let _ = tx.send(PeerMsg::Loaded(out));
+        });
+    }
+
+    /// Approve, deny, block, or clear the standing rule for the selected
+    /// consumer.
+    fn decide_selected(&mut self, decision: Option<&'static str>) {
+        let rows = self.peer_rows();
+        let consumer = match rows.get(self.peers_sel) {
+            Some(PeerRow::Pending(p)) => p.consumer.clone(),
+            Some(PeerRow::Consumer(c)) => c.consumer.clone(),
+            _ => {
+                self.say("select a consumer first");
+                return;
+            }
+        };
+        let (gateway, token) = match self.gateway_auth() {
+            Ok(v) => v,
+            Err(e) => return self.say(e),
+        };
+        let tx = self.peer_tx.clone();
+        let verb = decision.unwrap_or("cleared");
+        let short = consumer.clone();
+        tokio::spawn(async move {
+            let out = peers::decide(&gateway, &token, &consumer, decision, GATEWAY_TIMEOUT)
+                .await
+                .map(|()| format!("{short} {verb}"));
+            let _ = tx.send(PeerMsg::Acted(out));
+        });
+        self.say("asking the gateway…");
+    }
+
+    fn mint_invitation(&mut self, label: String) {
+        let (gateway, token) = match self.gateway_auth() {
+            Ok(v) => v,
+            Err(e) => return self.say(e),
+        };
+        let tx = self.peer_tx.clone();
+        tokio::spawn(async move {
+            let out = peers::invite(&gateway, &token, &label, GATEWAY_TIMEOUT)
+                .await
+                .map(|inv| format!("invitation {} minted", inv.invitation_id));
+            let _ = tx.send(PeerMsg::Acted(out));
+        });
+        self.say("minting…");
+    }
+
+    fn selected_invitation(&self) -> Option<peers::Invitation> {
+        match self.peer_rows().get(self.peers_sel) {
+            Some(PeerRow::Invitation(i)) => Some(i.clone()),
+            _ => None,
+        }
+    }
+
+    fn hold_selected_invitation(&mut self) {
+        let Some(inv) = self.selected_invitation() else {
+            self.say("select an invitation first");
+            return;
+        };
+        let (gateway, token) = match self.gateway_auth() {
+            Ok(v) => v,
+            Err(e) => return self.say(e),
+        };
+        let paused = !inv.paused;
+        let tx = self.peer_tx.clone();
+        tokio::spawn(async move {
+            let out = peers::set_paused(&gateway, &token, &inv, paused, GATEWAY_TIMEOUT)
+                .await
+                .map(|()| {
+                    if paused {
+                        "invitation held — pinned requests are refused until resumed".into()
+                    } else {
+                        "invitation resumed".to_string()
+                    }
+                });
+            let _ = tx.send(PeerMsg::Acted(out));
+        });
+    }
+
+    fn revoke_invitation(&mut self, id: String) {
+        let (gateway, token) = match self.gateway_auth() {
+            Ok(v) => v,
+            Err(e) => return self.say(e),
+        };
+        let tx = self.peer_tx.clone();
+        tokio::spawn(async move {
+            let out = peers::revoke(&gateway, &token, &id, GATEWAY_TIMEOUT)
+                .await
+                .map(|()| "invitation revoked".to_string());
+            let _ = tx.send(PeerMsg::Acted(out));
+        });
+    }
+
+    /// Keys that only mean something on the peers screen.
+    fn on_peers_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.peer_move(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.peer_move(1),
+            KeyCode::Char('a') => self.decide_selected(Some("approved")),
+            KeyCode::Char('n') => self.decide_selected(Some("denied")),
+            KeyCode::Char('b') => self.decide_selected(Some("blocked")),
+            KeyCode::Char('u') => self.decide_selected(None),
+            KeyCode::Char('i') => {
+                self.editing = Some(Editing {
+                    key: "invite-label",
+                    label: "Who is this invitation for? (a note only you see)",
+                    buffer: String::new(),
+                    masked: false,
+                });
+            }
+            KeyCode::Char('h') => self.hold_selected_invitation(),
+            KeyCode::Char('v') => match self.selected_invitation() {
+                Some(inv) => self.confirm = Some(Confirm::Revoke(inv.invitation_id)),
+                None => self.say("select an invitation first"),
+            },
+            KeyCode::Esc => self.view = View::Home,
+            _ => return false,
+        }
+        true
+    }
+
+    fn on_peer_msg(&mut self, msg: PeerMsg) {
+        match msg {
+            PeerMsg::Loaded(Ok(p)) => {
+                self.peers_loading = false;
+                self.peers_error.clear();
+                self.peers = Some(p);
+                let rows = self.peer_rows();
+                if rows.get(self.peers_sel).map(PeerRow::selectable) != Some(true) {
+                    self.peers_sel = 0;
+                    self.peer_move(1);
+                }
+            }
+            PeerMsg::Loaded(Err(e)) => {
+                self.peers_loading = false;
+                self.peers_error = e;
+            }
+            PeerMsg::Acted(Ok(msg)) => {
+                self.say(msg);
+                // The answer is on the gateway, so re-read rather than
+                // guessing what the decision did to the lists.
+                self.fetch_peers();
+            }
+            PeerMsg::Acted(Err(e)) => self.say(format!("gateway refused: {e}")),
+        }
+    }
+}
+
+fn draw_peers(f: &mut Frame, app: &App, area: Rect) {
+    let [body, note] = Layout::vertical([Constraint::Min(6), Constraint::Length(4)]).areas(area);
+    let rows = app.peer_rows();
+    let lines: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| peer_line(r, i == app.peers_sel))
+        .collect();
+    let mut title = "peers".to_string();
+    if app.peers_loading && app.peers.is_none() {
+        title.push_str("  (loading)");
+    }
+    if !app.peers_error.is_empty() {
+        title.push_str("  (gateway unreachable)");
+    }
+    f.render_widget(Paragraph::new(lines).block(panel_owned(title)), body);
+
+    let hint = if !app.peers_error.is_empty() {
+        Line::from(Span::styled(
+            format!("cannot ask the gateway: {}", app.peers_error),
+            Style::new().fg(Color::Red),
+        ))
+    } else {
+        Line::from(Span::styled(
+            "a approve · n deny · b block · u clear the rule · i new invitation · h hold/resume · v revoke",
+            Style::new().fg(MUTED),
+        ))
+    };
+    let mode = match app.peers.as_ref().and_then(|p| p.approval_mode.clone()) {
+        Some(m) if m != app.snap.approval_mode => format!(
+            "The gateway still has this node as {m}; the new mode is advertised on the next reconnect.",
+        ),
+        _ => "Blocking ends a consumer's access in every mode. Invitations always bypass manual approval.".into(),
+    };
+    f.render_widget(
+        Paragraph::new(vec![
+            hint,
+            Line::from(Span::styled(mode, Style::new().fg(MUTED))),
+        ])
+        .wrap(Wrap { trim: true })
+        .block(panel("about")),
+        note,
+    );
+}
+
+fn peer_line(row: &PeerRow, selected: bool) -> Line<'static> {
+    let base = if selected {
+        Style::new().fg(Color::Black).bg(ACCENT)
+    } else {
+        Style::new()
+    };
+    match row {
+        PeerRow::Section(title) => Line::from(Span::styled(
+            format!(" {title}"),
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        PeerRow::Note(text) => {
+            Line::from(Span::styled(format!("   {text}"), Style::new().fg(MUTED)))
+        }
+        PeerRow::Pending(p) => Line::from(vec![
+            Span::styled(format!("  {:<22}", p.consumer), base),
+            Span::styled(
+                format!(
+                    "waiting {}   asked for {}",
+                    human(Duration::from_secs(p.first_seen_seconds.max(0) as u64)),
+                    if p.model.is_empty() { "—" } else { &p.model }
+                ),
+                base.fg(Color::Yellow),
+            ),
+        ]),
+        PeerRow::Consumer(c) => {
+            let rule = c.rule.clone().unwrap_or_default();
+            let (mark, colour) = match rule.as_str() {
+                "blocked" => ("blocked", Color::Red),
+                "denied" => ("denied", Color::Red),
+                "approved" => ("approved", Color::Green),
+                _ => ("", MUTED),
+            };
+            Line::from(vec![
+                Span::styled(format!("  {:<22}", c.consumer), base),
+                Span::styled(
+                    format!("{:<9}", if c.active { "active" } else { "idle" }),
+                    if c.active {
+                        base.fg(Color::Green)
+                    } else {
+                        base.fg(MUTED)
+                    },
+                ),
+                Span::styled(format!("{:<18}", c.via), base.fg(MUTED)),
+                Span::styled(
+                    format!(
+                        "{:<10}",
+                        human(Duration::from_secs(c.last_seen_seconds.max(0) as u64))
+                    ),
+                    base.fg(MUTED),
+                ),
+                Span::styled(mark.to_string(), base.fg(colour)),
+            ])
+        }
+        PeerRow::Invitation(i) => Line::from(vec![
+            Span::styled(format!("  {}", i.invitation_id), base),
+            Span::styled(
+                format!(
+                    "  {:<20}",
+                    if i.label.is_empty() {
+                        "(no label)".to_string()
+                    } else {
+                        i.label.clone()
+                    }
+                ),
+                base,
+            ),
+            Span::styled(
+                if i.paused {
+                    "held".to_string()
+                } else if i.consumer_active {
+                    format!(
+                        "in use {}",
+                        human(Duration::from_secs(i.connected_for_seconds.max(0) as u64))
+                    )
+                } else {
+                    "idle".to_string()
+                },
+                base.fg(if i.paused {
+                    Color::Yellow
+                } else if i.consumer_active {
+                    Color::Green
+                } else {
+                    MUTED
+                }),
+            ),
+        ]),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1659,6 +2156,14 @@ mod tests {
             saved: Settings::default(),
             sharing_sel: 1,
             editing: None,
+            peers: None,
+            peers_error: String::new(),
+            peers_sel: 0,
+            peers_loading: false,
+            last_peers_fetch: Instant::now(),
+            peer_tx: tokio::sync::mpsc::unbounded_channel().0,
+            creds_path: std::env::temp_dir().join("fabric_node.json"),
+            gateway: "https://gw.example".into(),
             snap: Snapshot::default(),
             view: View::Home,
             selected: 0,
@@ -1959,6 +2464,138 @@ mod tests {
                 "landed on a heading"
             );
         }
+    }
+
+    fn peers_app() -> App {
+        let mut a = app();
+        a.view = View::Peers;
+        a.peers = Some(Peers {
+            pending: vec![peers::Pending {
+                consumer: "anon-1a2b3c4d".into(),
+                first_seen_seconds: 120,
+                last_seen_seconds: 2,
+                model: "llama3".into(),
+            }],
+            consumers: vec![peers::Consumer {
+                consumer: "node-9".into(),
+                via: "grid selection".into(),
+                active: true,
+                rule: None,
+                ..Default::default()
+            }],
+            invitations: vec![
+                peers::Invitation {
+                    invitation_id: "7f9b2c9e-4a1d-4e5f-9c3a-2b8d1e6f0a47".into(),
+                    label: "Anna's phone".into(),
+                    ..Default::default()
+                },
+                peers::Invitation {
+                    invitation_id: "dead0000-0000-0000-0000-000000000000".into(),
+                    revoked: true,
+                    ..Default::default()
+                },
+            ],
+            approval_mode: Some("manual".into()),
+        });
+        a
+    }
+
+    #[test]
+    fn the_peers_screen_lists_who_is_waiting_who_is_using_it_and_who_was_invited() {
+        let a = peers_app();
+        let rows = a.peer_rows();
+        assert!(rows.iter().any(|r| matches!(r, PeerRow::Pending(_))));
+        assert!(rows.iter().any(|r| matches!(r, PeerRow::Consumer(_))));
+        let invitations = rows
+            .iter()
+            .filter(|r| matches!(r, PeerRow::Invitation(_)))
+            .count();
+        // The revoked one is history, not a row someone can act on.
+        assert_eq!(invitations, 1);
+    }
+
+    #[test]
+    fn an_automatic_node_is_told_why_nobody_is_waiting() {
+        let mut a = peers_app();
+        a.peers.as_mut().unwrap().pending.clear();
+        a.snap.approval_mode = "auto".into();
+        let text = a
+            .peer_rows()
+            .iter()
+            .filter_map(|r| match r {
+                PeerRow::Note(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("Admission is automatic"));
+    }
+
+    #[test]
+    fn navigation_only_lands_on_rows_that_can_be_acted_on() {
+        let mut a = peers_app();
+        for _ in 0..a.peer_rows().len() * 2 {
+            a.peer_move(1);
+            assert!(a.peer_rows()[a.peers_sel].selectable());
+        }
+    }
+
+    #[test]
+    fn deciding_needs_a_consumer_selected() {
+        let mut a = peers_app();
+        // Sitting on the invitation row, an approve is a mistake, not a
+        // silent no-op against whoever happens to be first in the list.
+        let i = a
+            .peer_rows()
+            .iter()
+            .position(|r| matches!(r, PeerRow::Invitation(_)))
+            .unwrap();
+        a.peers_sel = i;
+        press(&mut a, 'a');
+        assert!(a.notice.contains("select a consumer"));
+    }
+
+    #[test]
+    fn revoking_an_invitation_is_confirmed_first() {
+        let mut a = peers_app();
+        a.peers_sel = a
+            .peer_rows()
+            .iter()
+            .position(|r| matches!(r, PeerRow::Invitation(_)))
+            .unwrap();
+        press(&mut a, 'v');
+        match a.confirm {
+            Some(Confirm::Revoke(ref id)) => assert!(id.starts_with("7f9b2c9e")),
+            _ => panic!("revoking must ask first — it cannot be undone"),
+        }
+        // And the question says what it costs.
+        assert!(a
+            .confirm
+            .as_ref()
+            .unwrap()
+            .question()
+            .contains("permanently"));
+    }
+
+    #[test]
+    fn minting_an_invitation_asks_who_it_is_for() {
+        let mut a = peers_app();
+        press(&mut a, 'i');
+        let edit = a.editing.as_ref().expect("a label field opens");
+        assert_eq!(edit.key, "invite-label");
+        assert!(!edit.masked);
+    }
+
+    #[test]
+    fn the_peers_screen_survives_a_gateway_that_says_nothing() {
+        let mut a = app();
+        a.view = View::Peers;
+        // No fetch has answered yet: the screen renders a waiting line rather
+        // than an empty box or a panic.
+        assert_eq!(a.peer_rows().len(), 1);
+        a.on_peer_msg(PeerMsg::Loaded(Err("connection refused".into())));
+        assert_eq!(a.peers_error, "connection refused");
+        assert!(!a.peers_loading);
     }
 
     #[test]

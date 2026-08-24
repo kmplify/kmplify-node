@@ -200,6 +200,7 @@ starts a node itself and quitting stops it.
 | `x` | Stop the node, tearing down hosted sessions first. |
 | `w` | Write a plain-text snapshot of the dashboard, for a bug report. |
 | `5` | **Sharing** — what this machine lends and how much of it (see below). |
+| `6` | **Peers** — who may use it: waiting consumers, active ones, invitations. |
 | `1`–`4` | Home, sessions, models, log. `?` for the full list. |
 
 ### Changing what you lend, without a restart
@@ -234,6 +235,23 @@ does not spring back on the next restart. Nothing about that is silent:
 `kmplify-node check` prints every value that is overriding the environment,
 `set --list` shows them, and a `●` marks them in the dashboard. `d` on a row
 (or `set --clear KEY`) drops the override, and the unit file governs again.
+
+### Who may use it
+
+The peers screen (`6`) is the admission half of the same panel, and it exists
+because the sharing screen can turn **manual approval** on: a node in manual
+mode with no way to approve anybody has quietly stopped serving.
+
+- consumers waiting for a decision — `a` approve, `n` deny, `b` block,
+  `u` clear the standing rule;
+- consumers that have used this machine recently, with how the work arrived
+  (invitation, grid selection, the anonymous pool) and any standing rule;
+- invitations — `i` mints one for a named consumer, `h` holds or resumes it,
+  `v` revokes it for good.
+
+This asks the gateway as the node itself, using the node's own credential; a
+gateway that cannot be reached costs the screen and nothing else — the worker
+carries on serving.
 
 The node also publishes `status.json` in its node directory (owner-readable
 only) and accepts commands as files in `control/` there. That is how a

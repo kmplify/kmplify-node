@@ -159,6 +159,17 @@ choice overrides the environment**, so an operator standing at the machine
 beats a unit file written months ago. `kmplify-node check` prints every such
 override, and `set --clear KEY` removes one.
 
+### Who may use it (key `6`)
+
+Consumers waiting for a decision (`a` approve, `n` deny, `b` block, `u` clear
+the rule), consumers seen recently and how their work arrived, and the
+invitations this node has minted (`i` new, `h` hold or resume, `v` revoke).
+
+Turning on manual approval without this screen would be a trap: the node
+would park every unknown consumer and nobody at the terminal could let them
+in. The screen talks to the gateway as the node, with the credential in
+`KMPLIFY_NODE_DIR`; an unreachable gateway costs the screen and nothing else.
+
 For scripts and monitoring, the same snapshot without the full screen:
 
 ```sh
