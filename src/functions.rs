@@ -440,7 +440,11 @@ pub fn run_module(
     _args: &[String],
     _limits: Limits,
 ) -> Result<RunResult, String> {
-    Err("this kmplify-node build has no Wasm runtime (build with --features wasm)".into())
+    Err(
+        "this kmplify-node build has no Wasm runtime: it was built with \
+         --no-default-features. Rebuild with --features wasm."
+            .into(),
+    )
 }
 
 #[cfg(test)]

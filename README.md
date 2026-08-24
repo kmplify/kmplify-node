@@ -37,8 +37,12 @@ decision anyone should make about a binary they cannot read.
 - **Optionally runs signed Wasm functions** in an in-process WASI sandbox
   (stdin/stdout only, no files, no network), only for a catalog key you chose
   to trust, and **optionally lends vector storage** for replicated RAG
-  indexes whose payloads are opaque to you. Both off by default; protocol
-  v3.0 in [PROTOCOL.md](PROTOCOL.md).
+  indexes whose payloads are opaque to you. Both off by default and both
+  switchable without a restart; protocol v3.0 in [PROTOCOL.md](PROTOCOL.md).
+
+  ```bash
+  kmplify-node set functions=true functions-pubkey=$(curl -s https://fabric.kmplify.io/v1/functions | jq -r .pubkey)
+  ```
 
 ### Hardware support
 
@@ -293,6 +297,8 @@ kmplify-node set --clear max-cpus   # back to whatever the unit file says
 | `country` | `PROVIDER_COUNTRY` | ISO alpha-2, for consumers who want EU capacity |
 | `colibri` · `colibri-key` | `COLIBRI_BASE` · `COLIBRI_API_KEY` | second upstream for frontier MoE models |
 | `max-cpus` · `max-vram-mb` · `max-ram-mb` · `max-disk-gb` | the matching `PROVIDER_MAX_*` | ceilings peer sessions never exceed |
+| `functions` · `functions-pubkey` | `PROVIDER_FUNCTIONS` · `PROVIDER_FUNCTIONS_PUBKEY` | host signed Wasm functions, and the catalog key to trust |
+| `share-vectors` · `max-vector-mb` | `PROVIDER_SHARE_VECTORS` · `PROVIDER_MAX_VECTOR_MB` | hold peers' vector collections, and how much |
 | `rewards` | `PROVIDER_REWARDS` | may the node ask an installed payout companion |
 
 Writes `settings.json` in the node directory (mode 0600 — it can hold the
@@ -553,7 +559,7 @@ falling back to a default the operator did not choose.
 | `KMPLIFY_GPU_BACKEND` | autodetect | Force the accelerator: `cuda`, `rocm`, `oneapi`, `metal`, `cpu`. |
 | `KMPLIFY_CUDA` | autodetect | Older CUDA-only override (`1`/`0`). Still honoured. |
 | `KMPLIFY_FABRIC_EXTRA_IMAGE_PINS` | *empty* | Extra `template=repository` image pins. See below. |
-| `PROVIDER_FUNCTIONS` | `false` | Host signed Wasm functions (needs a build with `--features wasm`). |
+| `PROVIDER_FUNCTIONS` | `false` | Host signed Wasm functions. The runtime ships in the released binaries; this switch and a catalog key are what turn it on. |
 | `PROVIDER_FUNCTIONS_PUBKEY` | *empty* | Hex Ed25519 key of the function catalog to trust. Empty = refuse all. |
 | `PROVIDER_MAX_FUNCTION_MB` | `256` | Per-call memory ceiling (hard cap 1024). |
 | `PROVIDER_MAX_FUNCTION_MS` | `30000` | Per-call wall-clock ceiling (hard cap 300000). |

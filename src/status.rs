@@ -240,6 +240,10 @@ pub struct Snapshot {
     pub delivered: Delivered,
 
     pub functions_enabled: bool,
+    /// The catalog key this node trusts, or empty. Public by nature — it is a
+    /// verification key — and a node that trusts none refuses every function,
+    /// which an operator has to be able to SEE.
+    pub functions_pubkey: String,
     pub vectors_enabled: bool,
     pub vectors_used_mb: u64,
     pub vectors_max_mb: u64,

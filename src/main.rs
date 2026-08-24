@@ -403,16 +403,20 @@ fn judge(cfg: &WorkerConfig, pf: &mut Preflight) {
         );
     }
     if cfg.functions.enabled && cfg.functions.trusted_pubkey.is_empty() {
-        pf.errors.push(
+        // Naming the endpoint, because the key is now the ONLY thing between
+        // an operator and a working functions lane: the runtime ships.
+        pf.errors.push(format!(
             "PROVIDER_FUNCTIONS is on but PROVIDER_FUNCTIONS_PUBKEY is empty — \
-             every function job would be refused"
-                .into(),
-        );
+             every function job would be refused. The key this fabric signs with:\n\
+             \x20   curl {}/v1/functions      # the \"pubkey\" field",
+            cfg.gateway_url
+        ));
     }
     if cfg.functions.enabled && !kmplify_node::functions::runtime_available() {
         pf.errors.push(
-            "PROVIDER_FUNCTIONS is on but this build has no Wasm runtime \
-             (rebuild with --features wasm)"
+            "PROVIDER_FUNCTIONS is on but this build has no Wasm runtime — it was \
+             built with --no-default-features. The released binaries include it; \
+             rebuild with --features wasm."
                 .into(),
         );
     }
