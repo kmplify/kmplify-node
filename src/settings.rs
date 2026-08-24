@@ -82,6 +82,13 @@ pub struct Settings {
     /// Ceiling on disk sessions may fill, in GB (`PROVIDER_MAX_DISK_GB`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_disk_gb: Option<u64>,
+    /// Show what an installed rewards companion reports (`PROVIDER_REWARDS`).
+    ///
+    /// Deliberately NOT applied to `WorkerConfig`: the worker has no idea
+    /// rewards exist, and that is the point. Serving must never depend on a
+    /// payment system being happy — see [`crate::rewards`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rewards: Option<bool>,
 }
 
 /// The settings a caller may address by name, in `kmplify-node set` and in
@@ -101,6 +108,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("max-vram-mb", "PROVIDER_MAX_VRAM_MB"),
     ("max-ram-mb", "PROVIDER_MAX_RAM_MB"),
     ("max-disk-gb", "PROVIDER_MAX_DISK_GB"),
+    ("rewards", "PROVIDER_REWARDS"),
 ];
 
 pub fn path(node_dir: &Path) -> PathBuf {
@@ -313,6 +321,7 @@ impl Settings {
             "max-vram-mb" => self.max_vram_mb = Some(parse_num::<u64>(key, value)?),
             "max-ram-mb" => self.max_ram_mb = Some(parse_num::<u64>(key, value)?),
             "max-disk-gb" => self.max_disk_gb = Some(parse_num::<u64>(key, value)?),
+            "rewards" => self.rewards = Some(parse_bool(key, value)?),
             _ => {
                 return Err(format!(
                     "unknown setting {key:?} (one of: {})",
@@ -337,6 +346,7 @@ impl Settings {
             "max-vram-mb" => self.max_vram_mb = None,
             "max-ram-mb" => self.max_ram_mb = None,
             "max-disk-gb" => self.max_disk_gb = None,
+            "rewards" => self.rewards = None,
             _ => {
                 return Err(format!(
                     "unknown setting {key:?} (one of: {})",
@@ -375,7 +385,29 @@ impl Settings {
         push("max-vram-mb", self.max_vram_mb.map(|v| v.to_string()));
         push("max-ram-mb", self.max_ram_mb.map(|v| v.to_string()));
         push("max-disk-gb", self.max_disk_gb.map(|v| v.to_string()));
+        push("rewards", self.rewards.map(|v| v.to_string()));
         out
+    }
+}
+
+impl Settings {
+    /// Is a rewards companion allowed to be asked at all?
+    ///
+    /// Stored choice first, then the environment, then off. Off is the only
+    /// default there can be: nothing should run another program on an
+    /// operator's machine because a file happened to be installed.
+    pub fn rewards_enabled(&self) -> bool {
+        if let Some(v) = self.rewards {
+            return v;
+        }
+        matches!(
+            std::env::var("PROVIDER_REWARDS")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        )
     }
 }
 
