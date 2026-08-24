@@ -168,6 +168,15 @@ pub struct Snapshot {
     pub cpu_model: String,
     pub cpus: f64,
     pub cpu_percent: f32,
+    /// Per-logical-CPU load, 0-100. Empty when the sampler has not warmed up.
+    pub per_core: Vec<f32>,
+    /// How busy the accelerator is, 0-100, or `None` where the platform will
+    /// not say (Metal, oneAPI). Absent is not zero, and a dashboard must not
+    /// draw it as an idle card.
+    pub gpu_percent: Option<u8>,
+    /// Disk the fabric's own volumes are holding, in MB. Sampled rarely: the
+    /// answer costs a `docker system df`.
+    pub fabric_disk_mb: Option<u64>,
     pub ram_total_mb: u64,
     pub ram_used_mb: u64,
     /// Logical CPUs promised to peer sessions right now.
@@ -464,25 +473,30 @@ pub fn status_path(node_dir: &Path) -> PathBuf {
     node_dir.join(STATUS_FILE)
 }
 
-/// How many publish ticks pass between VRAM readings.
+/// How many publish ticks pass between accelerator readings.
 ///
-/// Everything else in [`sample_host`] is an in-memory read; VRAM is a
-/// subprocess (`nvidia-smi`, `rocm-smi`) and spawning one every two seconds
-/// forever, on every CUDA node in the fabric, to move a bar that changes
-/// slowly is not a trade worth making. Ten seconds matches the cadence the
-/// worker already reads it at for the gateway.
-const VRAM_EVERY: u32 = 5;
+/// Everything else in [`sample_host`] is an in-memory read; the GPU is a
+/// subprocess (`nvidia-smi`, `rocm-smi`). Every four seconds is fast enough
+/// for a graph to be worth looking at and slow enough that a node lending its
+/// cycles is not spending them on being watched. A dashboard rendering the
+/// node in its OWN process samples faster, because someone is looking at it.
+const GPU_EVERY: u32 = 2;
+
+/// Ticks between `docker system df` readings. Minutes, not seconds: it walks
+/// the volume set, and the number moves when a model is downloaded rather
+/// than continuously.
+const DISK_EVERY: u32 = 30;
 
 /// Fill in the live host figures the worker does not otherwise sample.
 ///
 /// Separate from [`snapshot`] because these cost more than a lock and a
 /// dashboard repainting at 4 Hz must not pay that on every frame.
-pub async fn sample_host(accel: crate::gpu::Backend, with_vram: bool) {
+pub async fn sample_host(accel: crate::gpu::Backend, with_gpu: bool) {
     let cpu = crate::hostcpu::snapshot();
-    let vram_used = if with_vram {
-        crate::gpu::used_mb(accel).await
+    let (gpu_busy, vram_used) = if with_gpu {
+        crate::gpu::utilization(accel).await
     } else {
-        None
+        (None, None)
     };
     let reserved = crate::fabric_worker::reserved_cpus().await;
     let sessions: Vec<Session> = crate::fabric_worker::hosted_sessions()
@@ -501,14 +515,24 @@ pub async fn sample_host(accel: crate::gpu::Backend, with_vram: bool) {
         s.cpu_model = cpu.model;
         s.cpus = cpu.logical_cores as f64;
         s.cpu_percent = cpu.percent;
+        if !cpu.per_core.is_empty() {
+            s.per_core = cpu.per_core;
+        }
         s.ram_total_mb = cpu.ram_total_mb;
         s.ram_used_mb = cpu.ram_used_mb;
+        // Only a real reading replaces the last one: a skipped GPU tick must
+        // leave the previous figures standing, not blank the graph.
         if let Some(v) = vram_used {
             s.vram_used_mb = v;
         }
-        // Never below zero: the accounting can land on -0.0 when the last
-        // session releases, and "-0 of 12 cores lent" reads as a bug.
-        s.reserved_cpus = reserved.max(0.0);
+        if gpu_busy.is_some() {
+            s.gpu_percent = gpu_busy;
+        }
+        // Never below zero: the accounting lands on -0.0 when the last
+        // session releases, and "-0 of 12 cores lent" reads as a bug. Not
+        // `max(0.0)` — for two zeros that is allowed to return either one,
+        // and it returns the negative.
+        s.reserved_cpus = if reserved > 0.0 { reserved } else { 0.0 };
         s.sessions = sessions;
     });
 }
@@ -526,7 +550,11 @@ pub async fn publish_loop(
     let tmp = path.with_extension("json.tmp");
     let mut tick: u32 = 0;
     loop {
-        sample_host(accel, tick % VRAM_EVERY == 0).await;
+        sample_host(accel, tick % GPU_EVERY == 0).await;
+        if tick % DISK_EVERY == 0 {
+            let used = crate::fabric_worker::fabric_disk_used_mb().await;
+            update(move |s| s.fabric_disk_mb = used);
+        }
         tick = tick.wrapping_add(1);
         let snap = snapshot();
         write_snapshot(&path, &tmp, &snap).await;

@@ -201,6 +201,7 @@ starts a node itself and quitting stops it.
 | `w` | Write a plain-text snapshot of the dashboard, for a bug report. |
 | `5` | **Sharing** — what this machine lends and how much of it (see below). |
 | `6` | **Peers** — who may use it: waiting consumers, active ones, invitations. |
+| `7` | **Activity** — CPU, GPU, VRAM and RAM live, with history and a bar per core. |
 | `1`–`4` | Home, sessions, models, log. `?` for the full list. |
 
 ### Changing what you lend, without a restart
@@ -235,6 +236,30 @@ does not spring back on the next restart. Nothing about that is silent:
 `kmplify-node check` prints every value that is overriding the environment,
 `set --list` shows them, and a `●` marks them in the dashboard. `d` on a row
 (or `set --clear KEY`) drops the override, and the unit file governs again.
+
+### The activity monitor
+
+`7` is the screen a provider actually wants: how much of this machine is gone
+right now, which no log line answers.
+
+```
+╭ CPU ───────────────────────────────────╮╭ GPU · cuda ────────────────────────────╮
+│ ████████████········  61%  4 of 16 lent ││ ██████████████······  70%  busy        │
+│      ▂▃▅▆█▇▅▃▂▁▂▃▅▆█▇▅                  ││    ▁▃▅▆████▇▅▃▁▂▄▆██▇                  │
+│ 13th Gen i9-13900K   5 min: avg 38% …   ││ RTX 4090 · 24576 MB  5 min: avg 52% …  │
+╰────────────────────────────────────────╯╰────────────────────────────────────────╯
+╭ cores ──────────────────────────────────────────────────────────────────────────╮
+│  0 ███████···  71%    4 ██········  22%    8 █████·····  54%   12 ██········  19%│
+```
+
+Four measurements, each with its own colour wherever it appears, a bar, and
+five minutes of history; a bar per logical CPU, which is what tells a pinned
+thread apart from a busy machine; and a line for what the fabric is holding
+(sessions, cores, jobs, disk).
+
+Figures a platform will not report say so rather than drawing a zero — macOS
+exposes GPU load only to privileged tools, and a flat line along the bottom of
+a graph would read as an idle card every time.
 
 ### Who may use it
 
