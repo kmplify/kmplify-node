@@ -126,6 +126,33 @@ pub struct Baseline {
     pub max_disk_gb: Option<u64>,
 }
 
+/// Work this node has actually delivered, since this process started.
+///
+/// For the operator's own eyes, and for a companion that wants to show
+/// earnings next to effort. Explicitly **not** an accounting record and
+/// explicitly **not** the basis of any payout: what a node claims about
+/// itself cannot settle anything. The fabric's own signed receipts are the
+/// attestation (see `docs/REWARDS.md`); these are the numbers that let an
+/// operator notice when the two disagree.
+///
+/// Per-process on purpose. A lifetime total would be a ledger, and a ledger a
+/// node keeps about its own earnings is exactly the thing nobody should trust
+/// or maintain here.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Delivered {
+    /// Inference jobs answered.
+    pub jobs: u64,
+    /// Wall-clock spent answering them, in ms.
+    pub job_ms: u64,
+    /// Peer sessions hosted to completion.
+    pub sessions: u64,
+    /// Seconds those sessions held this machine.
+    pub session_seconds: u64,
+    /// When the count started, unix ms — the process start.
+    pub since_ms: u64,
+}
+
 /// A peer's container currently running on this machine.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Session {
@@ -208,6 +235,9 @@ pub struct Snapshot {
     pub engines: BTreeMap<String, String>,
     pub sessions: Vec<Session>,
     pub jobs: Jobs,
+    /// What this node has actually served, for the operator and for an
+    /// optional rewards companion.
+    pub delivered: Delivered,
 
     pub functions_enabled: bool,
     pub vectors_enabled: bool,
@@ -276,6 +306,8 @@ static JOBS_TOTAL_MS: AtomicU64 = AtomicU64::new(0);
 static JOBS_LAST_MS: AtomicU64 = AtomicU64::new(0);
 static FUNCTION_CALLS: AtomicU64 = AtomicU64::new(0);
 static VECTOR_OPS: AtomicU64 = AtomicU64::new(0);
+static SESSIONS_HOSTED: AtomicU64 = AtomicU64::new(0);
+static SESSION_SECONDS: AtomicU64 = AtomicU64::new(0);
 static RECONNECTS: AtomicU64 = AtomicU64::new(0);
 static QUIET: AtomicBool = AtomicBool::new(false);
 static PAUSED: AtomicBool = AtomicBool::new(false);
@@ -321,6 +353,13 @@ pub fn snapshot() -> Snapshot {
         last_model: s.jobs.last_model,
         functions: FUNCTION_CALLS.load(Ordering::Relaxed),
         vector_ops: VECTOR_OPS.load(Ordering::Relaxed),
+    };
+    s.delivered = Delivered {
+        jobs: done,
+        job_ms: JOBS_TOTAL_MS.load(Ordering::Relaxed),
+        sessions: SESSIONS_HOSTED.load(Ordering::Relaxed),
+        session_seconds: SESSION_SECONDS.load(Ordering::Relaxed),
+        since_ms: s.started_at_ms,
     };
     s.reconnects = RECONNECTS.load(Ordering::Relaxed);
     s.paused = paused();
@@ -465,6 +504,16 @@ pub fn count_function_call() {
 
 pub fn count_vector_op() {
     VECTOR_OPS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One peer session ended after holding this machine for `seconds`.
+///
+/// Counted where the session is REMOVED rather than where it is asked to
+/// stop: a container that died on its own, or that outlived a reconnect,
+/// still held the hardware for that long.
+pub fn count_session(seconds: u64) {
+    SESSIONS_HOSTED.fetch_add(1, Ordering::Relaxed);
+    SESSION_SECONDS.fetch_add(seconds, Ordering::Relaxed);
 }
 
 // ------------------------------------------------------------- publishing
