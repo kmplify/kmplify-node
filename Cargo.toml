@@ -49,6 +49,12 @@ reqwest = { version = "0.12", default-features = false, features = [
 sysinfo = "0.32"
 sha2 = "0.10.9"
 ed25519-dalek = "2.1.1"
+# The terminal dashboard (src/tui.rs). Default-on because a headless node
+# without one is operated by reading logs; a packager who wants the smallest
+# possible service binary can still build with --no-default-features.
+# ratatui re-exports the crossterm it was built against, so the terminal
+# backend can never be a mismatched second version.
+ratatui = { version = "0.30", optional = true }
 # Optional Wasm runtime for the functions lane (src/functions.rs). Off by
 # default: the runtime is a large dependency and most providers never host
 # functions. Both crates must share one major version.
@@ -61,7 +67,9 @@ lto = "thin"
 strip = true
 
 [features]
-default = []
+default = ["tui"]
+# `kmplify-node tui`: watch and control the node from a terminal.
+tui = ["dep:ratatui"]
 # Host signed Wasm functions in an in-process sandbox (wasmtime, WASI p1).
 wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
 

@@ -545,13 +545,18 @@ mod tests {
         pub struct Dir(std::path::PathBuf);
         impl Dir {
             pub fn new() -> Self {
+                // Unique by CONSTRUCTION, not by clock. The name used to be
+                // pid + nanos, and two tests starting inside the same clock
+                // tick shared a directory — so one test's cleanup deleted the
+                // other's store mid-write and the failure ("No such file or
+                // directory") pointed at the code under test rather than at
+                // the harness. It reproduced roughly one run in three once
+                // enough tests ran alongside these.
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let p = std::env::temp_dir().join(format!(
                     "kmplify-node-vectors-{}-{}",
                     std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos()
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 ));
                 std::fs::create_dir_all(&p).unwrap();
                 Dir(p)

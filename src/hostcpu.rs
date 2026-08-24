@@ -35,6 +35,13 @@ pub struct HostCpu {
     /// True once at least two samples have been taken, so the UI can tell
     /// "genuinely idle" apart from "no reading yet".
     pub sampled: bool,
+    /// Per-logical-CPU load, 0-100, in the platform's own core order.
+    ///
+    /// The total says how busy the machine is; this says HOW it is busy, which
+    /// is the difference between "one thread pinned" and "everything warm" —
+    /// and on a machine that lends cores to peers, that is the interesting
+    /// question.
+    pub per_core: Vec<f32>,
     /// HOST memory in MB — the machine's real RAM (unified memory on Apple
     /// Silicon), not the Docker VM's slice the containerized backend sees.
     /// A 64 GB M2 Max reported "7.7 GB total" through that path.
@@ -83,6 +90,11 @@ pub fn start() {
             sys.refresh_cpu_usage();
             sys.refresh_memory();
             let pct = sys.global_cpu_usage();
+            let per_core: Vec<f32> = sys
+                .cpus()
+                .iter()
+                .map(|c| c.cpu_usage().clamp(0.0, 100.0))
+                .collect();
             let ram_total_mb = sys.total_memory() / (1024 * 1024);
             let ram_used_mb = sys.used_memory() / (1024 * 1024);
             let mut w = cell().lock().unwrap();
@@ -93,6 +105,7 @@ pub fn start() {
             // for one interval.
             if warmed {
                 w.percent = pct.clamp(0.0, 100.0);
+                w.per_core = per_core;
                 w.sampled = true;
             }
             warmed = true;
