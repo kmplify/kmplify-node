@@ -31,7 +31,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Cell, Gauge, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Sparkline, Table, Wrap};
 use ratatui::Frame;
 
 use kmplify_node::control::Command;
@@ -61,8 +61,101 @@ const PEERS_POLL: Duration = Duration::from_secs(5);
 /// Palette, kept to the sixteen ANSI colours so the dashboard looks right on
 /// whatever terminal a server happens to have, light or dark, and never paints
 /// its own background.
+///
+/// Each measurement keeps ONE colour everywhere it appears — the same cyan for
+/// CPU on the home meters, on its gauge, on its sparkline and on its per-core
+/// grid. That is what makes four graphs on one screen readable at a glance
+/// rather than four graphs that have to be labelled and read.
 const ACCENT: Color = Color::Cyan;
 const MUTED: Color = Color::DarkGray;
+const CPU_C: Color = Color::LightCyan;
+const GPU_C: Color = Color::LightMagenta;
+const VRAM_C: Color = Color::LightGreen;
+const RAM_C: Color = Color::LightBlue;
+const DISK_C: Color = Color::Yellow;
+
+/// Samples kept per metric: five minutes at one a second, which is long
+/// enough to show that the job that just ran was the spike.
+const HISTORY: usize = 300;
+
+/// A rolling window of one measurement.
+#[derive(Default)]
+struct Track {
+    samples: std::collections::VecDeque<u64>,
+    /// False once the platform has said it will not report this figure, so
+    /// the panel can say so instead of drawing a flat line at zero.
+    reported: bool,
+}
+
+impl Track {
+    fn push(&mut self, value: Option<u64>) {
+        let Some(v) = value else { return };
+        self.reported = true;
+        if self.samples.len() == HISTORY {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(v);
+    }
+
+    /// The tail that fits `width` cells, oldest first.
+    fn window(&self, width: usize) -> Vec<u64> {
+        let start = self.samples.len().saturating_sub(width.max(1));
+        self.samples.iter().skip(start).copied().collect()
+    }
+
+    fn last(&self) -> Option<u64> {
+        self.samples.back().copied()
+    }
+
+    /// Mean over the window, for the "busy lately?" line under each graph.
+    fn mean(&self) -> Option<u64> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        Some(self.samples.iter().sum::<u64>() / self.samples.len() as u64)
+    }
+
+    fn peak(&self) -> Option<u64> {
+        self.samples.iter().copied().max()
+    }
+}
+
+/// Everything the activity screen graphs, sampled once a second.
+#[derive(Default)]
+struct Meters {
+    cpu: Track,
+    gpu: Track,
+    vram: Track,
+    ram: Track,
+}
+
+impl Meters {
+    fn sample(&mut self, s: &Snapshot) {
+        self.cpu.push(Some(s.cpu_percent.clamp(0.0, 100.0) as u64));
+        self.gpu.push(s.gpu_percent.map(u64::from));
+        self.vram.push(vram_used_percent(s));
+        self.ram.push(percent(s.ram_used_mb, s.ram_total_mb));
+    }
+}
+
+/// VRAM in use, as a percentage, or `None` where no such number exists.
+///
+/// Unified-memory backends have no distinct "used VRAM" to read, so the field
+/// stays at zero — and a graph that plots that zero says "idle card" in a
+/// place where the truth is "nobody can tell you". One rule, used by the
+/// gauge, the graph and the history alike.
+fn vram_used_percent(s: &Snapshot) -> Option<u64> {
+    if !matches!(s.accelerator.as_str(), "cuda" | "rocm") {
+        return None;
+    }
+    percent(s.vram_used_mb, s.vram_total_mb)
+}
+
+/// `used` as a percentage of `total`, or `None` when there is no total to be
+/// a percentage of.
+fn percent(used: u64, total: u64) -> Option<u64> {
+    (total > 0).then(|| (used * 100 / total).min(100))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
@@ -75,6 +168,9 @@ enum View {
     Sharing,
     /// Who may use it: waiting consumers, active ones, and invitations.
     Peers,
+    /// The activity monitor: CPU, GPU, VRAM and RAM over time, per core, and
+    /// what the fabric is holding.
+    Activity,
 }
 
 /// Something a spawned gateway call has to say.
@@ -149,6 +245,8 @@ struct App {
     peers_error: String,
     peers_sel: usize,
     peers_loading: bool,
+    /// Rolling measurements behind the activity screen and the home meters.
+    meters: Meters,
     last_peers_fetch: Instant,
     /// Where gateway work reports back to. The screen must keep painting
     /// while a request is in flight, so every call is spawned and answers
@@ -181,6 +279,7 @@ impl App {
         if !self.snap.gateway.is_empty() {
             self.gateway = self.snap.gateway.clone();
         }
+        self.meters.sample(&self.snap);
     }
 
     fn say(&mut self, msg: impl Into<String>) {
@@ -335,6 +434,7 @@ impl App {
                 self.view = View::Peers;
                 self.fetch_peers();
             }
+            KeyCode::Char('7') | KeyCode::Char('t') => self.view = View::Activity,
             KeyCode::Char('r') => {
                 self.refresh();
                 self.say("refreshed");
@@ -421,9 +521,11 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
     };
 
     // Captured before the config is handed to a worker: the peers screen
-    // needs both to talk to the gateway as this node.
+    // needs both to talk to the gateway as this node, and the activity
+    // screen needs to know which accelerator to ask about.
     let creds_path = cfg.creds_path.clone();
     let gateway = cfg.gateway_url.clone();
+    let accel = cfg.accel();
 
     let node = if attach_mode {
         None
@@ -449,6 +551,7 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
         peers_error: String::new(),
         peers_sel: 0,
         peers_loading: false,
+        meters: Meters::default(),
         last_peers_fetch: Instant::now(),
         peer_tx,
         creds_path,
@@ -495,9 +598,18 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
 
     let mut terminal = ratatui::init();
     let mut last_poll = Instant::now() - POLL;
+    let mut ticks: u32 = 0;
     let code = loop {
         if last_poll.elapsed() >= POLL {
+            // When this process IS the node, sample for the screen at the
+            // rate someone watching expects rather than at the publisher's
+            // slower file-writing cadence. The GPU probe is a subprocess, so
+            // it still goes every other second.
+            if !app.attached() {
+                status::sample_host(accel, ticks % 2 == 0).await;
+            }
             app.refresh();
+            ticks = ticks.wrapping_add(1);
             last_poll = Instant::now();
         }
         if terminal.draw(|f| draw(f, &app)).is_err() {
@@ -562,6 +674,7 @@ fn draw(f: &mut Frame, app: &App) {
         View::Logs => draw_logs(f, app, body),
         View::Sharing => draw_sharing(f, app, body),
         View::Peers => draw_peers(f, app, body),
+        View::Activity => draw_activity(f, app, body),
     }
     f.render_widget(footer_line(app), footer);
 
@@ -581,15 +694,17 @@ fn header_line(app: &App) -> Paragraph<'static> {
         View::Logs => "log",
         View::Sharing => "sharing",
         View::Peers => "peers",
+        View::Activity => "activity",
     };
     Paragraph::new(Line::from(vec![
-        Span::styled(" ◆ kmplify-node", Style::new().fg(ACCENT).bold()),
+        Span::styled(" ◆", Style::new().fg(GPU_C).bold()),
+        Span::styled(" kmplify-node", Style::new().fg(Color::White).bold()),
         Span::styled(
             "   provider · compute fabric · inference",
             Style::new().fg(MUTED),
         ),
         Span::raw("   "),
-        Span::styled(title, Style::new().fg(Color::Yellow).bold()),
+        Span::styled(title, Style::new().fg(view_colour(app.view)).bold()),
     ]))
 }
 
@@ -613,14 +728,24 @@ fn sub_line(app: &App) -> Paragraph<'static> {
         s.node_id[..12.min(s.node_id.len())].to_string()
     };
     spans.push(sep());
-    spans.push(Span::raw(format!("node {node}")));
+    spans.push(Span::styled("node ", Style::new().fg(MUTED)));
+    spans.push(Span::styled(node, Style::new().fg(Color::White)));
     spans.push(sep());
-    spans.push(Span::raw(gateway_host(&s.gateway)));
+    spans.push(Span::styled(
+        gateway_host(&s.gateway),
+        Style::new().fg(ACCENT),
+    ));
     spans.push(sep());
-    spans.push(Span::raw(format!("up {}", human(s.uptime()))));
+    spans.push(Span::styled(
+        format!("up {}", human(s.uptime())),
+        Style::new().fg(Color::White),
+    ));
     if s.reconnects > 0 {
         spans.push(sep());
-        spans.push(Span::raw(format!("{} reconnects", s.reconnects)));
+        spans.push(Span::styled(
+            format!("{} reconnects", s.reconnects),
+            Style::new().fg(Color::Yellow),
+        ));
     }
     spans.push(sep());
     spans.push(Span::styled(
@@ -637,6 +762,20 @@ fn sub_line(app: &App) -> Paragraph<'static> {
         Style::new().fg(MUTED),
     ));
     Paragraph::new(Line::from(spans))
+}
+
+/// Each screen has a colour, and its panels and title share it — so a glance
+/// at the top says which screen this is without reading the word.
+fn view_colour(view: View) -> Color {
+    match view {
+        View::Home => Color::Yellow,
+        View::Sessions => Color::LightBlue,
+        View::Models => VRAM_C,
+        View::Logs => MUTED,
+        View::Sharing => GPU_C,
+        View::Peers => ACCENT,
+        View::Activity => CPU_C,
+    }
 }
 
 fn link_style(app: &App) -> (String, Color) {
@@ -677,7 +816,7 @@ fn footer_line(app: &App) -> Paragraph<'static> {
         )
     } else {
         format!(
-            " {quit}   1 home  2 sessions  3 models  4 log  5 sharing  6 peers   {pause}  c reconnect  e evict  x stop node  ? keys"
+            " {quit}   1 home  2 sessions  3 models  4 log  5 sharing  6 peers  7 activity   {pause}  c reconnect  e evict  x stop node  ? keys"
         )
     };
     // The notice replaces the key hints for a few seconds after an action, so
@@ -713,13 +852,19 @@ fn draw_home(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// What this machine is, and how much of it is currently spoken for.
+/// The home screen's live meters: one row per measurement, each with its own
+/// colour, its bar, and the last minute of history beside it.
+///
+/// The same four measurements the activity screen graphs, at a glance, so
+/// the home screen answers "is anything happening" without a keystroke.
 fn draw_machine(f: &mut Frame, app: &App, area: Rect) {
     let s = &app.snap;
-    let block = panel("machine");
+    let block = panel_coloured("machine", CPU_C);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let [head, vram, cpu, ram, tail] = Layout::vertical([
+    let [head, cpu, gpu, vram, ram, tail] = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -728,43 +873,62 @@ fn draw_machine(f: &mut Frame, app: &App, area: Rect) {
     ])
     .areas(inner);
 
-    let accel = if s.accelerator.is_empty() {
-        "cpu".to_string()
-    } else {
-        s.accelerator.clone()
-    };
+    let accel = accel_name(s);
     let name = if s.gpu_name.is_empty() {
         "no accelerator detected".to_string()
     } else {
-        s.gpu_name.clone()
+        format!("{} · {} MB", s.gpu_name, s.vram_total_mb)
     };
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(format!("{accel:<7}"), Style::new().fg(ACCENT).bold()),
-            Span::raw(name),
+            Span::styled(format!("{accel:<7}"), Style::new().fg(GPU_C).bold()),
+            Span::styled(name, Style::new().fg(Color::White)),
         ])),
         head,
     );
-    f.render_widget(vram_gauge(s), vram);
-    f.render_widget(
-        gauge_pct(
-            "cpu ",
-            s.cpu_percent as f64 / 100.0,
-            &format!(
-                "{:.0}%  {:.0} of {:.0} cores lent",
-                s.cpu_percent, s.reserved_cpus, s.cpus
-            ),
-        ),
-        cpu,
+    meter_row(f, cpu, "cpu", CPU_C, &app.meters.cpu, {
+        let lent = if s.reserved_cpus > 0.0 {
+            s.reserved_cpus
+        } else {
+            0.0
+        };
+        format!("{lent:.0} of {:.0} cores lent", s.cpus)
+    });
+    meter_row(
+        f,
+        gpu,
+        "gpu",
+        GPU_C,
+        &app.meters.gpu,
+        if app.meters.gpu.reported {
+            "busy".to_string()
+        } else {
+            "usage not reported here".to_string()
+        },
     );
-    f.render_widget(gauge("ram ", s.ram_used_mb, s.ram_total_mb, "MB"), ram);
+    meter_row(
+        f,
+        vram,
+        "vram",
+        VRAM_C,
+        &app.meters.vram,
+        if app.meters.vram.reported {
+            format!("{} / {} MB", s.vram_used_mb, s.vram_total_mb)
+        } else {
+            format!("{} MB on the card", s.vram_total_mb)
+        },
+    );
+    meter_row(
+        f,
+        ram,
+        "ram",
+        RAM_C,
+        &app.meters.ram,
+        format!("{} / {} GB", s.ram_used_mb / 1024, s.ram_total_mb / 1024),
+    );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            if s.cpu_model.is_empty() {
-                String::new()
-            } else {
-                s.cpu_model.clone()
-            },
+            s.cpu_model.clone(),
             Style::new().fg(MUTED),
         )))
         .wrap(Wrap { trim: true }),
@@ -772,10 +936,53 @@ fn draw_machine(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// `cpu  ████░░░░  38%  0 of 12 cores lent      ▂▃▅▂▁`
+fn meter_row(f: &mut Frame, area: Rect, label: &str, colour: Color, track: &Track, note: String) {
+    // The history strip is worth having only once there is room for the
+    // numbers first; a squeezed terminal keeps the reading and loses the
+    // decoration.
+    let spark = if area.width > 60 { area.width / 4 } else { 0 };
+    let [text, history] =
+        Layout::horizontal([Constraint::Min(20), Constraint::Length(spark)]).areas(area);
+    let Some(pct) = track.last() else {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!(" {label:<5}"), Style::new().fg(colour)),
+                Span::styled(note, Style::new().fg(MUTED)),
+            ])),
+            text,
+        );
+        return;
+    };
+    let filled = (pct as usize * 12 / 100).min(12);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!(" {label:<5}"), Style::new().fg(colour)),
+            Span::styled(
+                "█".repeat(filled),
+                Style::new().fg(load_colour(pct, colour)),
+            ),
+            Span::styled("·".repeat(12 - filled), Style::new().fg(MUTED)),
+            Span::styled(format!(" {pct:>3}%  "), Style::new().fg(colour).bold()),
+            Span::styled(note, Style::new().fg(MUTED)),
+        ])),
+        text,
+    );
+    if spark > 0 {
+        f.render_widget(
+            Sparkline::default()
+                .data(track.window(history.width as usize))
+                .max(100)
+                .style(Style::new().fg(colour)),
+            history,
+        );
+    }
+}
+
 /// What the fabric is getting out of it.
 fn draw_work(f: &mut Frame, app: &App, area: Rect) {
     let s = &app.snap;
-    let block = panel("sharing");
+    let block = panel_coloured("sharing", GPU_C);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -783,12 +990,15 @@ fn draw_work(f: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             field("inference"),
             onoff(s.share_inference && !s.paused),
-            Span::raw(format!("   {} model(s) advertised", s.models.len())),
+            Span::styled(
+                format!("  {} model(s) advertised", s.models.len()),
+                Style::new().fg(VRAM_C),
+            ),
         ]),
         Line::from(vec![
-            field("cpu/ram  "),
+            field("cpu/ram"),
             onoff(s.share_cpu),
-            field("   sessions "),
+            field("sessions"),
             if s.workloads.is_empty() {
                 Span::styled("off", Style::new().fg(MUTED))
             } else {
@@ -796,46 +1006,64 @@ fn draw_work(f: &mut Frame, app: &App, area: Rect) {
             },
         ]),
         Line::from(vec![
-            field("jobs     "),
+            field("jobs"),
             Span::styled(
-                format!("{} active", s.jobs.active),
+                format!("{:<10}", format!("{} active", s.jobs.active)),
                 Style::new().fg(if s.jobs.active > 0 {
                     Color::Green
                 } else {
                     MUTED
                 }),
             ),
-            Span::raw(format!(
-                "   {} finished   {} errors   avg {} ms",
-                s.jobs.done, s.jobs.failed, s.jobs.avg_ms
-            )),
+            Span::styled(
+                format!("{} finished  ", s.jobs.done),
+                Style::new().fg(ACCENT),
+            ),
+            Span::styled(
+                format!("{} errors  ", s.jobs.failed),
+                Style::new().fg(if s.jobs.failed > 0 { Color::Red } else { MUTED }),
+            ),
+            Span::styled(format!("avg {} ms", s.jobs.avg_ms), Style::new().fg(MUTED)),
         ]),
         Line::from(vec![
-            field("last     "),
-            Span::raw(if s.jobs.last_model.is_empty() {
-                "nothing yet".to_string()
+            field("last"),
+            if s.jobs.last_model.is_empty() {
+                Span::styled("nothing yet", Style::new().fg(MUTED))
             } else {
-                format!("{} in {} ms", s.jobs.last_model, s.jobs.last_ms)
-            }),
+                Span::styled(
+                    format!("{} in {} ms", s.jobs.last_model, s.jobs.last_ms),
+                    Style::new().fg(Color::White),
+                )
+            },
         ]),
         Line::from(vec![
             field("admission"),
-            Span::raw(if s.approval_mode.is_empty() {
-                "auto".to_string()
+            Span::styled(
+                format!(
+                    "{:<10}",
+                    if s.approval_mode.is_empty() {
+                        "auto"
+                    } else {
+                        &s.approval_mode
+                    }
+                ),
+                Style::new().fg(if s.approval_mode == "manual" {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                }),
+            ),
+            field("country"),
+            if s.country.is_empty() {
+                Span::styled("XX (undeclared)", Style::new().fg(MUTED))
             } else {
-                s.approval_mode.clone()
-            }),
-            field("   country "),
-            Span::raw(if s.country.is_empty() {
-                "XX (undeclared)".to_string()
-            } else {
-                s.country.clone()
-            }),
+                Span::styled(s.country.clone(), Style::new().fg(Color::White))
+            },
         ]),
     ];
     if s.functions_enabled || s.vectors_enabled {
         lines.push(Line::from(vec![
-            field("lanes    "),
+            field("lanes"),
             Span::raw(format!(
                 "functions {} ({} calls)   vectors {} ({} MB of {})",
                 if s.functions_enabled { "on" } else { "off" },
@@ -848,7 +1076,7 @@ fn draw_work(f: &mut Frame, app: &App, area: Rect) {
     }
     if !s.link_detail.is_empty() && s.link != Link::Online {
         lines.push(Line::from(vec![
-            field("last err "),
+            field("last err"),
             Span::styled(s.link_detail.clone(), Style::new().fg(Color::Red)),
         ]));
     }
@@ -907,14 +1135,24 @@ fn log_panel(app: &App, rows: usize) -> Paragraph<'static> {
     let start = end.saturating_sub(rows.max(1));
     let shown: Vec<Line> = lines[start..end]
         .iter()
-        .map(|l| Line::from(Span::styled(l.clone(), log_style(l))))
+        .map(|l| {
+            // The timestamp is scaffolding; the message is the news. Split so
+            // the eye lands on the second half.
+            match l.split_once(' ') {
+                Some((stamp, msg)) => Line::from(vec![
+                    Span::styled(format!("{stamp} "), Style::new().fg(MUTED)),
+                    Span::styled(msg.to_string(), log_style(msg)),
+                ]),
+                None => Line::from(Span::styled(l.clone(), log_style(l))),
+            }
+        })
         .collect();
     let title = if app.log_scroll > 0 {
         format!("log  (scrolled {} back, ↓ to follow)", app.log_scroll)
     } else {
         "log".to_string()
     };
-    Paragraph::new(shown).block(panel_owned(title))
+    Paragraph::new(shown).block(panel_coloured(&title, view_colour(View::Logs)))
 }
 
 /// Red for a line that reports a failure, yellow for one that reports a
@@ -948,10 +1186,13 @@ fn sessions_table(app: &App, selectable: bool) -> Table<'static> {
             };
             Row::new(vec![
                 Cell::from(s.session_id[..12.min(s.session_id.len())].to_string()),
-                Cell::from(s.template.clone()),
+                Cell::from(Span::styled(s.template.clone(), Style::new().fg(ACCENT))),
                 Cell::from(state_span(&s.state)),
-                Cell::from(format!("{:.1}", s.cpus)),
-                Cell::from(human(age)),
+                Cell::from(Span::styled(
+                    format!("{:.1}", s.cpus),
+                    Style::new().fg(CPU_C),
+                )),
+                Cell::from(Span::styled(human(age), Style::new().fg(MUTED))),
             ])
             .style(style)
         })
@@ -971,7 +1212,7 @@ fn sessions_table(app: &App, selectable: bool) -> Table<'static> {
         Row::new(vec!["session", "template", "state", "cpus", "age"])
             .style(Style::new().fg(MUTED).add_modifier(Modifier::BOLD)),
     )
-    .block(panel_owned(title))
+    .block(panel_coloured(&title, view_colour(View::Sessions)))
 }
 
 fn state_span(state: &str) -> Span<'static> {
@@ -991,6 +1232,13 @@ fn models_table(app: &App, _height: usize) -> Table<'static> {
         .enumerate()
         .map(|(i, m)| {
             let engine = s.engines.get(m).cloned().unwrap_or_else(|| "local".into());
+            // Colibri models stream from NVMe rather than sitting in VRAM;
+            // the colour says which upstream a consumer would actually hit.
+            let engine_style = if engine == "local" {
+                Style::new().fg(VRAM_C)
+            } else {
+                Style::new().fg(GPU_C)
+            };
             let style = if app.view == View::Models && i == app.selected {
                 Style::new().fg(Color::Black).bg(ACCENT)
             } else {
@@ -998,7 +1246,7 @@ fn models_table(app: &App, _height: usize) -> Table<'static> {
             };
             Row::new(vec![
                 Cell::from(m.clone()),
-                Cell::from(Span::styled(engine, Style::new().fg(MUTED))),
+                Cell::from(Span::styled(engine, engine_style)),
             ])
             .style(style)
         })
@@ -1013,7 +1261,7 @@ fn models_table(app: &App, _height: usize) -> Table<'static> {
             Row::new(vec!["model", "engine"])
                 .style(Style::new().fg(MUTED).add_modifier(Modifier::BOLD)),
         )
-        .block(panel_owned(title))
+        .block(panel_coloured(&title, view_colour(View::Models)))
 }
 
 fn draw_overlay(f: &mut Frame, title: &str, body: String) {
@@ -1035,7 +1283,7 @@ fn draw_overlay(f: &mut Frame, title: &str, body: String) {
 }
 
 fn help_text() -> String {
-    "1/h home  2/s sessions  3/m models  4/l log  5/g sharing  6 peers\n\
+    "1/h home  2/s sessions  3/m models  4/l log  5/g sharing  6 peers  7/t activity\n\
      ↑/↓ or j/k   move (log: scroll back)\n\
      p  pause or resume sharing — stays connected, advertises nothing\n\
      c  reconnect to the gateway now\n\
@@ -1048,7 +1296,11 @@ fn help_text() -> String {
      s applies — which reconnects so the fabric hears the new terms.\n\
      \n\
      peers (6): a approve, n deny, b block, u clear the standing rule,\n\
-     i mint an invitation, h hold or resume one, v revoke it."
+     i mint an invitation, h hold or resume one, v revoke it.\n\
+     \n\
+     activity (7): CPU, GPU, VRAM and RAM live, with five minutes of\n\
+     history and a bar per core. Figures the platform will not report say\n\
+     so rather than drawing a zero."
         .into()
 }
 
@@ -1069,69 +1321,24 @@ fn panel_owned(title: String) -> Block<'static> {
         ))
 }
 
+/// A dim, fixed-width label, so the values after it line up into a column
+/// instead of starting wherever the word happened to end.
 fn field(name: &'static str) -> Span<'static> {
-    Span::styled(name, Style::new().fg(MUTED))
+    Span::styled(format!("{name:<10}"), Style::new().fg(MUTED))
 }
 
+/// Padded to a column so whatever follows starts in the same place whether
+/// the answer is "on" or "off".
 fn onoff(on: bool) -> Span<'static> {
     if on {
-        Span::styled("on ", Style::new().fg(Color::Green).bold())
+        Span::styled("on   ", Style::new().fg(Color::Green).bold())
     } else {
-        Span::styled("off", Style::new().fg(MUTED))
+        Span::styled("off  ", Style::new().fg(MUTED))
     }
 }
 
 fn sep() -> Span<'static> {
     Span::styled("  ·  ", Style::new().fg(MUTED))
-}
-
-/// VRAM, or an honest admission that there is no such number on this host.
-///
-/// Unified-memory backends (Metal, oneAPI) have no distinct "used VRAM" to
-/// read, and a bar sitting at 0% looks like a measurement of an idle card
-/// rather than the absence of a measurement.
-fn vram_gauge(s: &Snapshot) -> Gauge<'static> {
-    if !matches!(s.accelerator.as_str(), "cuda" | "rocm") {
-        let text = if s.vram_total_mb == 0 {
-            "vram  no accelerator".to_string()
-        } else {
-            format!("vram  {} MB, usage not reported", s.vram_total_mb)
-        };
-        return gauge_pct("vram", 0.0, &text);
-    }
-    gauge("vram", s.vram_used_mb, s.vram_total_mb, "MB")
-}
-
-fn gauge(label: &'static str, used: u64, total: u64, unit: &str) -> Gauge<'static> {
-    let ratio = if total == 0 {
-        0.0
-    } else {
-        (used as f64 / total as f64).clamp(0.0, 1.0)
-    };
-    let text = if total == 0 {
-        format!("{label}  not reported")
-    } else {
-        format!("{label}  {used} / {total} {unit}")
-    };
-    gauge_pct(label, ratio, &text)
-}
-
-fn gauge_pct(_label: &str, ratio: f64, text: &str) -> Gauge<'static> {
-    // Green until it matters, amber when it is filling, red when a peer's next
-    // request will not fit.
-    let colour = match ratio {
-        r if r >= 0.9 => Color::Red,
-        r if r >= 0.7 => Color::Yellow,
-        _ => Color::Green,
-    };
-    Gauge::default()
-        .gauge_style(Style::new().fg(colour))
-        .ratio(ratio.clamp(0.0, 1.0))
-        .label(Span::styled(
-            text.to_string(),
-            Style::new().fg(Color::White),
-        ))
-        .use_unicode(true)
 }
 
 fn centred(area: Rect, width: u16, height: u16) -> Rect {
@@ -1616,7 +1823,10 @@ fn draw_sharing(f: &mut Frame, app: &App, area: Rect) {
     } else {
         "sharing".to_string()
     };
-    f.render_widget(Paragraph::new(lines).block(panel_owned(title)), body);
+    f.render_widget(
+        Paragraph::new(lines).block(panel_coloured(&title, view_colour(View::Sharing))),
+        body,
+    );
 
     let help = if let Some(edit) = &app.editing {
         Line::from(vec![
@@ -2024,7 +2234,10 @@ fn draw_peers(f: &mut Frame, app: &App, area: Rect) {
     if !app.peers_error.is_empty() {
         title.push_str("  (gateway unreachable)");
     }
-    f.render_widget(Paragraph::new(lines).block(panel_owned(title)), body);
+    f.render_widget(
+        Paragraph::new(lines).block(panel_coloured(&title, view_colour(View::Peers))),
+        body,
+    );
 
     let hint = if !app.peers_error.is_empty() {
         Line::from(Span::styled(
@@ -2144,6 +2357,349 @@ fn peer_line(row: &PeerRow, selected: bool) -> Line<'static> {
     }
 }
 
+// --------------------------------------------------------------- activity
+
+/// The activity monitor: what this machine is doing, second by second.
+///
+/// A provider is lending hardware, and the question they actually have is
+/// "how much of my machine is gone right now" — which no log line answers.
+/// Four measurements, each with the number, a bar, and five minutes of
+/// history, plus the per-core grid that tells a pinned thread apart from a
+/// busy machine.
+fn draw_activity(f: &mut Frame, app: &App, area: Rect) {
+    // The core grid is sized to the cores it has to draw, so the panel is
+    // neither half empty on a laptop nor clipped on a 128-thread server.
+    let per_row = (area.width as usize / CORE_CELL).max(1);
+    let core_rows = app.snap.per_core.len().div_ceil(per_row).clamp(1, 8);
+    let [row1, row2, cores, holding] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Fill(1),
+        Constraint::Length(core_rows as u16 + 2),
+        Constraint::Length(3),
+    ])
+    .areas(area);
+    let [cpu, gpu] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Min(20)]).areas(row1);
+    let [ram, vram] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Min(20)]).areas(row2);
+
+    let s = &app.snap;
+    meter_panel(
+        f,
+        cpu,
+        "CPU",
+        CPU_C,
+        &app.meters.cpu,
+        Some(format!(
+            "{:.0} of {:.0} cores lent to peers",
+            s.reserved_cpus.max(0.0),
+            s.cpus
+        )),
+        &s.cpu_model,
+    );
+    meter_panel(
+        f,
+        ram,
+        "System RAM",
+        RAM_C,
+        &app.meters.ram,
+        Some(format!(
+            "{} / {} GB",
+            s.ram_used_mb / 1024,
+            s.ram_total_mb / 1024
+        )),
+        &match s.max_ram_mb {
+            Some(mb) => format!("at most {} GB is offered to peers", mb / 1024),
+            None => "all of it may be offered to peers".to_string(),
+        },
+    );
+    meter_panel(
+        f,
+        gpu,
+        &format!("GPU · {}", accel_name(s)),
+        GPU_C,
+        &app.meters.gpu,
+        s.gpu_percent.map(|_| "busy".to_string()),
+        &gpu_note(s),
+    );
+    meter_panel(
+        f,
+        vram,
+        "VRAM",
+        VRAM_C,
+        &app.meters.vram,
+        vram_used_percent(s).map(|_| {
+            format!(
+                "{} / {} MB",
+                s.vram_used_mb.min(s.vram_total_mb),
+                s.vram_total_mb
+            )
+        }),
+        &match (vram_used_percent(s).is_some(), s.max_vram_mb) {
+            (false, _) => format!(
+                "{} MB on the card; usage is not reported here",
+                s.vram_total_mb
+            ),
+            (true, Some(mb)) => format!("at most {mb} MB is offered to peers"),
+            (true, None) => "all of it may be offered to peers".to_string(),
+        },
+    );
+
+    draw_cores(f, app, cores);
+    draw_holding(f, app, holding);
+}
+
+/// One measurement: the number, a bar, and its history.
+fn meter_panel(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    colour: Color,
+    track: &Track,
+    value: Option<String>,
+    note: &str,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(MUTED))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::new().fg(colour).bold(),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height < 3 {
+        return;
+    }
+    let [head, graph, foot] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let latest = track.last();
+    match (&value, latest) {
+        (Some(v), Some(pct)) => {
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::raw(" "),
+                    // Drawn by hand rather than with a Gauge: the same bar
+                    // glyphs as the sharing screen's ceilings, and the
+                    // reading sits BESIDE the bar instead of being painted
+                    // over it, where the fill inverts half the digits.
+                    Span::styled(
+                        "█".repeat(bar_cells(pct, head.width)),
+                        Style::new().fg(load_colour(pct, colour)),
+                    ),
+                    Span::styled(
+                        "·".repeat(BAR_WIDTH - bar_cells(pct, head.width)),
+                        Style::new().fg(MUTED),
+                    ),
+                    Span::styled(format!(" {pct:>3}%  "), Style::new().fg(colour).bold()),
+                    Span::styled(v.clone(), Style::new().fg(MUTED)),
+                ])),
+                head,
+            );
+            if track.reported {
+                f.render_widget(
+                    Sparkline::default()
+                        .data(track.window(graph.width as usize))
+                        .max(100)
+                        .style(Style::new().fg(colour)),
+                    graph,
+                );
+            }
+            let mut tail = vec![Span::styled(note.to_string(), Style::new().fg(MUTED))];
+            if let (Some(mean), Some(peak)) = (track.mean(), track.peak()) {
+                tail.push(Span::styled(
+                    format!("   5 min: avg {mean}%  peak {peak}%"),
+                    Style::new().fg(MUTED),
+                ));
+            }
+            f.render_widget(Paragraph::new(Line::from(tail)), foot);
+        }
+        _ => {
+            // Not reported is not zero, and this arm is why: a flat line
+            // along the bottom of a graph reads as an idle card, which on
+            // macOS would be a lie every single time. The panel says what it
+            // does know instead.
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    " not reported on this platform",
+                    Style::new().fg(Color::Yellow),
+                ))),
+                head,
+            );
+            f.render_widget(
+                Paragraph::new(note.to_string())
+                    .style(Style::new().fg(MUTED))
+                    .wrap(Wrap { trim: true })
+                    .alignment(Alignment::Center),
+                graph,
+            );
+        }
+    }
+}
+
+/// Cells in a meter's bar. Fixed rather than proportional so the four panels
+/// line up with each other and with the sharing screen's ceilings.
+const BAR_WIDTH: usize = 20;
+
+fn bar_cells(pct: u64, width: u16) -> usize {
+    let cells = BAR_WIDTH.min(width.saturating_sub(12) as usize);
+    (pct as usize * cells / 100).min(BAR_WIDTH)
+}
+
+/// Width of one core's `nn ███··· 42%` cell, shared by the layout that sizes
+/// the panel and the code that fills it.
+const CORE_CELL: usize = 22;
+
+/// A bar per logical CPU, htop-style.
+fn draw_cores(f: &mut Frame, app: &App, area: Rect) {
+    let block = panel_coloured("cores", CPU_C);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let cores = &app.snap.per_core;
+    if cores.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "waiting for the first sample…",
+                Style::new().fg(MUTED),
+            )),
+            inner,
+        );
+        return;
+    }
+    // As many columns as fit, so 8 cores and 128 cores both look deliberate.
+    let columns = ((inner.width as usize / CORE_CELL).max(1)).min(cores.len());
+    let rows = cores.len().div_ceil(columns);
+    let mut lines: Vec<Line> = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let mut spans = Vec::new();
+        for col in 0..columns {
+            let Some(load) = cores.get(col * rows + row) else {
+                continue;
+            };
+            let pct = load.clamp(0.0, 100.0) as u64;
+            let filled = (pct as usize * 10 / 100).min(10);
+            spans.push(Span::styled(
+                format!("{:>3} ", col * rows + row),
+                Style::new().fg(MUTED),
+            ));
+            spans.push(Span::styled(
+                "█".repeat(filled),
+                Style::new().fg(load_colour(pct, CPU_C)),
+            ));
+            spans.push(Span::styled(
+                "·".repeat(10 - filled),
+                Style::new().fg(MUTED),
+            ));
+            spans.push(Span::styled(
+                format!(" {pct:>3}%  "),
+                Style::new().fg(MUTED),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// What of this machine other people are currently holding.
+fn draw_holding(f: &mut Frame, app: &App, area: Rect) {
+    let s = &app.snap;
+    let block = panel_coloured("what the fabric is holding", DISK_C);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    // The worker's own accounting rather than a sum of the rows: it is the
+    // figure the gateway is told. Compared rather than `max`ed, because
+    // `(-0.0).max(0.0)` may hand back the negative zero and "cores held -0.0"
+    // reads as a bug in the accounting.
+    let held = if s.reserved_cpus > 0.0 {
+        s.reserved_cpus
+    } else {
+        0.0
+    };
+    let line = Line::from(vec![
+        field("sessions "),
+        Span::styled(
+            format!("{:<4}", s.sessions.len()),
+            Style::new().fg(if s.sessions.is_empty() {
+                MUTED
+            } else {
+                Color::Green
+            }),
+        ),
+        field("cores held "),
+        Span::styled(format!("{held:<6.1}"), Style::new().fg(CPU_C)),
+        field("jobs "),
+        Span::styled(
+            format!("{:<4}", s.jobs.active),
+            Style::new().fg(if s.jobs.active > 0 {
+                Color::Green
+            } else {
+                MUTED
+            }),
+        ),
+        field("finished "),
+        Span::styled(format!("{:<8}", s.jobs.done), Style::new().fg(ACCENT)),
+        field("fabric disk "),
+        Span::styled(
+            match s.fabric_disk_mb {
+                Some(mb) => format!("{:.1} GB", mb as f64 / 1024.0),
+                None => "unmeasured".into(),
+            },
+            Style::new().fg(DISK_C),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), inner);
+}
+
+fn accel_name(s: &Snapshot) -> String {
+    if s.accelerator.is_empty() {
+        "cpu".into()
+    } else {
+        s.accelerator.clone()
+    }
+}
+
+fn gpu_note(s: &Snapshot) -> String {
+    let card = if s.gpu_name.is_empty() {
+        "no card detected".to_string()
+    } else {
+        format!("{} · {} MB", s.gpu_name, s.vram_total_mb)
+    };
+    match s.accelerator.as_str() {
+        "metal" => format!("{card}\nmacOS reports GPU load only to privileged tools, so this node measures what it can: VRAM held by models, and the work it answers."),
+        "oneapi" => format!("{card}\nno utilization probe for this vendor yet"),
+        "cpu" => "no accelerator on this machine — inference runs on the CPU above".into(),
+        _ => card,
+    }
+}
+
+/// Green while it is nobody's problem, amber when it is filling, red when the
+/// next request will not fit — over the metric's own colour, which carries
+/// the identity.
+fn load_colour(pct: u64, base: Color) -> Color {
+    match pct {
+        90..=u64::MAX => Color::Red,
+        75..=89 => Color::Yellow,
+        _ => base,
+    }
+}
+
+fn panel_coloured(title: &str, colour: Color) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(MUTED))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::new().fg(colour).bold(),
+        ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2160,6 +2716,7 @@ mod tests {
             peers_error: String::new(),
             peers_sel: 0,
             peers_loading: false,
+            meters: Meters::default(),
             last_peers_fetch: Instant::now(),
             peer_tx: tokio::sync::mpsc::unbounded_channel().0,
             creds_path: std::env::temp_dir().join("fabric_node.json"),
@@ -2596,6 +3153,96 @@ mod tests {
         a.on_peer_msg(PeerMsg::Loaded(Err("connection refused".into())));
         assert_eq!(a.peers_error, "connection refused");
         assert!(!a.peers_loading);
+    }
+
+    #[test]
+    fn history_keeps_the_tail_and_ignores_what_was_never_measured() {
+        let mut t = Track::default();
+        assert!(!t.reported, "nothing has been measured yet");
+        t.push(None);
+        assert!(!t.reported, "a platform that will not say must not count");
+        for i in 0..(HISTORY + 10) {
+            t.push(Some((i % 101) as u64));
+        }
+        assert!(t.reported);
+        assert_eq!(t.samples.len(), HISTORY);
+        assert_eq!(t.last(), Some(((HISTORY + 9) % 101) as u64));
+        assert_eq!(t.window(5).len(), 5);
+        assert_eq!(t.window(5).last(), t.last().as_ref().copied().as_ref());
+    }
+
+    #[test]
+    fn a_percentage_needs_something_to_be_a_percentage_of() {
+        assert_eq!(percent(50, 100), Some(50));
+        assert_eq!(percent(3, 0), None);
+        // Never over 100, whatever a vendor tool reports.
+        assert_eq!(percent(120, 100), Some(100));
+    }
+
+    #[test]
+    fn unified_memory_reports_no_vram_usage_rather_than_zero() {
+        let mut s = Snapshot {
+            accelerator: "metal".into(),
+            vram_total_mb: 49152,
+            ..Default::default()
+        };
+        assert_eq!(vram_used_percent(&s), None, "macOS cannot answer this");
+        s.accelerator = "cuda".into();
+        s.vram_used_mb = 24576;
+        assert_eq!(vram_used_percent(&s), Some(50));
+    }
+
+    #[test]
+    fn the_meters_only_graph_what_was_measured() {
+        let mut m = Meters::default();
+        m.sample(&Snapshot {
+            accelerator: "metal".into(),
+            cpu_percent: 42.0,
+            vram_total_mb: 49152,
+            ram_total_mb: 1024,
+            ram_used_mb: 512,
+            gpu_percent: None,
+            ..Default::default()
+        });
+        assert_eq!(m.cpu.last(), Some(42));
+        assert_eq!(m.ram.last(), Some(50));
+        assert!(!m.gpu.reported, "Metal reports no GPU load");
+        assert!(!m.vram.reported, "…and no VRAM usage either");
+    }
+
+    #[test]
+    fn a_meter_turns_red_before_the_next_request_fails_to_fit() {
+        assert_eq!(load_colour(10, CPU_C), CPU_C);
+        assert_eq!(load_colour(80, CPU_C), Color::Yellow);
+        assert_eq!(load_colour(95, CPU_C), Color::Red);
+    }
+
+    #[test]
+    fn a_bar_never_overflows_its_cell() {
+        assert_eq!(bar_cells(0, 80), 0);
+        assert_eq!(bar_cells(100, 80), BAR_WIDTH);
+        assert!(bar_cells(100, 20) <= BAR_WIDTH);
+        // A narrow pane shrinks the bar rather than wrapping the line.
+        assert!(bar_cells(100, 14) < BAR_WIDTH);
+    }
+
+    #[test]
+    fn every_screen_has_its_own_colour() {
+        let views = [
+            View::Home,
+            View::Sessions,
+            View::Models,
+            View::Logs,
+            View::Sharing,
+            View::Peers,
+            View::Activity,
+        ];
+        let mut seen = Vec::new();
+        for v in views {
+            let c = view_colour(v);
+            assert!(!seen.contains(&c), "two screens share a colour");
+            seen.push(c);
+        }
     }
 
     #[test]

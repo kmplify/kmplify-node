@@ -159,6 +159,18 @@ choice overrides the environment**, so an operator standing at the machine
 beats a unit file written months ago. `kmplify-node check` prints every such
 override, and `set --clear KEY` removes one.
 
+### Activity monitor (key `7`)
+
+CPU, GPU, VRAM and RAM live, each with a bar and five minutes of history, a
+bar per logical CPU, and what the fabric is holding right now (sessions, cores
+promised to peers, jobs, disk). The home screen carries the same four meters
+in miniature.
+
+GPU utilization comes from `nvidia-smi` / `rocm-smi` and is sampled every few
+seconds — a node lending its cycles should not spend them on being watched.
+Where a platform will not report a figure (macOS exposes GPU load only to
+privileged tools) the panel says so instead of drawing a zero.
+
 ### Who may use it (key `6`)
 
 Consumers waiting for a decision (`a` approve, `n` deny, `b` block, `u` clear

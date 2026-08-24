@@ -579,6 +579,85 @@ pub fn resolve_backend(all: &[Gpu]) -> (Backend, Option<Gpu>) {
 
 /// Accelerator memory currently in use, MB. `None` when the vendor gives us
 /// no cheap way to ask.
+/// How hard the accelerator is working, and how much of its memory is held,
+/// in ONE probe.
+///
+/// Returns `(utilization 0-100, VRAM used MB)`, either of which may be
+/// missing. Both come from the same subprocess because a dashboard wants them
+/// together, and spawning `nvidia-smi` twice to ask two questions of the same
+/// tool is a waste of a machine that is supposed to be lending its cycles to
+/// someone else.
+///
+/// `None` for utilization on Metal and oneAPI is an honest gap rather than a
+/// bug: macOS exposes GPU load only through privileged interfaces
+/// (`powermetrics` wants root), and the Intel path has never been run on real
+/// hardware. A dashboard then says "not reported" instead of drawing a flat
+/// zero, which would read as an idle card.
+pub async fn utilization(backend: Backend) -> (Option<u8>, Option<u64>) {
+    match backend {
+        Backend::Cuda => match run(
+            "nvidia-smi",
+            &[
+                "--query-gpu=utilization.gpu,memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+        )
+        .await
+        {
+            Some(text) => parse_nvidia_utilization(&text),
+            None => (None, None),
+        },
+        Backend::Rocm => {
+            let used = run("rocm-smi", &["--showmeminfo", "vram", "--csv"])
+                .await
+                .and_then(|o| parse_rocm_meminfo_csv(&o))
+                .map(|(_, used)| used);
+            let busy = run("rocm-smi", &["--showuse", "--csv"])
+                .await
+                .and_then(|o| parse_rocm_use_csv(&o));
+            (busy, used)
+        }
+        Backend::OneApi | Backend::Metal | Backend::Cpu => (None, None),
+    }
+}
+
+/// `utilization.gpu, memory.used` from one `nvidia-smi` row.
+pub(crate) fn parse_nvidia_utilization(out: &str) -> (Option<u8>, Option<u64>) {
+    let Some(line) = out.lines().find(|l| !l.trim().is_empty()) else {
+        return (None, None);
+    };
+    let mut fields = line.split(',').map(str::trim);
+    let busy = fields
+        .next()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|v| v.clamp(0.0, 100.0) as u8);
+    let used = fields
+        .next()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|v| v as u64);
+    (busy, used)
+}
+
+/// The GPU-busy column of `rocm-smi --showuse --csv`.
+///
+/// Matched by substring for the same reason [`parse_rocm_meminfo_csv`] is:
+/// AMD renames these headers between releases ("GPU use (%)", "GPU
+/// Utilization (%)"), and a fixed column index turns a rename into a silent
+/// zero.
+pub(crate) fn parse_rocm_use_csv(out: &str) -> Option<u8> {
+    let mut lines = out.lines().filter(|l| !l.trim().is_empty());
+    let header = lines.next()?.to_ascii_lowercase();
+    let cols: Vec<&str> = header.split(',').map(|c| c.trim()).collect();
+    let idx = cols
+        .iter()
+        .position(|c| c.contains("use") || c.contains("utilization"))?;
+    let row: Vec<&str> = lines.next()?.split(',').map(|c| c.trim()).collect();
+    row.get(idx)?
+        .parse::<f64>()
+        .ok()
+        .map(|v| v.clamp(0.0, 100.0) as u8)
+}
+
 pub async fn used_mb(backend: Backend) -> Option<u64> {
     match backend {
         Backend::Cuda => run(
@@ -600,6 +679,28 @@ pub async fn used_mb(backend: Backend) -> Option<u64> {
 #[cfg(test)]
 mod parser_tests {
     use super::*;
+
+    #[test]
+    fn nvidia_reports_load_and_memory_from_one_row() {
+        let (busy, used) = parse_nvidia_utilization("37, 8123\n");
+        assert_eq!(busy, Some(37));
+        assert_eq!(used, Some(8123));
+        // A tool that answered with nothing usable must not read as an idle
+        // card holding no memory.
+        assert_eq!(parse_nvidia_utilization(""), (None, None));
+        assert_eq!(parse_nvidia_utilization("[N/A], [N/A]"), (None, None));
+    }
+
+    #[test]
+    fn rocm_use_is_found_by_name_not_by_column() {
+        let csv = "device,GPU use (%),other\ncard0,64,x\n";
+        assert_eq!(parse_rocm_use_csv(csv), Some(64));
+        // A renamed header still resolves…
+        let renamed = "device,GPU Utilization (%)\ncard0,12\n";
+        assert_eq!(parse_rocm_use_csv(renamed), Some(12));
+        // …and one we cannot recognise reports nothing rather than zero.
+        assert_eq!(parse_rocm_use_csv("device,temp\ncard0,40\n"), None);
+    }
 
     #[test]
     fn nvidia_csv_shapes() {

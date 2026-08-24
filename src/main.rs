@@ -754,6 +754,23 @@ fn run_status(dir: &std::path::Path, json: bool) -> i32 {
         }
     );
     println!(
+        "  load     : cpu {:.0}%{}{}",
+        snap.cpu_percent,
+        match snap.gpu_percent {
+            Some(p) => format!("  gpu {p}%"),
+            None => String::new(),
+        },
+        if snap.ram_total_mb > 0 {
+            format!(
+                "  ram {}/{} GB",
+                snap.ram_used_mb / 1024,
+                snap.ram_total_mb / 1024
+            )
+        } else {
+            String::new()
+        }
+    );
+    println!(
         "  jobs     : {} active, {} finished, {} errors, avg {} ms",
         snap.jobs.active, snap.jobs.done, snap.jobs.failed, snap.jobs.avg_ms
     );
