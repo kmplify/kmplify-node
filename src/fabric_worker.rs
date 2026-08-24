@@ -128,6 +128,7 @@ fn publish_config(cfg: &WorkerConfig) {
         s.max_disk_gb = cfg.max_shared_disk_gb;
         s.colibri = cfg.colibri_base.clone();
         s.functions_enabled = cfg.functions.enabled;
+        s.functions_pubkey = cfg.functions.trusted_pubkey.clone();
         s.vectors_enabled = cfg.vectors.enabled;
         s.vectors_max_mb = cfg.vectors.max_mb;
         if let Some(v) = &cfg.client_version {

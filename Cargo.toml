@@ -1,6 +1,6 @@
 [package]
 name = "kmplify-node"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.77"
 description = "Provider agent for the KMPLIFY Compute Fabric: lend a machine's GPU, CPU and local models to a fabric over one outbound connection."
@@ -67,10 +67,18 @@ lto = "thin"
 strip = true
 
 [features]
-default = ["tui"]
+# Both lanes ship in the released binaries. The functions lane was optional
+# for a year and the result was a fabric where the gateway could sign and
+# schedule a function and NOT ONE node could run it: the runtime was absent
+# from every build anyone actually installed. A capability that ships turned
+# off in every artifact is a capability that does not exist.
+default = ["tui", "wasm"]
 # `kmplify-node tui`: watch and control the node from a terminal.
 tui = ["dep:ratatui"]
 # Host signed Wasm functions in an in-process sandbox (wasmtime, WASI p1).
+# Costs ~8 MB of binary; hosting functions is still opt-in at RUNTIME
+# (PROVIDER_FUNCTIONS, plus a catalog key to trust), so what this decides is
+# only whether an operator who opts in has an engine to do it with.
 wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
 
 [dev-dependencies]
