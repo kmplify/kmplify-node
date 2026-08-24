@@ -159,6 +159,7 @@ verdict in a form a script can read.
 | `kmplify-node status` | One-shot report of the node running here. `--json`. |
 | `kmplify-node id` | Print this install's node id, the handle consumers pin and invite. |
 | `kmplify-node set` | Change what this machine lends, durably and without a restart. |
+| `kmplify-node peers` | Who may use it — list, approve, block, invite. |
 | `kmplify-node version` | Version and build stamp. |
 
 Every configuration variable also has a flag (`--gateway`, `--workloads`,
@@ -277,6 +278,34 @@ mode with no way to approve anybody has quietly stopped serving.
 This asks the gateway as the node itself, using the node's own credential; a
 gateway that cannot be reached costs the screen and nothing else — the worker
 carries on serving.
+
+### Admission: automatic, or your say-so
+
+`auto` (the default) lets any consumer on the fabric use this machine.
+`manual` parks unknown consumers until you decide — they are told to ask, and
+they appear here until you do. Invitations connect in either mode: minting one
+*is* the approval.
+
+```bash
+kmplify-node set approval-mode=manual
+```
+
+The switch is also the sharing screen's third checkbox, and either way it
+takes effect on the reconnect it triggers, with no restart. Deciding needs no
+terminal either:
+
+```bash
+kmplify-node peers                        # who is waiting, who is using it
+```
+
+```bash
+kmplify-node peers approve node-9abc      # a standing rule, so it holds
+```
+
+`deny` refuses quietly while manual admission is on, `block` refuses in every
+mode, and `clear` drops the rule so the mode decides again. `peers invite
+"Anna's phone"` prints an invitation id on stdout for a script to capture, and
+`peers revoke <id>` ends it. `--json` for anything that has to parse it.
 
 The node also publishes `status.json` in its node directory (owner-readable
 only) and accepts commands as files in `control/` there. That is how a
