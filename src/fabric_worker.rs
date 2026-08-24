@@ -2836,7 +2836,7 @@ async fn start_workload(
         // about a crash from second 20. Every third tick keeps the docker
         // exec chatter down while still reporting a death within ~3s.
         ticks += 1;
-        if ticks % 3 == 0 {
+        if ticks.is_multiple_of(3) {
             if let Some(code) = container_exit(&name).await {
                 let tail = container_log_tail(&name, 15).await;
                 sessions.lock().await.remove(&session);
