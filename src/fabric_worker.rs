@@ -4028,6 +4028,79 @@ async fn session(
     result
 }
 
+/// Is this a host where plaintext http is a reasonable thing to allow?
+///
+/// Loopback and private ranges only: a LAN cluster's master and a developer's
+/// own box are the legitimate cases for http, and neither leaves the machine
+/// or the building. Anything routable is on the public internet as far as this
+/// node can tell.
+fn host_is_local_or_private(host: &str) -> bool {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".local") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        Ok(std::net::IpAddr::V6(v6)) => {
+            // is_unique_local / is_unicast_link_local are still unstable, so
+            // check the prefixes directly: fc00::/7 and fe80::/10.
+            let o = v6.octets();
+            v6.is_loopback() || (o[0] & 0xfe) == 0xfc || (o[0] == 0xfe && (o[1] & 0xc0) == 0x80)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Refuse a gateway this node would talk to in the clear.
+///
+/// The control channel derived from this URL carries the node's registration
+/// token and the job frames that decide what `docker run` is handed. Over
+/// plaintext both are readable and both are writable by anyone on the path, so
+/// a http:// gateway is not a weaker deployment, it is one where the fabric's
+/// instructions come from whoever is closest to the wire.
+///
+/// Nothing enforced this before: `gateway_url.replacen("http", "ws", 1)` turned
+/// http into ws without comment, so a misconfigured PROVIDER_GATEWAY_URL simply
+/// worked, quietly. See docs/security/AUDIT-2026-08-24.md, F7.
+///
+/// http to a loopback or private address stays allowed, because a LAN master
+/// and a dev box are real and neither is on the internet.
+pub fn check_gateway_url(url: &str) -> Result<(), String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("gateway URL is empty".to_string());
+    }
+    if url.starts_with("https://") {
+        return Ok(());
+    }
+    if let Some(rest) = url.strip_prefix("http://") {
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        // Strip any userinfo, then the port, leaving the host.
+        let hostport = authority.rsplit('@').next().unwrap_or(authority);
+        let host = if hostport.starts_with('[') {
+            hostport
+                .split(']')
+                .next()
+                .unwrap_or("")
+                .trim_start_matches('[')
+        } else {
+            hostport.split(':').next().unwrap_or("")
+        };
+        if host_is_local_or_private(host) {
+            return Ok(());
+        }
+        return Err(format!(
+            "refusing to use gateway {url}: it is plaintext http to a public address. \
+             The node's registration token and every job instruction would travel in the \
+             clear, readable and MODIFIABLE by anyone on the path. Use https://, or a \
+             loopback/LAN address if this is a local gateway."
+        ));
+    }
+    Err(format!(
+        "refusing to use gateway {url}: expected an http:// or https:// URL"
+    ))
+}
+
 /// Run the worker until `stop` is signalled true; reconnects with backoff
 /// on any error (gateway unreachable, dropped connection, etc).
 pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
@@ -4037,6 +4110,13 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
     // headless provider would have advertised an empty CPU model and no
     // usage at all — exactly the "CPU peers have no detail" complaint, on
     // the deployment where nobody is watching a window to notice.
+    // Checked before anything connects or registers. Returning rather than
+    // continuing on a warning is the point: a node that carries on in
+    // plaintext has already sent its token by the time anyone reads the log.
+    if let Err(e) = check_gateway_url(&cfg.gateway_url) {
+        log(format!("FATAL: {e}"));
+        return;
+    }
     crate::hostcpu::start();
     if cfg.vectors.enabled {
         let loaded = vectors_store(&cfg).load().await;
@@ -4968,5 +5048,94 @@ mod hardening_tests {
         assert!(!env_key_ok("A B"));
         assert!(!env_key_ok("A\nB"));
         assert!(!env_key_ok("--privileged"));
+    }
+}
+
+#[cfg(test)]
+mod gateway_tls_tests {
+    //! Audit F7: the node would talk to its gateway in the clear.
+    //!
+    //! `gateway_url.replacen("http", "ws", 1)` turned http into ws with no
+    //! comment and no check, so a misconfigured PROVIDER_GATEWAY_URL simply
+    //! worked. That channel carries the node's registration token and the job
+    //! frames that decide what `docker run` is handed, so in plaintext both
+    //! are readable AND writable by anyone on the path.
+
+    use super::*;
+
+    #[test]
+    fn https_is_always_fine() {
+        assert!(check_gateway_url("https://fabric.kmplify.io").is_ok());
+        assert!(check_gateway_url("https://fabric.kmplify.io/").is_ok());
+        assert!(check_gateway_url("https://gw.example.com:8443/base").is_ok());
+    }
+
+    #[test]
+    fn plaintext_to_a_public_address_is_refused() {
+        for url in [
+            "http://fabric.kmplify.io",
+            "http://example.com/fabric",
+            "http://8.8.8.8:9000",
+        ] {
+            let err = check_gateway_url(url).expect_err("{url} should be refused");
+            assert!(
+                err.contains("plaintext"),
+                "unhelpful error for {url}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn plaintext_to_loopback_and_lan_still_works() {
+        // A LAN cluster's master and a developer's own box are real, and
+        // neither leaves the building. Refusing these would push people to
+        // disable the check rather than fix anything.
+        for url in [
+            "http://localhost:4321",
+            "http://127.0.0.1:4321/fabric",
+            "http://[::1]:4321",
+            "http://192.168.1.42:18100",
+            "http://10.1.2.3:8080",
+            "http://172.16.5.4:8080",
+            "http://mymachine.local:4321",
+        ] {
+            assert!(
+                check_gateway_url(url).is_ok(),
+                "{url} was refused but is local/private"
+            );
+        }
+    }
+
+    #[test]
+    fn a_public_host_cannot_hide_behind_userinfo() {
+        // http://127.0.0.1@evil.example.com/ connects to evil.example.com.
+        // Parsing the host as "everything before the first colon" would read
+        // it as loopback and wave it through.
+        let err = check_gateway_url("http://127.0.0.1@evil.example.com/fabric")
+            .expect_err("userinfo must not disguise the host");
+        assert!(err.contains("plaintext"), "{err}");
+    }
+
+    #[test]
+    fn a_public_host_cannot_hide_behind_a_path() {
+        let err = check_gateway_url("http://evil.example.com/127.0.0.1")
+            .expect_err("a path must not be read as the host");
+        assert!(err.contains("plaintext"), "{err}");
+    }
+
+    #[test]
+    fn nonsense_is_refused_rather_than_assumed() {
+        assert!(check_gateway_url("").is_err());
+        assert!(check_gateway_url("   ").is_err());
+        assert!(check_gateway_url("fabric.kmplify.io").is_err());
+        assert!(check_gateway_url("ws://fabric.kmplify.io").is_err());
+        assert!(check_gateway_url("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn the_shipped_default_passes_its_own_rule() {
+        // If the public fabric URL ever changed to http, this is the test that
+        // would say so rather than every node silently going plaintext.
+        assert!(check_gateway_url(crate::PUBLIC_FABRIC_URL).is_ok());
     }
 }

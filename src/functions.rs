@@ -383,19 +383,39 @@ pub fn run_module(
     };
     let mut store = Store::new(&engine, state);
     store.limiter(|s| &mut s.limits);
-    // Fuel bounds instructions; the epoch bounds wall-clock. Both, because a
-    // guest blocked in a host call burns no fuel, and a guest spinning burns
-    // fuel far faster than the clock moves.
+    // WALL CLOCK is the bound that stops a guest, via the epoch below. Fuel is
+    // enabled (the engine needs consume_fuel for the metering hooks) but left
+    // effectively unbounded on purpose: the operator's ceiling is expressed in
+    // milliseconds, and a second limit in instructions would kill a legitimate
+    // compute-heavy function for a reason nobody configured.
+    //
+    // This comment used to claim fuel and the epoch both bounded the run. They
+    // did not: u64::MAX / 2 is not a budget. The epoch is sufficient here
+    // because the sandbox grants only WASI stdio, so there is no host call for
+    // a guest to block in and starve the fuel counter.
     store
         .set_fuel(u64::MAX / 2)
         .map_err(|e| format!("fuel: {e}"))?;
     store.set_epoch_deadline(1);
+
+    // The deadline thread must be CANCELLABLE. It used to sleep the whole
+    // timeout unconditionally and be joined before returning, so a function
+    // finishing in a millisecond still held this thread — and its caller — for
+    // the entire ceiling, up to HARD_MAX_TIMEOUT_MS (five minutes). A consumer
+    // asking for a long timeout could pin a node's blocking pool with work that
+    // did nothing, which is a denial of service dressed as a slow function.
+    //
+    // recv_timeout wakes on whichever comes first: the run finishing (Ok), the
+    // run unwinding early and dropping the sender (Disconnected), or the
+    // deadline (Timeout). Only the last one has anything left to interrupt.
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     let engine_for_timer = engine.clone();
     let timeout = Duration::from_millis(limits.timeout_ms);
     let started = Instant::now();
     let timer = std::thread::spawn(move || {
-        std::thread::sleep(timeout);
-        engine_for_timer.increment_epoch();
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = done_rx.recv_timeout(timeout) {
+            engine_for_timer.increment_epoch();
+        }
     });
 
     let instance = linker
@@ -407,6 +427,10 @@ pub fn run_module(
 
     let outcome = start.call(&mut store, ());
     let duration_ms = started.elapsed().as_millis() as u64;
+    // Release the deadline thread NOW rather than waiting it out. Sent before
+    // the join for the obvious reason, and before dropping the store so the
+    // thread is already on its way out while the store tears down.
+    let _ = done_tx.send(());
     drop(store);
     let _ = timer.join();
 
@@ -636,6 +660,38 @@ mod tests {
         assert_eq!(out.exit_code, 0);
         assert_eq!(out.stdout, b"hello fabric");
         assert!(out.duration_ms < 5000);
+    }
+
+    /// A fast function must not be billed the whole ceiling in wall clock.
+    ///
+    /// The timeout thread used to sleep the full `timeout_ms` with no way to
+    /// cancel it, and `run_module` joined that thread before returning. So a
+    /// module finishing in a millisecond still held its blocking-pool thread
+    /// for the entire ceiling — up to HARD_MAX_TIMEOUT_MS, five minutes.
+    ///
+    /// The pre-existing echo test asserted `out.duration_ms < 5000`, which is
+    /// the measured CALL, not how long run_module took to return. That is why
+    /// this went unnoticed: the assertion measured the wrong clock.
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn a_fast_function_returns_immediately_not_after_its_timeout() {
+        let wasm = wat::parse_str(ECHO_WAT).expect("echo module assembles");
+        let limits = Limits {
+            memory_mb: 16,
+            timeout_ms: 10_000,
+        };
+
+        let started = Instant::now();
+        let out = run_module(&wasm, b"hi", &[], limits).expect("echo runs");
+        let wall = started.elapsed();
+
+        assert_eq!(out.exit_code, 0);
+        assert!(
+            wall < Duration::from_secs(2),
+            "run_module took {wall:?} for a function that finished in {}ms — \
+             it is waiting out the whole timeout",
+            out.duration_ms
+        );
     }
 
     #[cfg(feature = "wasm")]
