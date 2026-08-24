@@ -41,7 +41,7 @@ Both files live in `KMPLIFY_NODE_DIR` (`~/.config/kmplify-node` by default).
   "schema": 1,
   "node_id": "44802ebc90e24de18825b90af320edfe",
   "gateway": "https://fabric.kmplify.io",
-  "version": "0.2.0+c8ba618",
+  "version": "0.3.0+c8ba618",
   "os": "macos",
   "arch": "aarch64",
   "published_at_ms": 1787608216832
