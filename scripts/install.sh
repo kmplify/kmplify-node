@@ -118,6 +118,20 @@ if [ "$DO_SERVICE" = 1 ]; then
   # In the docker group only if docker exists: sessions need it, inference
   # does not, and granting docker-group on a box without docker is noise.
   if getent group docker >/dev/null 2>&1; then EXTRA="-G docker"; else EXTRA=""; fi
+  if [ -n "$EXTRA" ]; then
+    # Said out loud BEFORE it happens. Docker group membership is equivalent
+    # to root on this host: anyone who reaches the socket can start a
+    # container that mounts the whole filesystem. That is Docker's design,
+    # not this installer's, but silently granting root during a one-line
+    # install is how an operator ends up not knowing.
+    say ""
+    say "NOTE: creating the 'kmplify' user in the 'docker' group, which is"
+    say "      required to host container sessions and is EQUIVALENT TO ROOT"
+    say "      on this machine. To avoid it, run rootless Docker or Podman, or"
+    say "      lend inference only (leave PROVIDER_WORKLOADS unset) and remove"
+    say "      the user from the group. See packaging/kmplify-node.service."
+    say ""
+  fi
   id kmplify >/dev/null 2>&1 || useradd -r $EXTRA -d /var/lib/kmplify-node -s /usr/sbin/nologin kmplify
 
   install -m 644 "$TMP/kmplify-node.service" /etc/systemd/system/kmplify-node.service

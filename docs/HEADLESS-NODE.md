@@ -132,6 +132,32 @@ install -m 644 packaging/kmplify-node.service /etc/systemd/system/
 systemctl enable --now kmplify-node
 ```
 
+### The `docker` group is root
+
+`-G docker` above is what lets this node host container sessions, and it is
+**equivalent to giving the `kmplify` user root on the machine**. Anyone who can
+reach the docker socket can start a container that mounts the host filesystem
+and take root from there. That is how Docker works, not something this unit
+does wrong, but it is worth deciding rather than inheriting.
+
+It matters more here than it would elsewhere, because a node hosting sessions
+runs **other people's workloads**. Treat any bug in this process as a possible
+path to root on the host.
+
+If that trade is not one you want:
+
+| Option | What you give up |
+|---|---|
+| Rootless Docker, or Podman, with the node pointed at that socket | Nothing much; the usual rootless caveats about ports and cgroups |
+| A socket proxy exposing only the container verbs the node uses | One more moving part to run |
+| Lend **inference only**: leave `PROVIDER_WORKLOADS` unset and drop `-G docker` | Container sessions; inference still earns |
+
+The shipped unit also sets the usual systemd sandboxing (`NoNewPrivileges`,
+`ProtectSystem=full`, an empty `CapabilityBoundingSet`, and so on). Worth
+knowing what that does and does not do: it narrows what a compromised worker
+can touch directly, and it does **not** contain the docker socket, because the
+daemon on the other side of it is outside every one of those restrictions.
+
 `systemctl stop` sends SIGTERM; the worker tears down every hosted session
 container before exiting — a stopped node leaves nothing running on the
 owner's GPU. The unit works unchanged on every systemd distribution.

@@ -172,6 +172,12 @@ async fn resolve_config() -> WorkerConfig {
 async fn run_check(cfg: &WorkerConfig) -> i32 {
     println!("kmplify-node configuration");
     println!("  gateway    : {}", cfg.gateway_url);
+    if let Err(e) = fabric_worker::check_gateway_url(&cfg.gateway_url) {
+        // Printed here as well as enforced at startup, so `kmplify-node check`
+        // (which the installer runs) reports it while the operator is still
+        // watching, rather than at the first silent refusal to start.
+        println!("               ^ REFUSED: {e}");
+    }
     println!("  creds      : {}", cfg.creds_path.display());
     println!("  ollama     : {}", cfg.ollama_base);
     println!(
@@ -367,6 +373,14 @@ async fn main() {
         std::process::exit(run_check(&cfg).await);
     }
 
+    if let Err(e) = fabric_worker::check_gateway_url(&cfg.gateway_url) {
+        // Before ensure_identity, which is the call that would hand the token
+        // over. A refusal has to happen while there is still nothing to leak,
+        // and it exits non-zero so a service manager reports a failed unit
+        // rather than restarting into the same misconfiguration forever.
+        eprintln!("\nERROR: {e}");
+        std::process::exit(1);
+    }
     println!("[kmplify-node] joining {}", cfg.gateway_url);
     match fabric_worker::ensure_identity(&cfg.gateway_url, &cfg.creds_path).await {
         Ok(c) => println!(
