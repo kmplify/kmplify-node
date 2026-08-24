@@ -42,6 +42,8 @@ pub enum Command {
     Resume,
     /// Drop the gateway connection and dial again immediately.
     Reconnect,
+    /// Re-read the sharing settings and re-advertise with them.
+    Reload,
     /// End one peer session running on this machine.
     StopSession(String),
     /// Graceful shutdown: tear down hosted sessions, then exit.
@@ -54,6 +56,7 @@ impl Command {
             Command::Pause => json!({"type": "node_pause"}),
             Command::Resume => json!({"type": "node_resume"}),
             Command::Reconnect => json!({"type": "node_reconnect"}),
+            Command::Reload => json!({"type": "node_reload"}),
             Command::StopSession(id) => json!({"type": "workload_stop", "session": id}),
             Command::Shutdown => json!({"type": "node_shutdown"}),
         }
@@ -64,6 +67,7 @@ impl Command {
             "node_pause" => Some(Command::Pause),
             "node_resume" => Some(Command::Resume),
             "node_reconnect" => Some(Command::Reconnect),
+            "node_reload" => Some(Command::Reload),
             "node_shutdown" => Some(Command::Shutdown),
             "workload_stop" => Some(Command::StopSession(
                 v["session"].as_str().unwrap_or_default().to_string(),
@@ -78,6 +82,7 @@ impl Command {
             Command::Pause => "paused — advertising no models".into(),
             Command::Resume => "resumed — advertising models again".into(),
             Command::Reconnect => "reconnecting…".into(),
+            Command::Reload => "settings saved — re-advertising".into(),
             Command::StopSession(id) => format!("stopping session {}…", short(id)),
             Command::Shutdown => "shutting down…".into(),
         }
@@ -203,6 +208,7 @@ mod tests {
             Command::Pause,
             Command::Resume,
             Command::Reconnect,
+            Command::Reload,
             Command::Shutdown,
             Command::StopSession("s-1".into()),
         ] {

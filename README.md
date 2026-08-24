@@ -158,6 +158,7 @@ verdict in a form a script can read.
 | `kmplify-node check` | Preflight this host. Connects to nothing. `--json`, `--timeout SECS`. |
 | `kmplify-node status` | One-shot report of the node running here. `--json`. |
 | `kmplify-node id` | Print this install's node id, the handle consumers pin and invite. |
+| `kmplify-node set` | Change what this machine lends, durably and without a restart. |
 | `kmplify-node version` | Version and build stamp. |
 
 Every configuration variable also has a flag (`--gateway`, `--workloads`,
@@ -198,7 +199,41 @@ starts a node itself and quitting stops it.
 | `e` | Evict the selected session — the peer's container is stopped and removed. |
 | `x` | Stop the node, tearing down hosted sessions first. |
 | `w` | Write a plain-text snapshot of the dashboard, for a bug report. |
+| `5` | **Sharing** — what this machine lends and how much of it (see below). |
 | `1`–`4` | Home, sessions, models, log. `?` for the full list. |
+
+### Changing what you lend, without a restart
+
+The dashboard's sharing screen is the desktop app's "Provide this machine's
+Resources" panel: the switches for inference, container sessions per template,
+CPU/RAM and manual approval; the ceilings for cores, VRAM, RAM and disk; the
+country and the colibri upstream. Edits are a draft until `s` applies them, at
+which point the node reconnects so the fabric hears the new terms — hosted
+sessions keep running.
+
+```
+ ceilings — peer sessions never exceed these
+  CPU threads             ██████████████████░░░░░░  9 / 12 threads ●
+  VRAM                    ████████████████████████  all of it (48 GB)
+```
+
+The same thing without a terminal, for provisioning scripts and one-off ssh:
+
+```bash
+kmplify-node set max-cpus=6 share-cpu=true workloads=vllm-openai,comfyui
+```
+
+```bash
+kmplify-node set --clear max-cpus
+```
+
+Both write `settings.json` in the node directory and nudge the running node,
+which re-advertises within a second. **A stored choice overrides the
+environment** — the same contract the desktop app has always had — so a slider
+does not spring back on the next restart. Nothing about that is silent:
+`kmplify-node check` prints every value that is overriding the environment,
+`set --list` shows them, and a `●` marks them in the dashboard. `d` on a row
+(or `set --clear KEY`) drops the override, and the unit file governs again.
 
 The node also publishes `status.json` in its node directory (owner-readable
 only) and accepts commands as files in `control/` there. That is how a
@@ -213,7 +248,9 @@ build that executes on any Linux distribution, see
 ## Configuration
 
 Environment variables, so a service manager, a container and a shell all
-configure it the same way; every one also has a flag that sets it. A value
+configure it the same way; every one also has a flag that sets it, and the
+sharing ones can be changed at runtime from the dashboard or `kmplify-node
+set` — which then wins over the environment until cleared. A value
 that cannot be read — a ceiling that is not a number, a country that is not
 alpha-2, an admission mode that is neither `auto` nor `manual` — stops the
 node at startup with a message naming the variable, rather than silently

@@ -37,6 +37,9 @@ pub enum Cmd {
     Status,
     /// Print this install's node id, the handle consumers pin and invite.
     Id,
+    /// Change what this machine lends, durably — the dashboard's sharing
+    /// screen for scripts and shells with no terminal.
+    Set,
     Version,
     Help,
 }
@@ -56,6 +59,14 @@ pub struct Cli {
     /// Environment overrides collected from flags, applied before anything
     /// reads the environment.
     pub env: Vec<(&'static str, String)>,
+    /// `set`: `key=value` assignments, in the order given.
+    pub assignments: Vec<(String, String)>,
+    /// `set --clear KEY`: overrides to drop, so the environment governs again.
+    pub clear: Vec<String>,
+    /// `set --clear-all`: drop every override.
+    pub clear_all: bool,
+    /// `set --list`: print the stored overrides and change nothing.
+    pub list: bool,
 }
 
 impl Default for Cli {
@@ -67,6 +78,10 @@ impl Default for Cli {
             attach: false,
             standalone: false,
             env: Vec::new(),
+            assignments: Vec::new(),
+            clear: Vec::new(),
+            clear_all: false,
+            list: false,
         }
     }
 }
@@ -182,6 +197,7 @@ pub fn usage() -> String {
          \x20 kmplify-node check [options]     preflight this host, then exit\n\
          \x20 kmplify-node status [--json]     one-shot report of the running node\n\
          \x20 kmplify-node id                  print this install's node id\n\
+         \x20 kmplify-node set KEY=VALUE …     change what this machine lends, durably\n\
          \x20 kmplify-node version | help\n\
          \n\
          DASHBOARD\n\
@@ -189,6 +205,17 @@ pub fn usage() -> String {
          \x20 drives it: pause and resume sharing, evict a peer's session, force a\n\
          \x20 reconnect, stop the node. With no node running it starts one itself, so\n\
          \x20 a GUI-less machine is operated entirely from the terminal.\n\
+         \n\
+         SHARING\n\
+         \x20 What this machine lends is the dashboard's sharing screen (key 5) and,\n\
+         \x20 for scripts, `set`. Both write the same file in the node directory and\n\
+         \x20 take effect on the reconnect they trigger — no restart, no unit-file\n\
+         \x20 edit. A stored choice overrides the environment until it is cleared.\n\
+         \n\
+         \x20 kmplify-node set max-cpus=6 share-cpu=true\n\
+         \x20 kmplify-node set workloads=vllm-openai,comfyui\n\
+         \x20 kmplify-node set --clear max-cpus     # back to the unit file\n\
+         \x20 kmplify-node set --list\n\
          \n\
          OPTIONS\n\
          \x20 --json                 machine-readable output (check, status)\n\
@@ -214,6 +241,10 @@ pub fn usage() -> String {
             *key
         ));
     }
+    out.push_str("\n SETTINGS (for `set`), each overriding the variable beside it\n");
+    for (key, var) in kmplify_node::settings::KEYS {
+        out.push_str(&format!("\x20 {:<22} {}\n", *key, *var));
+    }
     out.push_str(
         "\n\
          EXIT CODES\n\
@@ -235,6 +266,16 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
 
         if !arg.starts_with('-') {
             if cmd_seen {
+                // `set` is the one command that takes positional arguments:
+                // the assignments themselves.
+                if cli.cmd == Cmd::Set {
+                    let Some((key, value)) = arg.split_once('=') else {
+                        return Err(format!("`set` takes key=value pairs; `{arg}` has no `=`"));
+                    };
+                    cli.assignments
+                        .push((key.trim().to_string(), value.to_string()));
+                    continue;
+                }
                 return Err(format!("unexpected argument `{arg}`"));
             }
             cmd_seen = true;
@@ -244,6 +285,7 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
                 "check" | "doctor" | "preflight" => Cmd::Check,
                 "status" => Cmd::Status,
                 "id" | "node-id" => Cmd::Id,
+                "set" | "config" => Cmd::Set,
                 "version" => Cmd::Version,
                 "help" => Cmd::Help,
                 other => return Err(format!("unknown command `{other}`")),
@@ -270,6 +312,12 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
                 })
             }
             "--json" => cli.json = true,
+            "--clear" => {
+                let key = take(&name, inline, argv, &mut i)?;
+                cli.clear.push(key);
+            }
+            "--clear-all" => cli.clear_all = true,
+            "--list" => cli.list = true,
             "--attach" => cli.attach = true,
             "--standalone" => cli.standalone = true,
             "--timeout" => {
@@ -313,6 +361,18 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
     }
     if (cli.attach || cli.standalone) && cli.cmd != Cmd::Tui {
         return Err("--attach and --standalone apply to `tui`".into());
+    }
+    let touches_settings = !cli.assignments.is_empty() || !cli.clear.is_empty() || cli.clear_all;
+    if (touches_settings || cli.list) && cli.cmd != Cmd::Set {
+        return Err("--clear, --clear-all, --list and key=value belong to `set`".into());
+    }
+    if cli.cmd == Cmd::Set && !touches_settings && !cli.list {
+        return Err(
+            "`set` needs something to do: key=value, --clear KEY, --clear-all, or --list".into(),
+        );
+    }
+    if cli.list && touches_settings {
+        return Err("--list only reports; drop it to change a setting".into());
     }
     Ok(cli)
 }
