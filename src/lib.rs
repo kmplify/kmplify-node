@@ -20,6 +20,7 @@ pub mod functions;
 pub mod gpu;
 pub mod hostcpu;
 pub mod proc;
+pub mod settings;
 pub mod status;
 pub mod vectors;
 

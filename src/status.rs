@@ -105,6 +105,27 @@ pub struct Jobs {
     pub vector_ops: u64,
 }
 
+/// The sharing configuration as the ENVIRONMENT resolved it, before the
+/// operator's stored choices were layered on.
+///
+/// Published so the dashboard can show where each value came from, and so
+/// clearing an override can show what it falls back to without waiting for
+/// the node to reconnect and republish.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Baseline {
+    pub share_inference: bool,
+    pub share_cpu: bool,
+    pub workloads: Vec<String>,
+    pub approval_mode: String,
+    pub country: String,
+    pub colibri: String,
+    pub max_cpus: Option<f64>,
+    pub max_vram_mb: Option<u64>,
+    pub max_ram_mb: Option<u64>,
+    pub max_disk_gb: Option<u64>,
+}
+
 /// A peer's container currently running on this machine.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Session {
@@ -160,6 +181,18 @@ pub struct Snapshot {
     pub approval_mode: String,
     pub country: String,
     pub workloads: Vec<String>,
+    /// The operator's ceilings, as this worker is applying them. `None` is
+    /// "no explicit choice", which is not the same as zero — see the fields
+    /// on `WorkerConfig`.
+    pub max_cpus: Option<f64>,
+    pub max_vram_mb: Option<u64>,
+    pub max_ram_mb: Option<u64>,
+    pub max_disk_gb: Option<u64>,
+    /// Colibri upstream, empty when none is configured. The key never
+    /// travels in this file.
+    pub colibri: String,
+    /// The same fields as the environment alone resolved them.
+    pub baseline: Baseline,
 
     pub models: Vec<String>,
     /// Non-default routing only, model -> upstream ("colibri").

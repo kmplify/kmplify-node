@@ -35,7 +35,9 @@ use ratatui::widgets::{Block, BorderType, Borders, Cell, Gauge, Paragraph, Row, 
 use ratatui::Frame;
 
 use kmplify_node::control::Command;
-use kmplify_node::fabric_worker::WorkerConfig;
+use kmplify_node::fabric_worker::{self, WorkerConfig};
+use kmplify_node::gpu::Backend;
+use kmplify_node::settings::Settings;
 use kmplify_node::status::{self, Link, Snapshot};
 
 /// Repaint rate. Fast enough that a keypress feels immediate, slow enough that
@@ -59,6 +61,19 @@ enum View {
     Sessions,
     Models,
     Logs,
+    /// The desktop app's "Provide this machine's Resources" panel: what this
+    /// machine lends, and how much of it.
+    Sharing,
+}
+
+/// A text setting being typed into.
+struct Editing {
+    key: &'static str,
+    label: &'static str,
+    buffer: String,
+    /// Never echo a key to the screen; it is being typed on a machine
+    /// somebody else can usually see.
+    masked: bool,
 }
 
 /// A destructive action waiting for `y`.
@@ -93,6 +108,15 @@ struct App {
     /// Log pane scroll, counted from the bottom. 0 follows the tail.
     log_scroll: usize,
     confirm: Option<Confirm>,
+    /// The sharing settings as edited here but not yet applied. Edits are a
+    /// DRAFT on purpose: a ceiling is re-advertised by reconnecting, and
+    /// reconnecting on every arrow key would make the node flap.
+    draft: Settings,
+    /// The draft as last saved, so "unsaved" is a fact rather than a guess.
+    saved: Settings,
+    sharing_sel: usize,
+    /// The text field currently being typed into, if any.
+    editing: Option<Editing>,
     /// Last thing this dashboard did, shown in the footer.
     notice: String,
     notice_at: Instant,
@@ -191,6 +215,12 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
+        // Typing into a text field takes every key, or the country code "d"
+        // would clear an override and "q" would quit the dashboard.
+        if self.editing.is_some() {
+            self.edit_key(key);
+            return;
+        }
         // A pending confirmation swallows everything else: no key should mean
         // "evict" by accident.
         if let Some(pending) = self.confirm.clone() {
@@ -224,6 +254,13 @@ impl App {
             return;
         }
 
+        // The sharing screen rebinds the keys that mean something different
+        // there (space, arrows, d, s, esc); everything else falls through to
+        // the global bindings below.
+        if self.view == View::Sharing && self.on_sharing_key(key) {
+            return;
+        }
+
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
@@ -238,6 +275,11 @@ impl App {
                 self.selected = 0;
             }
             KeyCode::Char('4') | KeyCode::Char('l') => self.view = View::Logs,
+            KeyCode::Char('5') | KeyCode::Char('g') => {
+                self.view = View::Sharing;
+                // Row 0 is a section heading.
+                self.sharing_sel = self.sharing_sel.max(1);
+            }
             KeyCode::Char('r') => {
                 self.refresh();
                 self.say("refreshed");
@@ -332,9 +374,16 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
         Some(crate::start_node(cfg, dir.clone()).await)
     };
 
+    // The stored sharing choices are the starting point of the draft, so the
+    // screen opens showing what this node is actually applying.
+    let stored = Settings::load(&dir);
     let mut app = App {
         attached_to: attach_mode.then(|| dir.clone()),
         node_dir: dir,
+        draft: stored.clone(),
+        saved: stored,
+        sharing_sel: 1,
+        editing: None,
         snap: live.unwrap_or_default(),
         view: View::Home,
         selected: 0,
@@ -429,6 +478,7 @@ fn draw(f: &mut Frame, app: &App) {
         View::Sessions => draw_sessions(f, app, body),
         View::Models => draw_models(f, app, body),
         View::Logs => draw_logs(f, app, body),
+        View::Sharing => draw_sharing(f, app, body),
     }
     f.render_widget(footer_line(app), footer);
 
@@ -446,6 +496,7 @@ fn header_line(app: &App) -> Paragraph<'static> {
         View::Sessions => "sessions",
         View::Models => "models",
         View::Logs => "log",
+        View::Sharing => "sharing",
     };
     Paragraph::new(Line::from(vec![
         Span::styled(" ◆ kmplify-node", Style::new().fg(ACCENT).bold()),
@@ -532,9 +583,15 @@ fn footer_line(app: &App) -> Paragraph<'static> {
     } else {
         "p pause"
     };
-    let keys = format!(
-        " {quit}   1 home  2 sessions  3 models  4 log   {pause}  c reconnect  e evict  x stop node  w snapshot  ? keys"
-    );
+    let keys = if app.view == View::Sharing {
+        format!(
+            " {quit}   1 home  2 sessions  3 models  4 log  5 sharing   space toggle  ←/→ ceiling  d environment  s apply  ? keys"
+        )
+    } else {
+        format!(
+            " {quit}   1 home  2 sessions  3 models  4 log  5 sharing   {pause}  c reconnect  e evict  x stop node  ? keys"
+        )
+    };
     // The notice replaces the key hints for a few seconds after an action, so
     // a command that failed is impossible to miss.
     let text = if app.notice_at.elapsed() < Duration::from_secs(4) && !app.notice.is_empty() {
@@ -890,13 +947,17 @@ fn draw_overlay(f: &mut Frame, title: &str, body: String) {
 }
 
 fn help_text() -> String {
-    "1/h home   2/s sessions   3/m models   4/l log\n\
+    "1/h home   2/s sessions   3/m models   4/l log   5/g sharing\n\
      ↑/↓ or j/k   move (log: scroll back)\n\
      p  pause or resume sharing — stays connected, advertises nothing\n\
      c  reconnect to the gateway now\n\
      e  evict the selected session (sessions view)\n\
      x  stop the node   ·   w write a snapshot file   ·   r refresh\n\
-     q  leave the dashboard (stops the node only if it started here)"
+     q  leave the dashboard (stops the node only if it started here)\n\
+     \n\
+     sharing (5): space toggles, ←/→ moves a ceiling (shift for a bigger\n\
+     step), enter edits a field, d hands one back to the environment,\n\
+     s applies — which reconnects so the fabric hears the new terms."
         .into()
 }
 
@@ -1017,6 +1078,575 @@ fn human(d: Duration) -> String {
     }
 }
 
+// ---------------------------------------------------------------- sharing
+
+/// One line of the sharing screen.
+///
+/// A hand-rolled row model rather than a widget per control: the screen mixes
+/// switches, a template checklist, sliders and text fields, and every one of
+/// them needs the same three annotations — the value, where it came from
+/// (environment or set here), and whether it is editable on this hardware.
+enum SharingRow {
+    Section(&'static str),
+    Toggle {
+        key: &'static str,
+        label: &'static str,
+        on: bool,
+        note: String,
+        editable: bool,
+        overridden: bool,
+    },
+    Template {
+        name: String,
+        on: bool,
+    },
+    /// A ceiling in whole units, with the machine's own total as the top of
+    /// the bar. `value == 0` means no ceiling is set.
+    Ceiling {
+        key: &'static str,
+        label: &'static str,
+        value: u64,
+        total: u64,
+        unit: &'static str,
+        overridden: bool,
+    },
+    Field {
+        key: &'static str,
+        label: &'static str,
+        shown: String,
+        overridden: bool,
+    },
+}
+
+impl SharingRow {
+    fn selectable(&self) -> bool {
+        !matches!(self, SharingRow::Section(_))
+    }
+}
+
+/// MB the operator thinks in GB about. Ceilings are stored in MB (the wire
+/// unit) and shown in GB (the human unit), and the conversion lives here so
+/// the two cannot drift.
+fn mb_to_gb(mb: u64) -> u64 {
+    mb / 1024
+}
+
+fn gb_to_mb(gb: u64) -> u64 {
+    gb * 1024
+}
+
+impl App {
+    /// The effective value of every sharing control: the environment's
+    /// baseline, with this dashboard's unsaved draft on top.
+    fn sharing_rows(&self) -> Vec<SharingRow> {
+        let s = &self.snap;
+        let b = &s.baseline;
+        let d = &self.draft;
+        let backend = Backend::parse(&s.accelerator).unwrap_or(Backend::Cpu);
+        let can_host = backend.hosts_container_sessions();
+        let workloads = d.workloads.clone().unwrap_or_else(|| b.workloads.clone());
+        let mut rows = vec![
+            SharingRow::Section("what this machine lends"),
+            SharingRow::Toggle {
+                key: "share-inference",
+                label: "GPU inference (chat & embeddings)",
+                on: d.share_inference.unwrap_or(b.share_inference),
+                note: if s.paused {
+                    "paused right now — p resumes without changing this".into()
+                } else {
+                    format!("{} model(s) advertised", s.models.len())
+                },
+                editable: true,
+                overridden: d.share_inference.is_some(),
+            },
+            SharingRow::Toggle {
+                key: "share-cpu",
+                label: "CPU & system RAM",
+                on: d.share_cpu.unwrap_or(b.share_cpu),
+                note: format!("{:.0} cores, {} GB", s.cpus, mb_to_gb(s.ram_total_mb)),
+                editable: true,
+                overridden: d.share_cpu.is_some(),
+            },
+            SharingRow::Toggle {
+                key: "approval-mode",
+                label: "Require my approval for new peers",
+                on: d
+                    .approval_mode
+                    .clone()
+                    .unwrap_or_else(|| b.approval_mode.clone())
+                    == "manual",
+                note: "consumers wait until approved; invitations connect directly".into(),
+                editable: true,
+                overridden: d.approval_mode.is_some(),
+            },
+            SharingRow::Section(if can_host {
+                "container sessions for peers (each one is its own consent)"
+            } else {
+                "container sessions — this accelerator cannot pass a GPU into a container"
+            }),
+        ];
+        if can_host {
+            for t in fabric_worker::hostable_templates(backend) {
+                rows.push(SharingRow::Template {
+                    name: t.to_string(),
+                    on: workloads.iter().any(|w| w == t),
+                });
+            }
+        }
+        rows.push(SharingRow::Section(
+            "ceilings — peer sessions never exceed these",
+        ));
+        rows.push(SharingRow::Ceiling {
+            key: "max-cpus",
+            label: "CPU threads",
+            value: d
+                .max_cpus
+                .or(b.max_cpus)
+                .map(|v| v.round() as u64)
+                .unwrap_or(0),
+            total: s.cpus.max(1.0) as u64,
+            unit: "threads",
+            overridden: d.max_cpus.is_some(),
+        });
+        rows.push(SharingRow::Ceiling {
+            key: "max-vram-mb",
+            label: "VRAM",
+            value: mb_to_gb(d.max_vram_mb.or(b.max_vram_mb).unwrap_or(0)),
+            total: mb_to_gb(s.vram_total_mb),
+            unit: "GB",
+            overridden: d.max_vram_mb.is_some(),
+        });
+        rows.push(SharingRow::Ceiling {
+            key: "max-ram-mb",
+            label: "System RAM",
+            value: mb_to_gb(d.max_ram_mb.or(b.max_ram_mb).unwrap_or(0)),
+            total: mb_to_gb(s.ram_total_mb),
+            unit: "GB",
+            overridden: d.max_ram_mb.is_some(),
+        });
+        rows.push(SharingRow::Ceiling {
+            key: "max-disk-gb",
+            label: "Disk (images & weights)",
+            value: d.max_disk_gb.or(b.max_disk_gb).unwrap_or(0),
+            // Disk has no advertised total the way VRAM does, so the bar is
+            // scaled to a round number rather than pretending to know the
+            // volume's size.
+            total: 1000,
+            unit: "GB",
+            overridden: d.max_disk_gb.is_some(),
+        });
+        rows.push(SharingRow::Section("who, and through what"));
+        rows.push(SharingRow::Field {
+            key: "country",
+            label: "Country for EU-only consumers",
+            shown: {
+                let c = d.country.clone().unwrap_or_else(|| b.country.clone());
+                if c.is_empty() {
+                    "undeclared (recorded as XX)".into()
+                } else {
+                    c
+                }
+            },
+            overridden: d.country.is_some(),
+        });
+        rows.push(SharingRow::Field {
+            key: "colibri",
+            label: "Colibri gateway (frontier MoE models)",
+            shown: {
+                let v = d.colibri_base.clone().unwrap_or_else(|| b.colibri.clone());
+                if v.is_empty() {
+                    "none — lend only local models".into()
+                } else {
+                    v
+                }
+            },
+            overridden: d.colibri_base.is_some(),
+        });
+        rows.push(SharingRow::Field {
+            key: "colibri-key",
+            label: "Colibri API key",
+            shown: match d.colibri_api_key.as_deref() {
+                Some("") => "(cleared)".into(),
+                Some(_) => "(set here)".into(),
+                None => "(unchanged)".into(),
+            },
+            overridden: d.colibri_api_key.is_some(),
+        });
+        rows
+    }
+
+    fn sharing_clamp(&mut self, rows: usize) {
+        if self.sharing_sel >= rows {
+            self.sharing_sel = rows.saturating_sub(1);
+        }
+    }
+
+    /// Move the selection to the next selectable row in `step` direction.
+    fn sharing_move(&mut self, step: isize) {
+        let rows = self.sharing_rows();
+        if rows.is_empty() {
+            return;
+        }
+        let mut i = self.sharing_sel as isize;
+        for _ in 0..rows.len() {
+            i += step;
+            if i < 0 {
+                i = rows.len() as isize - 1;
+            }
+            if i >= rows.len() as isize {
+                i = 0;
+            }
+            if rows[i as usize].selectable() {
+                self.sharing_sel = i as usize;
+                return;
+            }
+        }
+    }
+
+    fn toggle_selected(&mut self) {
+        let rows = self.sharing_rows();
+        let Some(row) = rows.get(self.sharing_sel) else {
+            return;
+        };
+        match row {
+            SharingRow::Toggle {
+                key, on, editable, ..
+            } => {
+                if !editable {
+                    self.say("not available on this hardware");
+                    return;
+                }
+                let value = !on;
+                match *key {
+                    "share-inference" => self.draft.share_inference = Some(value),
+                    "share-cpu" => self.draft.share_cpu = Some(value),
+                    "approval-mode" => {
+                        self.draft.approval_mode =
+                            Some(if value { "manual" } else { "auto" }.to_string())
+                    }
+                    _ => {}
+                }
+            }
+            SharingRow::Template { name, on } => {
+                let mut list = self
+                    .draft
+                    .workloads
+                    .clone()
+                    .unwrap_or_else(|| self.snap.baseline.workloads.clone());
+                if *on {
+                    list.retain(|t| t != name);
+                } else if !list.iter().any(|t| t == name) {
+                    list.push(name.clone());
+                }
+                list.sort();
+                self.draft.workloads = Some(list);
+            }
+            SharingRow::Field { .. } => self.begin_edit(),
+            SharingRow::Ceiling { .. } => self.say("←/→ adjusts this ceiling, d clears it"),
+            SharingRow::Section(_) => {}
+        }
+    }
+
+    /// Nudge the selected ceiling. One step is one thread or one GB; with
+    /// shift, a tenth of the machine, because dragging 64 GB one press at a
+    /// time is not an interface.
+    fn adjust_selected(&mut self, dir: i64, coarse: bool) {
+        let rows = self.sharing_rows();
+        let Some(SharingRow::Ceiling {
+            key, value, total, ..
+        }) = rows.get(self.sharing_sel)
+        else {
+            return;
+        };
+        let step = if coarse { (*total / 10).max(1) } else { 1 };
+        // An unset ceiling starts from the machine's own total: the first
+        // press should lower a real number, not jump from "all of it" to 1.
+        let from = if *value == 0 { *total } else { *value };
+        let next = (from as i64 + dir * step as i64).clamp(1, (*total).max(1) as i64) as u64;
+        match *key {
+            "max-cpus" => self.draft.max_cpus = Some(next as f64),
+            "max-vram-mb" => self.draft.max_vram_mb = Some(gb_to_mb(next)),
+            "max-ram-mb" => self.draft.max_ram_mb = Some(gb_to_mb(next)),
+            "max-disk-gb" => self.draft.max_disk_gb = Some(next),
+            _ => {}
+        }
+    }
+
+    /// Drop the override on the selected row, handing the field back to the
+    /// environment.
+    fn clear_selected(&mut self) {
+        let rows = self.sharing_rows();
+        let key = match rows.get(self.sharing_sel) {
+            Some(SharingRow::Toggle { key, .. }) => *key,
+            Some(SharingRow::Ceiling { key, .. }) => *key,
+            Some(SharingRow::Field { key, .. }) => *key,
+            Some(SharingRow::Template { .. }) => "workloads",
+            _ => return,
+        };
+        if let Err(e) = self.draft.clear(key) {
+            self.say(e);
+            return;
+        }
+        self.say(format!("{key}: back to the environment's value"));
+    }
+
+    fn begin_edit(&mut self) {
+        let rows = self.sharing_rows();
+        let Some(SharingRow::Field { key, .. }) = rows.get(self.sharing_sel) else {
+            return;
+        };
+        let (label, masked, current) = match *key {
+            "country" => (
+                "Country (alpha-2, empty to declare nothing)",
+                false,
+                self.draft
+                    .country
+                    .clone()
+                    .unwrap_or_else(|| self.snap.baseline.country.clone()),
+            ),
+            "colibri" => (
+                "Colibri gateway URL (empty to switch it off)",
+                false,
+                self.draft
+                    .colibri_base
+                    .clone()
+                    .unwrap_or_else(|| self.snap.baseline.colibri.clone()),
+            ),
+            _ => ("Colibri API key (never shown)", true, String::new()),
+        };
+        self.editing = Some(Editing {
+            key,
+            label,
+            buffer: current,
+            masked,
+        });
+    }
+
+    /// Keys while a text field is open. Returns false once the field closes.
+    fn edit_key(&mut self, key: KeyEvent) {
+        let Some(edit) = self.editing.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.editing = None;
+                self.say("edit cancelled");
+            }
+            KeyCode::Enter => {
+                let (k, value) = (edit.key, edit.buffer.clone());
+                self.editing = None;
+                match self.draft.set(k, &value) {
+                    Ok(()) => self.say(format!("{k} set — s applies it")),
+                    Err(e) => self.say(e),
+                }
+            }
+            KeyCode::Backspace => {
+                edit.buffer.pop();
+            }
+            KeyCode::Char(c) => edit.buffer.push(c),
+            _ => {}
+        }
+    }
+
+    /// Keys that only mean something on the sharing screen. `true` when the
+    /// key was consumed here.
+    fn on_sharing_key(&mut self, key: KeyEvent) -> bool {
+        let coarse = key.modifiers.contains(KeyModifiers::SHIFT);
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.sharing_move(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.sharing_move(1),
+            KeyCode::Char(' ') | KeyCode::Enter => self.toggle_selected(),
+            KeyCode::Left => self.adjust_selected(-1, coarse),
+            KeyCode::Right => self.adjust_selected(1, coarse),
+            KeyCode::Char('d') => self.clear_selected(),
+            KeyCode::Char('s') => self.save_sharing(),
+            KeyCode::Esc => {
+                // Esc discards a draft here rather than quitting: leaving the
+                // dashboard by accident with unsaved ceilings on screen is
+                // the worse outcome.
+                if self.sharing_dirty() {
+                    self.discard_sharing();
+                } else {
+                    self.view = View::Home;
+                }
+            }
+            _ => return false,
+        }
+        let rows = self.sharing_rows().len();
+        self.sharing_clamp(rows);
+        true
+    }
+
+    fn sharing_dirty(&self) -> bool {
+        self.draft != self.saved
+    }
+
+    /// Write the draft and tell the node to re-advertise with it.
+    fn save_sharing(&mut self) {
+        if !self.sharing_dirty() {
+            self.say("nothing to apply");
+            return;
+        }
+        if let Err(e) = self.draft.save(&self.node_dir) {
+            self.say(format!("could not write settings: {e}"));
+            return;
+        }
+        self.saved = self.draft.clone();
+        // Same command in both modes: in-process it reaches the worker
+        // directly, attached it goes through the control directory.
+        self.send(Command::Reload);
+    }
+
+    fn discard_sharing(&mut self) {
+        if self.sharing_dirty() {
+            self.draft = self.saved.clone();
+            self.say("changes discarded");
+        }
+    }
+}
+
+fn draw_sharing(f: &mut Frame, app: &App, area: Rect) {
+    let [body, note] = Layout::vertical([Constraint::Min(6), Constraint::Length(4)]).areas(area);
+    let rows = app.sharing_rows();
+    let width = body.width.saturating_sub(4) as usize;
+    let mut lines: Vec<Line> = Vec::with_capacity(rows.len() + 4);
+    for (i, r) in rows.iter().enumerate() {
+        if i > 0 && matches!(r, SharingRow::Section(_)) {
+            lines.push(Line::raw(""));
+        }
+        lines.push(sharing_line(r, i == app.sharing_sel, width));
+    }
+    let title = if app.sharing_dirty() {
+        "sharing  ● unsaved — s applies, esc discards".to_string()
+    } else {
+        "sharing".to_string()
+    };
+    f.render_widget(Paragraph::new(lines).block(panel_owned(title)), body);
+
+    let help = if let Some(edit) = &app.editing {
+        Line::from(vec![
+            Span::styled(format!("{}: ", edit.label), Style::new().fg(MUTED)),
+            Span::styled(
+                if edit.masked {
+                    "•".repeat(edit.buffer.chars().count())
+                } else {
+                    edit.buffer.clone()
+                },
+                Style::new().fg(Color::Yellow).bold(),
+            ),
+            Span::styled("_   enter saves · esc cancels", Style::new().fg(MUTED)),
+        ])
+    } else {
+        Line::from(Span::styled(
+            "↑/↓ move · space toggle · ←/→ ceiling (shift: bigger step) · enter edit · d back to environment · s apply",
+            Style::new().fg(MUTED),
+        ))
+    };
+    f.render_widget(
+        Paragraph::new(vec![
+            help,
+            Line::from(Span::styled(
+                "Applying reconnects the node so the fabric hears the new terms. Hosted sessions keep running.",
+                Style::new().fg(MUTED),
+            )),
+        ])
+        .wrap(Wrap { trim: true })
+        .block(panel("about")),
+        note,
+    );
+}
+
+fn sharing_line(row: &SharingRow, selected: bool, width: usize) -> Line<'static> {
+    let base = if selected {
+        Style::new().fg(Color::Black).bg(ACCENT)
+    } else {
+        Style::new()
+    };
+    let mark = |overridden: bool| {
+        if overridden {
+            Span::styled(" ●", Style::new().fg(Color::Yellow))
+        } else {
+            Span::raw("  ")
+        }
+    };
+    // Fixed columns: the value of every row starts in the same place, so the
+    // screen reads as a form rather than as ragged prose.
+    const LABEL: usize = 42;
+    match row {
+        SharingRow::Section(title) => Line::from(Span::styled(
+            format!(" {title}"),
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        SharingRow::Toggle {
+            label,
+            on,
+            note,
+            editable,
+            overridden,
+            ..
+        } => Line::from(vec![
+            Span::styled(
+                format!(
+                    "  [{}] {:<width$}",
+                    if *on { "x" } else { " " },
+                    label,
+                    width = LABEL - 6
+                ),
+                if *editable { base } else { base.fg(MUTED) },
+            ),
+            mark(*overridden),
+            Span::styled(format!(" {note}"), Style::new().fg(MUTED)),
+        ]),
+        SharingRow::Template { name, on } => Line::from(vec![Span::styled(
+            format!("      [{}] {name}", if *on { "x" } else { " " }),
+            base,
+        )]),
+        SharingRow::Ceiling {
+            label,
+            value,
+            total,
+            unit,
+            overridden,
+            ..
+        } => {
+            let shown = if *value == 0 { *total } else { *value };
+            let bar_width = width.min(24);
+            let filled = if *total == 0 {
+                0
+            } else {
+                (shown as usize * bar_width / (*total).max(1) as usize).min(bar_width)
+            };
+            Line::from(vec![
+                Span::styled(format!("  {label:<24}"), base),
+                Span::styled(
+                    "█".repeat(filled),
+                    Style::new().fg(if *value == 0 { MUTED } else { Color::Green }),
+                ),
+                Span::styled("░".repeat(bar_width - filled), Style::new().fg(MUTED)),
+                Span::styled(
+                    if *value == 0 {
+                        format!("  all of it ({total} {unit})")
+                    } else {
+                        format!("  {value} / {total} {unit}")
+                    },
+                    base,
+                ),
+                mark(*overridden),
+            ])
+        }
+        SharingRow::Field {
+            label,
+            shown,
+            overridden,
+            ..
+        } => Line::from(vec![
+            Span::styled(format!("  {label:<LABEL$}"), base),
+            Span::styled(shown.clone(), base),
+            mark(*overridden),
+        ]),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1025,6 +1655,10 @@ mod tests {
         App {
             attached_to: None,
             node_dir: std::env::temp_dir(),
+            draft: Settings::default(),
+            saved: Settings::default(),
+            sharing_sel: 1,
+            editing: None,
             snap: Snapshot::default(),
             view: View::Home,
             selected: 0,
@@ -1133,6 +1767,198 @@ mod tests {
         );
         assert_eq!(gateway_host("http://10.0.0.2:8080/x"), "10.0.0.2:8080");
         assert_eq!(gateway_host(""), "no gateway");
+    }
+
+    /// A machine with a CUDA card, so the template checklist is populated.
+    fn cuda_app() -> App {
+        let mut a = app();
+        a.view = View::Sharing;
+        a.snap.accelerator = "cuda".into();
+        a.snap.cpus = 16.0;
+        a.snap.vram_total_mb = 24576;
+        a.snap.ram_total_mb = 65536;
+        a.snap.baseline = status::Baseline {
+            share_inference: true,
+            approval_mode: "auto".into(),
+            ..Default::default()
+        };
+        a
+    }
+
+    fn row_index(a: &App, label: &str) -> usize {
+        a.sharing_rows()
+            .iter()
+            .position(|r| match r {
+                SharingRow::Toggle { label: l, .. } => l.contains(label),
+                SharingRow::Ceiling { label: l, .. } => l.contains(label),
+                SharingRow::Field { label: l, .. } => l.contains(label),
+                SharingRow::Template { name, .. } => name.contains(label),
+                SharingRow::Section(_) => false,
+            })
+            .unwrap_or_else(|| panic!("no row for {label}"))
+    }
+
+    #[test]
+    fn the_sharing_screen_offers_every_switch_the_desktop_panel_does() {
+        let a = cuda_app();
+        for label in [
+            "GPU inference",
+            "CPU & system RAM",
+            "Require my approval",
+            "CPU threads",
+            "VRAM",
+            "System RAM",
+            "Disk",
+            "Country",
+            "Colibri gateway",
+            "Colibri API key",
+        ] {
+            row_index(&a, label);
+        }
+        // …and the container-session templates this hardware can actually run.
+        assert!(a
+            .sharing_rows()
+            .iter()
+            .any(|r| matches!(r, SharingRow::Template { .. })));
+    }
+
+    #[test]
+    fn a_machine_that_cannot_host_sessions_is_offered_none() {
+        let mut a = cuda_app();
+        a.snap.accelerator = "metal".into();
+        assert!(
+            !a.sharing_rows()
+                .iter()
+                .any(|r| matches!(r, SharingRow::Template { .. })),
+            "macOS has no GPU passthrough into containers, so there is nothing to opt into"
+        );
+    }
+
+    #[test]
+    fn toggling_writes_a_draft_rather_than_the_live_node() {
+        let mut a = cuda_app();
+        a.sharing_sel = row_index(&a, "CPU & system RAM");
+        press(&mut a, ' ');
+        assert_eq!(a.draft.share_cpu, Some(true));
+        assert!(a.sharing_dirty(), "an edit is unsaved until s applies it");
+        press(&mut a, ' ');
+        assert_eq!(a.draft.share_cpu, Some(false));
+    }
+
+    #[test]
+    fn the_approval_switch_speaks_the_gateways_vocabulary() {
+        let mut a = cuda_app();
+        a.sharing_sel = row_index(&a, "Require my approval");
+        press(&mut a, ' ');
+        assert_eq!(a.draft.approval_mode.as_deref(), Some("manual"));
+        press(&mut a, ' ');
+        assert_eq!(a.draft.approval_mode.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn a_ceiling_starts_from_the_machines_own_total() {
+        let mut a = cuda_app();
+        a.sharing_sel = row_index(&a, "VRAM");
+        // First press must lower a real number, not jump from "all of it" to 1.
+        a.on_sharing_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(a.draft.max_vram_mb, Some(gb_to_mb(23)));
+        a.on_sharing_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(a.draft.max_vram_mb, Some(gb_to_mb(24)));
+        // And never past the card.
+        for _ in 0..5 {
+            a.on_sharing_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        }
+        assert_eq!(a.draft.max_vram_mb, Some(gb_to_mb(24)));
+    }
+
+    #[test]
+    fn a_ceiling_never_reaches_zero_by_arrow_key() {
+        // Zero means "no explicit ceiling" to the worker, so walking a slider
+        // down must stop at 1 rather than silently mean "all of it".
+        let mut a = cuda_app();
+        a.sharing_sel = row_index(&a, "CPU threads");
+        for _ in 0..40 {
+            a.on_sharing_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        }
+        assert_eq!(a.draft.max_cpus, Some(1.0));
+    }
+
+    #[test]
+    fn clearing_a_row_hands_it_back_to_the_environment() {
+        let mut a = cuda_app();
+        a.sharing_sel = row_index(&a, "CPU & system RAM");
+        press(&mut a, ' ');
+        assert!(a.draft.share_cpu.is_some());
+        press(&mut a, 'd');
+        assert!(a.draft.share_cpu.is_none());
+    }
+
+    #[test]
+    fn templates_are_a_checklist_over_the_environments_list() {
+        let mut a = cuda_app();
+        a.snap.baseline.workloads = vec!["ollama".into()];
+        let i = a
+            .sharing_rows()
+            .iter()
+            .position(|r| matches!(r, SharingRow::Template { name, .. } if name == "comfyui"))
+            .expect("comfyui is a CUDA template");
+        a.sharing_sel = i;
+        press(&mut a, ' ');
+        let list = a.draft.workloads.clone().unwrap();
+        assert!(list.contains(&"comfyui".to_string()));
+        // The one the environment already opted into is preserved, not lost.
+        assert!(list.contains(&"ollama".to_string()));
+    }
+
+    #[test]
+    fn typing_into_a_field_swallows_the_global_keys() {
+        let mut a = cuda_app();
+        a.sharing_sel = row_index(&a, "Country");
+        press(&mut a, ' ');
+        assert!(a.editing.is_some(), "enter/space opens the field");
+        // "q" is a country letter here, not quit.
+        press(&mut a, 'q');
+        assert!(!a.quit);
+        a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(a.editing.is_none());
+    }
+
+    #[test]
+    fn a_field_is_validated_before_it_becomes_a_draft() {
+        let mut a = cuda_app();
+        a.sharing_sel = row_index(&a, "Country");
+        press(&mut a, ' ');
+        for c in "DEU".chars() {
+            press(&mut a, c);
+        }
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(a.draft.country.is_none(), "a three-letter code is refused");
+        assert!(a.notice.contains("alpha-2"));
+    }
+
+    #[test]
+    fn escape_discards_a_draft_before_it_leaves_the_screen() {
+        let mut a = cuda_app();
+        a.sharing_sel = row_index(&a, "CPU & system RAM");
+        press(&mut a, ' ');
+        a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!a.sharing_dirty(), "the draft is dropped");
+        assert!(a.view == View::Sharing, "…and the screen stays put");
+        a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(a.view == View::Home, "a second escape leaves");
+    }
+
+    #[test]
+    fn navigation_skips_the_section_headings() {
+        let mut a = cuda_app();
+        a.sharing_sel = 1;
+        for _ in 0..a.sharing_rows().len() * 2 {
+            a.sharing_move(1);
+            assert!(
+                a.sharing_rows()[a.sharing_sel].selectable(),
+                "landed on a heading"
+            );
+        }
     }
 
     #[test]

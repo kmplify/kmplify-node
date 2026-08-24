@@ -106,6 +106,36 @@ fn hosted_cell() -> &'static Arc<Mutex<Vec<HostedSession>>> {
     HOSTED.get_or_init(|| Arc::new(Mutex::new(Vec::new())))
 }
 
+/// Mirror the EFFECTIVE configuration into the status snapshot.
+///
+/// What the dashboard shows must be what this worker was actually handed,
+/// baseline plus the operator's overrides — not what the reader's own
+/// environment resolves to. The two differ the moment a service unit and an
+/// operator's shell disagree, which is most of the time.
+fn publish_config(cfg: &WorkerConfig) {
+    let cfg = cfg.clone();
+    crate::status::update(move |s| {
+        s.gateway = cfg.gateway_url.clone();
+        s.accelerator = cfg.accel().as_str().to_string();
+        s.share_inference = cfg.share_inference;
+        s.share_cpu = cfg.share_cpu;
+        s.approval_mode = cfg.approval_mode.clone();
+        s.country = cfg.country.clone();
+        s.workloads = cfg.workload_templates.clone();
+        s.max_cpus = cfg.max_shared_cpus;
+        s.max_vram_mb = cfg.max_shared_vram_mb;
+        s.max_ram_mb = cfg.max_shared_ram_mb;
+        s.max_disk_gb = cfg.max_shared_disk_gb;
+        s.colibri = cfg.colibri_base.clone();
+        s.functions_enabled = cfg.functions.enabled;
+        s.vectors_enabled = cfg.vectors.enabled;
+        s.vectors_max_mb = cfg.vectors.max_mb;
+        if let Some(v) = &cfg.client_version {
+            s.version = v.clone();
+        }
+    });
+}
+
 /// Is this node advertising models right now?
 ///
 /// Two switches, one answer: `share_inference` is the durable choice (config,
@@ -3780,6 +3810,17 @@ async fn session(
                         // Left empty on purpose: the next ping recomputes the
                         // list, sees it differs from "nothing", and sends it.
                     }
+                    Ok(frame) if frame["type"] == "node_reload" => {
+                        // Almost everything the sharing settings control is
+                        // declared in the HELLO frame — ceilings, templates,
+                        // country, admission — so the only honest way to
+                        // apply a change is to say hello again. run() re-reads
+                        // the settings file before every session, so ending
+                        // this one IS the reload.
+                        log("sharing settings changed — reconnecting to re-advertise");
+                        let _ = sink.lock().await.send(Message::Close(None)).await;
+                        break Err(RECONNECT_REQUESTED.to_string());
+                    }
                     Ok(frame) if frame["type"] == "node_reconnect" => {
                         log("reconnect requested by this machine's owner");
                         let _ = sink.lock().await.send(Message::Close(None)).await;
@@ -4122,6 +4163,35 @@ async fn session(
 /// Run the worker until `stop` is signalled true; reconnects with backoff
 /// on any error (gateway unreachable, dropped connection, etc).
 pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
+    // The configuration this worker was handed is the BASELINE; the
+    // operator's own choices (the dashboard's sharing screen, `kmplify-node
+    // set`) are layered on top before every connection. Keeping the baseline
+    // means clearing an override restores what the unit file said, without
+    // restarting anything.
+    let baseline = cfg.clone();
+    let node_dir = cfg
+        .creds_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut cfg = cfg;
+    crate::status::update({
+        let b = baseline.clone();
+        move |s| {
+            s.baseline = crate::status::Baseline {
+                share_inference: b.share_inference,
+                share_cpu: b.share_cpu,
+                workloads: b.workload_templates.clone(),
+                approval_mode: b.approval_mode.clone(),
+                country: b.country.clone(),
+                colibri: b.colibri_base.clone(),
+                max_cpus: b.max_shared_cpus,
+                max_vram_mb: b.max_shared_vram_mb,
+                max_ram_mb: b.max_shared_ram_mb,
+                max_disk_gb: b.max_shared_disk_gb,
+            };
+        }
+    });
     // The CPU/RAM sampler feeds both the hello's `cpu` block and the pong's
     // live figures. Idempotent, and started HERE rather than only from the
     // GUI setup: the headless `kmplify-node` binary never touched it, so a
@@ -4133,24 +4203,7 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
     // this worker was actually handed rather than what the reader's own
     // environment resolves to — the two differ the moment a service unit and
     // an operator's shell disagree.
-    {
-        let cfg = cfg.clone();
-        crate::status::update(move |s| {
-            s.gateway = cfg.gateway_url.clone();
-            s.accelerator = cfg.accel().as_str().to_string();
-            s.share_inference = cfg.share_inference;
-            s.share_cpu = cfg.share_cpu;
-            s.approval_mode = cfg.approval_mode.clone();
-            s.country = cfg.country.clone();
-            s.workloads = cfg.workload_templates.clone();
-            s.functions_enabled = cfg.functions.enabled;
-            s.vectors_enabled = cfg.vectors.enabled;
-            s.vectors_max_mb = cfg.vectors.max_mb;
-            if let Some(v) = &cfg.client_version {
-                s.version = v.clone();
-            }
-        });
-    }
+    publish_config(&cfg);
     if cfg.vectors.enabled {
         let loaded = vectors_store(&cfg).load().await;
         if loaded > 0 {
@@ -4187,10 +4240,21 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
         }
     }
     let _mark_stopped = MarkStoppedOnExit;
+    // Subscribed for the whole run, not per session: the commands that mean
+    // "stop waiting" arrive precisely when there IS no session — a settings
+    // change made while the gateway is unreachable would otherwise sit out
+    // the full backoff before anyone noticed it.
+    let mut wake = control().subscribe();
     loop {
         if *stop.borrow() {
             return;
         }
+        // Re-read before every connection, so a change made in the dashboard
+        // takes effect on the reconnect it triggers — and so a node that has
+        // been up for weeks still picks up an edit made an hour ago.
+        cfg = baseline.clone();
+        crate::settings::Settings::load(&node_dir).apply(&mut cfg);
+        publish_config(&cfg);
         match session(&client, &cfg, &mut stop).await {
             Ok(()) => healed_since_connect = false,
             Err(e) => {
@@ -4240,6 +4304,18 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
                     return;
                 }
             }
+            // The operator changed something. Cut the backoff short: the top
+            // of the loop re-reads the settings and dials again.
+            _ = async {
+                loop {
+                    match wake.recv().await {
+                        Ok(f) if f["type"] == "node_reload" || f["type"] == "node_reconnect" => return,
+                        Ok(_) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => std::future::pending::<()>().await,
+                    }
+                }
+            } => {}
         }
     }
 }

@@ -133,6 +133,32 @@ For the systemd install below, that is the `kmplify` user:
 sudo -u kmplify KMPLIFY_NODE_DIR=/var/lib/kmplify-node kmplify-node tui
 ```
 
+### What this machine lends (key `5`)
+
+The sharing screen is the desktop app's "Provide this machine's Resources"
+panel: switches for inference, per-template container sessions, CPU/RAM and
+manual approval; ceilings for cores, VRAM, RAM and disk; country and colibri
+upstream. `space` toggles, `←/→` moves a ceiling (`shift` for a bigger step),
+`enter` edits a field, `d` hands a row back to the environment, `s` applies —
+which reconnects the node so the fabric hears the new terms. Hosted sessions
+survive it.
+
+The same without a terminal:
+
+```sh
+kmplify-node set max-cpus=6 share-cpu=true
+kmplify-node set workloads=vllm-openai,comfyui   # empty value = sessions off
+kmplify-node set --clear max-cpus                # back to /etc/kmplify-node.env
+kmplify-node set --list
+```
+
+Both write `settings.json` in `KMPLIFY_NODE_DIR` (mode 0600 — it can hold the
+colibri key) and signal the running node, which re-advertises within a second;
+a node that is offline picks the change up on its next connection. **A stored
+choice overrides the environment**, so an operator standing at the machine
+beats a unit file written months ago. `kmplify-node check` prints every such
+override, and `set --clear KEY` removes one.
+
 For scripts and monitoring, the same snapshot without the full screen:
 
 ```sh

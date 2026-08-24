@@ -58,6 +58,7 @@ use std::time::Duration;
 
 use kmplify_node::fabric_worker::{self, WorkerConfig};
 use kmplify_node::gpu::{self, Backend};
+use kmplify_node::settings::Settings;
 use kmplify_node::{control, status, PUBLIC_FABRIC_URL};
 
 /// Ready, or a clean stop.
@@ -286,6 +287,8 @@ struct Preflight {
     models: Vec<String>,
     engines: HashMap<String, String>,
     gateway: Result<u16, String>,
+    /// Stored sharing choices that are overriding the environment.
+    overrides: Vec<String>,
     warnings: Vec<String>,
     errors: Vec<String>,
 }
@@ -344,6 +347,7 @@ async fn gather(cfg: &WorkerConfig, timeout: Duration) -> Preflight {
         models,
         engines,
         gateway,
+        overrides: Vec::new(),
         warnings: Vec::new(),
         errors: Vec::new(),
     }
@@ -585,6 +589,13 @@ fn render_check_text(cfg: &WorkerConfig, pf: &Preflight) {
         );
     }
 
+    if !pf.overrides.is_empty() {
+        println!();
+        println!("stored sharing settings (kmplify-node set --list) override the environment:");
+        for line in &pf.overrides {
+            println!("  {line}");
+        }
+    }
     if !pf.warnings.is_empty() {
         println!();
         for w in &pf.warnings {
@@ -640,6 +651,7 @@ fn render_check_json(cfg: &WorkerConfig, pf: &Preflight) {
         },
         "models": pf.models,
         "engines": pf.engines,
+        "overrides": pf.overrides,
         "warnings": pf.warnings,
         "errors": pf.errors,
     });
@@ -655,9 +667,17 @@ fn render_check_json(cfg: &WorkerConfig, pf: &Preflight) {
 /// needed the accelerator to build the config, and asking the vendor tools
 /// twice doubled the wall-clock of the one command an operator runs when
 /// something is already wrong.
-async fn run_check(cfg: &WorkerConfig, gpus: Vec<gpu::Gpu>, json: bool, timeout: Duration) -> i32 {
+async fn run_check(
+    cfg: &WorkerConfig,
+    stored: &Settings,
+    from_env: &WorkerConfig,
+    gpus: Vec<gpu::Gpu>,
+    json: bool,
+    timeout: Duration,
+) -> i32 {
     let mut pf = gather(cfg, timeout).await;
     pf.gpus = gpus;
+    pf.overrides = stored.conflicts(from_env);
     judge(cfg, &mut pf);
     if json {
         render_check_json(cfg, &pf);
@@ -739,6 +759,100 @@ fn run_status(dir: &std::path::Path, json: bool) -> i32 {
     );
     println!("  sessions : {}", snap.sessions.len());
     EXIT_OK
+}
+
+/// `set`: change what this machine lends, durably.
+///
+/// The dashboard's sharing screen for a shell — same file, same effect, and
+/// the same nudge to the running node, so `kmplify-node set max-cpus=6` from
+/// a provisioning script lands exactly like dragging the slider.
+fn run_set(dir: &std::path::Path, cli: &cli::Cli, from_env: &WorkerConfig) -> i32 {
+    let mut stored = Settings::load(dir);
+    if cli.list {
+        let lines = stored.lines();
+        if lines.is_empty() {
+            println!("no settings stored here — this node runs on its environment alone");
+        } else {
+            println!("stored in {}", kmplify_node::settings::path(dir).display());
+            for line in lines {
+                println!("  {line}");
+            }
+            for line in stored.conflicts(from_env) {
+                println!("  overriding {line}");
+            }
+        }
+        return EXIT_OK;
+    }
+
+    if cli.clear_all {
+        stored = Settings::default();
+    }
+    for key in &cli.clear {
+        if let Err(e) = stored.clear(key) {
+            eprintln!("kmplify-node: {e}");
+            return EXIT_USAGE;
+        }
+    }
+    for (key, value) in &cli.assignments {
+        if let Err(e) = stored.set(key, value) {
+            eprintln!("kmplify-node: {e}");
+            return EXIT_USAGE;
+        }
+    }
+    if let Err(e) = stored.save(dir) {
+        eprintln!(
+            "kmplify-node: cannot write {}: {e}",
+            kmplify_node::settings::path(dir).display()
+        );
+        return EXIT_UNUSABLE;
+    }
+
+    // Show the outcome rather than echoing the input: what matters is what
+    // this machine now lends, including the fields the change did not touch.
+    let mut effective = from_env.clone();
+    stored.apply(&mut effective);
+    println!(
+        "sharing: inference {} · cpu/ram {} · sessions {} · admission {}",
+        onoff(effective.share_inference),
+        onoff(effective.share_cpu),
+        if effective.workload_templates.is_empty() {
+            "off".to_string()
+        } else {
+            effective.workload_templates.join(",")
+        },
+        effective.approval_mode
+    );
+    println!(
+        "ceilings: cpus {} · vram {} · ram {} · disk {}",
+        ceiling(effective.max_shared_cpus, ""),
+        ceiling(effective.max_shared_vram_mb, " MB"),
+        ceiling(effective.max_shared_ram_mb, " MB"),
+        ceiling(effective.max_shared_disk_gb, " GB"),
+    );
+
+    // Nudge the running node, if there is one. Without this the change would
+    // be correct and invisible until the next restart.
+    match status::read_published(dir).filter(kmplify_node::status::Snapshot::is_fresh) {
+        Some(_) => match control::request(dir, &control::Command::Reload) {
+            Ok(()) => println!("the node running here will re-advertise within a second"),
+            Err(e) => eprintln!("saved, but the running node could not be told: {e}"),
+        },
+        None => println!("no node is running here; this takes effect when one starts"),
+    }
+    EXIT_OK
+}
+
+fn onoff(v: bool) -> &'static str {
+    if v {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+fn ceiling<T: std::fmt::Display>(v: Option<T>, unit: &str) -> String {
+    v.map(|v| format!("{v}{unit}"))
+        .unwrap_or_else(|| "unset".into())
 }
 
 /// `id`: the handle consumers pin and invite. Registers if this install has
@@ -947,6 +1061,25 @@ async fn main() {
 
     let mut errs = Vec::new();
     let mut cfg = resolve_config(&mut errs);
+    // The environment alone, kept for two jobs: reporting which stored
+    // choices are overriding it, and giving `set --clear` something to fall
+    // back to.
+    let from_env = cfg.clone();
+    let stored = Settings::load(&dir);
+
+    // `set` runs BEFORE the configuration gate on purpose: a unit file with a
+    // bad value is exactly when an operator needs to change a setting, and
+    // refusing to let them would be a trap.
+    if cli.cmd == cli::Cmd::Set {
+        if !errs.is_empty() {
+            eprintln!("note: the environment has problems the node would refuse to start on:");
+            for e in &errs {
+                eprintln!("  {e}");
+            }
+        }
+        std::process::exit(run_set(&dir, &cli, &from_env));
+    }
+
     if !errs.is_empty() {
         for e in &errs {
             eprintln!("kmplify-node: {e}");
@@ -954,6 +1087,10 @@ async fn main() {
         eprintln!("\nnothing was started. Fix the configuration and try again.");
         std::process::exit(EXIT_USAGE);
     }
+    // What the operator chose in the dashboard or with `set` wins over the
+    // environment; see the settings module for why round that way.
+    stored.apply(&mut cfg);
+
     // One detection round, shared by the config and by `check`'s card list —
     // and skipped entirely for the commands that never look at the hardware,
     // because probing four vendor tools to print a node id is pure latency in
@@ -978,8 +1115,11 @@ async fn main() {
     }
 
     let code = match cli.cmd {
-        cli::Cmd::Check => run_check(&cfg, gpus, cli.json, cli.probe_timeout).await,
+        cli::Cmd::Check => {
+            run_check(&cfg, &stored, &from_env, gpus, cli.json, cli.probe_timeout).await
+        }
         cli::Cmd::Id => run_id(&cfg).await,
+        cli::Cmd::Set => unreachable!("handled above"),
         cli::Cmd::Run => serve(cfg, dir).await,
         cli::Cmd::Tui => run_tui(cfg, dir, &cli).await,
         cli::Cmd::Status | cli::Cmd::Help | cli::Cmd::Version => unreachable!("handled above"),
@@ -1209,6 +1349,7 @@ mod tests {
             models: Vec::new(),
             engines: HashMap::new(),
             gateway: Ok(405),
+            overrides: Vec::new(),
             warnings: Vec::new(),
             errors: Vec::new(),
         }
