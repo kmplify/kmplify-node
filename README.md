@@ -129,8 +129,8 @@ are attached to every [GitHub release](https://github.com/kmplify/kmplify-node/r
 ## Run
 
 Check the configuration before joining anything. This connects to nothing; it
-resolves the config, probes Docker, `nvidia-smi` and your model endpoint, and
-tells you what the fabric would see:
+resolves the config, probes Docker, `nvidia-smi`, the gateway and your model
+endpoint, and tells you what the fabric would see:
 
 ```bash
 kmplify-node check
@@ -144,7 +144,66 @@ kmplify-node
 
 A node that lists no models will connect, count as online, and have every job
 refused by the scheduler, so `check` fails loudly on that rather than letting
-you deploy something that looks healthy and serves nothing.
+you deploy something that looks healthy and serves nothing. It exits `0` when
+the host is ready, `1` when it is not, and `2` when the configuration is
+wrong, so a provisioning script can branch on it. `--json` gives the same
+verdict in a form a script can read.
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `kmplify-node` / `run` | Join the fabric and serve. Logs to stdout, stops cleanly on SIGTERM. |
+| `kmplify-node tui` | Terminal dashboard: watch **and control** the node. |
+| `kmplify-node check` | Preflight this host. Connects to nothing. `--json`, `--timeout SECS`. |
+| `kmplify-node status` | One-shot report of the node running here. `--json`. |
+| `kmplify-node id` | Print this install's node id, the handle consumers pin and invite. |
+| `kmplify-node version` | Version and build stamp. |
+
+Every configuration variable also has a flag (`--gateway`, `--workloads`,
+`--max-vram-mb`, `--no-share-inference`, …). A flag sets the variable it names
+rather than living beside it, so there is one configuration surface and `check`
+always reports what `run` would use. `kmplify-node help` lists them all.
+
+### The terminal dashboard
+
+A node usually runs where there is no desktop, which used to mean it was
+operated by reading logs. `kmplify-node tui` is the sharing screen from the
+desktop app, in a terminal, on Linux, macOS and Windows alike:
+
+```bash
+kmplify-node tui
+```
+
+```
+ ◆ kmplify-node   provider · compute fabric · inference        live dashboard
+ ONLINE  ·  node 8f2c1a5b90de  ·  fabric.kmplify.io  ·  up 3h 12m  ·  running here
+╭ machine ───────────────────────────────╮╭ sharing ──────────────────────────╮
+│ cuda    NVIDIA GeForce RTX 4090        ││ inference on   7 model(s)         │
+│  ████████████░░░░░  vram 14G / 24G     ││ cpu/ram   on   sessions vllm-o…   │
+│  ██████░░░░░░░░░░░  cpu 38%  4 of 16   ││ jobs      2 active  914 finished  │
+╰────────────────────────────────────────╯╰───────────────────────────────────╯
+ q quit   1 home  2 sessions  3 models  4 log   p pause  c reconnect  e evict …
+```
+
+It **attaches** to the node already running here (systemd, Docker, launchd),
+reading the snapshot that node publishes and sending commands back to it, so
+quitting the dashboard leaves the node running. If nothing is running, it
+starts a node itself and quitting stops it.
+
+| Key | Action |
+|---|---|
+| `p` | Pause or resume sharing. The connection and hosted sessions stay up; the node advertises nothing until resumed. |
+| `c` | Reconnect to the gateway now, without waiting out the backoff. |
+| `e` | Evict the selected session — the peer's container is stopped and removed. |
+| `x` | Stop the node, tearing down hosted sessions first. |
+| `w` | Write a plain-text snapshot of the dashboard, for a bug report. |
+| `1`–`4` | Home, sessions, models, log. `?` for the full list. |
+
+The node also publishes `status.json` in its node directory (owner-readable
+only) and accepts commands as files in `control/` there. That is how a
+dashboard in one process drives a node in another **without the node ever
+listening on a port** — the property this whole crate is built around.
 
 To run it as a service on a headless box, including the fully-static musl
 build that executes on any Linux distribution, see
@@ -153,8 +212,12 @@ build that executes on any Linux distribution, see
 
 ## Configuration
 
-Environment variables only, so a service manager, a container and a shell all
-configure it the same way.
+Environment variables, so a service manager, a container and a shell all
+configure it the same way; every one also has a flag that sets it. A value
+that cannot be read — a ceiling that is not a number, a country that is not
+alpha-2, an admission mode that is neither `auto` nor `manual` — stops the
+node at startup with a message naming the variable, rather than silently
+falling back to a default the operator did not choose.
 
 | Variable | Default | Meaning |
 |---|---|---|

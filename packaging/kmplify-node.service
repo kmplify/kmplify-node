@@ -27,6 +27,9 @@ RestartSec=10
 User=kmplify
 Group=docker
 StateDirectory=kmplify-node
+# The node publishes status.json and reads control/ inside StateDirectory, so
+# the dashboard has to run as this user:
+#   sudo -u kmplify KMPLIFY_NODE_DIR=/var/lib/kmplify-node kmplify-node tui
 
 [Install]
 WantedBy=multi-user.target

@@ -93,12 +93,51 @@ into its stack `.env`:
 | `KMPLIFY_CUDA` | autodetected | force CUDA advertising `1`/`0` |
 
 Always start with the preflight — it prints the resolved configuration and
-probes docker/nvidia-smi/Ollama without connecting, and exits non-zero when
-sessions are offered but Docker is unreachable, so provisioning scripts fail
-loudly instead of deploying a broken node:
+probes docker/nvidia-smi/the gateway/Ollama without connecting, and exits
+non-zero when the host cannot serve as configured, so provisioning scripts
+fail loudly instead of deploying a broken node:
 
 ```sh
-kmplify-node check
+kmplify-node check          # 0 ready · 1 cannot serve · 2 bad configuration
+kmplify-node check --json   # the same verdict, for a script
+```
+
+Every variable above also has a flag that sets it (`--gateway`,
+`--workloads`, `--max-vram-mb`, `--no-share-inference`, …), which is handy
+for trying a setting before writing it into a unit file:
+
+```sh
+kmplify-node check --gateway https://fabric.example --workloads vllm-openai
+```
+
+## The terminal dashboard
+
+`kmplify-node tui` is how a GUI-less machine is operated: it shows link
+state, advertised models, the peers running here and the log, and it drives
+the node — pause and resume sharing (`p`), reconnect (`c`), evict a session
+(`e`), stop the node (`x`), write a snapshot for a bug report (`w`).
+
+```sh
+kmplify-node tui
+```
+
+It attaches to the node already running on this machine and leaves it running
+when you quit. With no node running it starts one, and quitting stops it.
+
+The node publishes `status.json` in `KMPLIFY_NODE_DIR` (mode 0600) and reads
+commands dropped as files into `control/` there. Nothing listens on a port,
+which also means the dashboard must run as the user that owns that directory.
+For the systemd install below, that is the `kmplify` user:
+
+```sh
+sudo -u kmplify KMPLIFY_NODE_DIR=/var/lib/kmplify-node kmplify-node tui
+```
+
+For scripts and monitoring, the same snapshot without the full screen:
+
+```sh
+kmplify-node status          # human-readable, exit 1 when no node is running
+kmplify-node status --json   # every field, including live CPU/RAM/VRAM
 ```
 
 ## Docker (inference-only)
@@ -121,6 +160,13 @@ docker run -d --name kmplify-node --restart unless-stopped \
 Ollama; elsewhere set `OLLAMA_BASE=http://host.docker.internal:11434`. The
 volume keeps the node's anonymous identity across container replacements;
 without it every recreation joins the fabric as a brand-new peer.
+
+The dashboard attaches from inside the container, where the node directory
+and the running worker are:
+
+```sh
+docker exec -it kmplify-node kmplify-node tui
+```
 
 ## Run as a service
 

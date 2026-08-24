@@ -28,6 +28,11 @@ use tokio::sync::{watch, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(10);
+
+/// Session error that means "the operator asked for this": reconnect at once
+/// and say nothing alarming, rather than logging a lost connection and
+/// sitting out the backoff.
+const RECONNECT_REQUESTED: &str = "reconnect requested";
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// The gateway pings every 10s, so a healthy link is never silent for long.
 /// A link that says nothing for this long is dead — typically a gateway
@@ -101,8 +106,40 @@ fn hosted_cell() -> &'static Arc<Mutex<Vec<HostedSession>>> {
     HOSTED.get_or_init(|| Arc::new(Mutex::new(Vec::new())))
 }
 
+/// Is this node advertising models right now?
+///
+/// Two switches, one answer: `share_inference` is the durable choice (config,
+/// or the desktop's sharing settings) and the pause is the live one the
+/// dashboard flips. Read through this everywhere, or the two disagree and the
+/// node advertises models a paused operator thinks it withdrew.
+fn serving(cfg: &WorkerConfig) -> bool {
+    cfg.share_inference && !crate::status::paused()
+}
+
 fn control() -> &'static tokio::sync::broadcast::Sender<Value> {
     CONTROL.get_or_init(|| tokio::sync::broadcast::channel(16).0)
+}
+
+/// Hand an operator command to the worker running in this process.
+///
+/// The frames are the ones the session loop already understands (see
+/// [`crate::control::Command`]); this is the door they come in through,
+/// whether from the dashboard in this process or from a command file another
+/// process dropped.
+pub fn send_control(frame: Value) -> Result<(), String> {
+    control()
+        .send(frame)
+        .map(|_| ())
+        .map_err(|_| "the node is not running, so there is nothing to command".to_string())
+}
+
+/// Watch the same command stream the worker acts on.
+///
+/// For the one command the worker cannot carry out itself: shutting the
+/// process down is the caller's business (it owns the stop signal and the
+/// exit code), so `main` listens here.
+pub fn subscribe_control() -> tokio::sync::broadcast::Receiver<Value> {
+    control().subscribe()
 }
 
 /// The sink of the connection currently talking to the gateway.
@@ -169,12 +206,9 @@ pub async fn hosted_sessions() -> Vec<HostedSession> {
 /// needs: a `kmplify-fabric-*` container still running with no worker behind
 /// it is an orphan, and removing it directly is then the correct repair.
 pub fn request_stop(session_id: &str) -> Result<(), String> {
-    control()
-        .send(json!({"type": "workload_stop", "session": session_id}))
-        .map(|_| ())
-        .map_err(|_| {
-            "GPU sharing is not running, so there is no session to ask it to stop".to_string()
-        })
+    send_control(json!({"type": "workload_stop", "session": session_id})).map_err(|_| {
+        "GPU sharing is not running, so there is no session to ask it to stop".to_string()
+    })
 }
 
 /// Resident models as the desktop UI should see them — same call, same
@@ -475,7 +509,17 @@ pub struct Credentials {
 }
 
 fn log(msg: impl std::fmt::Display) {
-    println!("[fabric-worker] {msg}");
+    let msg = msg.to_string();
+    // Every line also lands in the status ring, which is what the dashboard's
+    // log pane and an attached `kmplify-node tui` read. Kept here rather than
+    // at the call sites so a line can never exist in one surface and not the
+    // other.
+    crate::status::push_log(msg.clone());
+    // A full-screen dashboard owns the terminal; printing under it would draw
+    // over the frame it just painted. The line is not lost, it is in the ring.
+    if !crate::status::quiet() {
+        println!("[fabric-worker] {msg}");
+    }
 }
 
 /// Write a file only its owner may read.
@@ -3273,6 +3317,9 @@ async fn run_job(
     let is_colibri = upstreams.engines.get(&requested_model).map(String::as_str) == Some("colibri");
 
     let send = |sink: Arc<Mutex<WsSink>>, msg: Value| async move {
+        if msg["type"] == "error" {
+            crate::status::count_job_error();
+        }
         let _ = sink.lock().await.send(Message::Text(msg.to_string())).await;
     };
 
@@ -3474,12 +3521,15 @@ async fn session(
     // No models advertised = no inference jobs scheduled here. That is the
     // OFF state of the "Share GPU inference" switch, not an error — the
     // worker may be connected purely to lend CPU/RAM or run sessions.
-    let (models, engines) = if cfg.share_inference {
+    // `serving()` is the switch AND the dashboard's live pause: a paused node
+    // stays connected, keeps its hosted sessions and its place in the
+    // registry, and advertises nothing.
+    let (models, engines) = if serving(cfg) {
         discover(client, cfg).await
     } else {
         (Vec::new(), std::collections::HashMap::new())
     };
-    if models.is_empty() && cfg.share_inference {
+    if models.is_empty() && serving(cfg) {
         log("no local models — connecting anyway; jobs will be refused by scheduler");
     }
 
@@ -3496,6 +3546,7 @@ async fn session(
         "{}/fabric/connect",
         cfg.gateway_url.replacen("http", "ws", 1)
     );
+    crate::status::set_link(crate::status::Link::Connecting, ws_url.clone());
     let (ws, _) = connect_async(&ws_url).await.map_err(|e| e.to_string())?;
     let (write, mut read) = ws.split();
     let sink = Arc::new(Mutex::new(write));
@@ -3596,6 +3647,8 @@ async fn session(
     if welcome["type"] != "welcome" {
         return Err(format!("gateway refused: {welcome}"));
     }
+    crate::status::set_link(crate::status::Link::Online, String::new());
+    crate::status::set_models(&models, &engines);
     log(format!(
         "connected to {} — sharing {} model(s), sessions: {}",
         cfg.gateway_url,
@@ -3704,6 +3757,33 @@ async fn session(
                             session_id,
                             cfg.clone(),
                         ));
+                    }
+                    Ok(frame) if frame["type"] == "node_pause" => {
+                        crate::status::set_paused(true);
+                        log("paused by this machine's owner — withdrawing models");
+                        // Withdrawn EXPLICITLY rather than left to the next
+                        // refresh: that path only sends a non-empty list (see
+                        // the ping branch), so without this the gateway would
+                        // keep scheduling against the last list it was told.
+                        current_models = Vec::new();
+                        current_engines = std::collections::HashMap::new();
+                        crate::status::set_models(&[], &current_engines);
+                        if let Err(e) = sink.lock().await.send(Message::Text(
+                            json!({"type": "models", "models": [], "engines": {}}).to_string()
+                        )).await {
+                            break Err(e.to_string());
+                        }
+                    }
+                    Ok(frame) if frame["type"] == "node_resume" => {
+                        crate::status::set_paused(false);
+                        log("resumed by this machine's owner");
+                        // Left empty on purpose: the next ping recomputes the
+                        // list, sees it differs from "nothing", and sends it.
+                    }
+                    Ok(frame) if frame["type"] == "node_reconnect" => {
+                        log("reconnect requested by this machine's owner");
+                        let _ = sink.lock().await.send(Message::Close(None)).await;
+                        break Err(RECONNECT_REQUESTED.to_string());
                     }
                     // Lagged means the owner clicked faster than this loop
                     // drained; the sessions they wanted gone are still listed
@@ -3891,7 +3971,7 @@ async fn session(
                         // them within a minute and started taking chat jobs
                         // again. The switch has to hold here too, or it only
                         // works until the next refresh.
-                        let (fresh, fresh_engines) = if cfg.share_inference {
+                        let (fresh, fresh_engines) = if serving(cfg) {
                             let ollama = telemetry.lock().await.models.clone();
                             // Colibri is probed inline (the sampler is
                             // Ollama-only): one short localhost round-trip
@@ -3918,6 +3998,7 @@ async fn session(
                         {
                             current_models = fresh.clone();
                             current_engines = fresh_engines.clone();
+                            crate::status::set_models(&fresh, &fresh_engines);
                             if let Err(e) = sink.lock().await.send(Message::Text(
                                 json!({"type": "models", "models": fresh, "engines": fresh_engines}).to_string()
                             )).await {
@@ -3926,23 +4007,33 @@ async fn session(
                         }
                     }
                     Some("job") if frame["kind"].as_str() == Some("function") => {
+                        crate::status::count_function_call();
                         tokio::spawn(run_function(sink.clone(), client.clone(), cfg.clone(), frame));
                     }
                     Some("job") if frame["kind"].as_str().is_some_and(|k| k.starts_with("vector_")) => {
+                        crate::status::count_vector_op();
                         tokio::spawn(run_vector_job(sink.clone(), store.clone(), frame));
                     }
                     Some("job") => {
-                        tokio::spawn(run_job(
-                            sink.clone(),
-                            client.clone(),
-                            JobUpstreams {
-                                ollama_base: cfg.ollama_base.clone(),
-                                colibri_base: cfg.colibri_base.clone(),
-                                colibri_api_key: cfg.colibri_api_key.clone(),
-                                engines: current_engines.clone(),
-                            },
-                            frame,
-                        ));
+                        // Counted around the spawn, not inside run_job: the
+                        // job has a dozen early returns and an "active" count
+                        // that only falls on the happy path would read as a
+                        // permanently busy node.
+                        let model = frame["payload"]["model"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string();
+                        let upstreams = JobUpstreams {
+                            ollama_base: cfg.ollama_base.clone(),
+                            colibri_base: cfg.colibri_base.clone(),
+                            colibri_api_key: cfg.colibri_api_key.clone(),
+                            engines: current_engines.clone(),
+                        };
+                        let (sink, client) = (sink.clone(), client.clone());
+                        tokio::spawn(async move {
+                            let _counted = crate::status::JobGuard::start(&model);
+                            run_job(sink, client, upstreams, frame).await;
+                        });
                     }
                     Some("workload_start") => {
                         tokio::spawn(start_workload(sink.clone(), sessions.clone(), stopped.clone(), cfg.clone(), frame));
@@ -4038,6 +4129,28 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
     // usage at all — exactly the "CPU peers have no detail" complaint, on
     // the deployment where nobody is watching a window to notice.
     crate::hostcpu::start();
+    // The dashboard reads the CONFIG from here too, so what it shows is what
+    // this worker was actually handed rather than what the reader's own
+    // environment resolves to — the two differ the moment a service unit and
+    // an operator's shell disagree.
+    {
+        let cfg = cfg.clone();
+        crate::status::update(move |s| {
+            s.gateway = cfg.gateway_url.clone();
+            s.accelerator = cfg.accel().as_str().to_string();
+            s.share_inference = cfg.share_inference;
+            s.share_cpu = cfg.share_cpu;
+            s.approval_mode = cfg.approval_mode.clone();
+            s.country = cfg.country.clone();
+            s.workloads = cfg.workload_templates.clone();
+            s.functions_enabled = cfg.functions.enabled;
+            s.vectors_enabled = cfg.vectors.enabled;
+            s.vectors_max_mb = cfg.vectors.max_mb;
+            if let Some(v) = &cfg.client_version {
+                s.version = v.clone();
+            }
+        });
+    }
     if cfg.vectors.enabled {
         let loaded = vectors_store(&cfg).load().await;
         if loaded > 0 {
@@ -4065,6 +4178,15 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
         }
     }
     let _clear_on_exit = ClearSinkOnExit;
+    // However this returns — stop signal, or a panic unwinding through it —
+    // the published status must stop claiming the node is online.
+    struct MarkStoppedOnExit;
+    impl Drop for MarkStoppedOnExit {
+        fn drop(&mut self) {
+            crate::status::set_link(crate::status::Link::Stopped, "worker stopped");
+        }
+    }
+    let _mark_stopped = MarkStoppedOnExit;
     loop {
         if *stop.borrow() {
             return;
@@ -4075,6 +4197,13 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
                 if *stop.borrow() {
                     return;
                 }
+                if e == RECONNECT_REQUESTED {
+                    // The operator asked; do not make them wait out a backoff
+                    // meant for a gateway that went away.
+                    crate::status::set_link(crate::status::Link::Connecting, "reconnecting");
+                    continue;
+                }
+                crate::status::set_link(crate::status::Link::Retrying, e.clone());
                 if e == AUTH_REJECTED && !healed_since_connect {
                     // The gateway does not know this node id — retrying with
                     // it can only fail identically, forever. Mint a fresh
