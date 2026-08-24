@@ -338,10 +338,16 @@ async fn hosted_set_state(session: &str, state: &str) {
 }
 
 async fn hosted_remove(session: &str) {
-    hosted_cell()
-        .lock()
-        .await
-        .retain(|h| h.session_id != session);
+    let mut list = hosted_cell().lock().await;
+    if let Some(h) = list.iter().find(|h| h.session_id == session) {
+        // How long this peer actually held the machine. Counted for the
+        // operator's own view (and for an optional rewards companion); the
+        // fabric's signed receipts remain the only thing that settles
+        // anything. See status::Delivered.
+        let held = (chrono_now_secs() - h.since).max(0) as u64;
+        crate::status::count_session(held);
+    }
+    list.retain(|h| h.session_id != session);
 }
 
 /// Sink for user-facing worker events (a peer starting a session on this

@@ -775,6 +775,11 @@ fn run_status(dir: &std::path::Path, json: bool) -> i32 {
         snap.jobs.active, snap.jobs.done, snap.jobs.failed, snap.jobs.avg_ms
     );
     println!("  sessions : {}", snap.sessions.len());
+    println!(
+        "  delivered: {} jobs, {} of hosted sessions",
+        snap.delivered.jobs,
+        human_duration(Duration::from_secs(snap.delivered.session_seconds))
+    );
     EXIT_OK
 }
 
@@ -870,6 +875,103 @@ fn onoff(v: bool) -> &'static str {
 fn ceiling<T: std::fmt::Display>(v: Option<T>, unit: &str) -> String {
     v.map(|v| format!("{v}{unit}"))
         .unwrap_or_else(|| "unset".into())
+}
+
+/// `rewards`: what this node has delivered, and what a companion makes of it.
+///
+/// The node's own half is always here: its public identity, and what it has
+/// actually served. The other half — accounts, wallets, tokens, payouts —
+/// belongs to a separate program that an operator installs on purpose. If
+/// none is installed, this command says so and the node carries on exactly
+/// as before; nothing about serving depends on it.
+async fn run_rewards(dir: &std::path::Path, cfg: &WorkerConfig, stored: &Settings) -> i32 {
+    use kmplify_node::rewards::{self, Companion};
+
+    let identity = kmplify_node::identity::Identity::read(dir);
+    println!("this node");
+    match &identity {
+        Some(id) => {
+            println!("  node id  : {}", id.node_id);
+            println!("  gateway  : {}", id.gateway);
+            println!(
+                "  published: {}",
+                kmplify_node::identity::path(dir).display()
+            );
+        }
+        None => {
+            println!("  node id  : none yet — start the node once so it registers");
+            println!(
+                "  gateway  : {}",
+                match status::read_published(dir) {
+                    Some(s) if !s.gateway.is_empty() => s.gateway,
+                    _ => cfg.gateway_url.clone(),
+                }
+            );
+        }
+    }
+
+    // What this machine has actually served. Not an accounting record, and
+    // said so out loud: only the fabric's signed receipts settle anything.
+    if let Some(snap) = status::read_published(dir) {
+        let d = &snap.delivered;
+        println!(
+            "\ndelivered since this node started ({})",
+            human_duration(snap.uptime())
+        );
+        println!(
+            "  jobs     : {} answered in {:.1} s of compute",
+            d.jobs,
+            d.job_ms as f64 / 1000.0
+        );
+        println!(
+            "  sessions : {} hosted, {} of machine time",
+            d.sessions,
+            human_duration(Duration::from_secs(d.session_seconds))
+        );
+        println!("  (the node's own count — the fabric's signed receipts are what settle)");
+    }
+
+    let enabled = stored.rewards_enabled();
+    let companion = Companion::resolve(enabled);
+    println!("\nrewards companion");
+    match &companion {
+        Companion::Off => {
+            println!("  off. Rewards are optional and this node needs nothing to serve.");
+            println!("  To use one: install a companion, then `kmplify-node set rewards=on`.");
+            return EXIT_OK;
+        }
+        Companion::Missing(why) => {
+            println!("  {why}");
+            return EXIT_UNUSABLE;
+        }
+        Companion::Found(p) => println!("  {}", p.display()),
+    }
+
+    match rewards::ask(&companion, dir).await {
+        Ok(report) => {
+            println!("  {}", rewards::summary(&report));
+            if !report.account.is_empty() {
+                println!("  account  : {}", report.account);
+            }
+            if !report.destination.is_empty() {
+                println!("  paid to  : {}", report.destination);
+            }
+            // Said once. The companion usually says it too, and two
+            // sentences about the same thing read as boilerplate rather than
+            // as a warning.
+            if report.testnet && !report.note.to_ascii_lowercase().contains("test") {
+                println!("  note     : this rail is a TEST network — the balance is not money");
+            }
+            if !report.note.is_empty() {
+                println!("  note     : {}", report.note);
+            }
+            EXIT_OK
+        }
+        Err(e) => {
+            println!("  {e}");
+            EXIT_UNUSABLE
+        }
+    }
 }
 
 /// `peers`: who may use this machine, and the verbs that decide.
@@ -1108,6 +1210,9 @@ pub(crate) async fn start_node(cfg: WorkerConfig, dir: PathBuf) -> Node {
         Ok(c) => {
             let id = c.node_id.clone();
             status::update(move |s| s.node_id = id);
+            // The PUBLIC half, in its own file, so a companion never has to
+            // open the credential to learn the node id — see identity.rs.
+            kmplify_node::identity::publish_for(&dir, &c.node_id, &cfg.gateway_url);
             status::push_log(format!(
                 "node identity {}…",
                 &c.node_id[..8.min(c.node_id.len())]
@@ -1339,6 +1444,7 @@ async fn main() {
         }
         cli::Cmd::Id => run_id(&cfg).await,
         cli::Cmd::Peers => run_peers(&dir, &cfg, &cli).await,
+        cli::Cmd::Rewards => run_rewards(&dir, &cfg, &stored).await,
         cli::Cmd::Set => unreachable!("handled above"),
         cli::Cmd::Run => serve(cfg, dir).await,
         cli::Cmd::Tui => run_tui(cfg, dir, &cli).await,
