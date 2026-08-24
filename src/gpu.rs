@@ -549,22 +549,30 @@ pub async fn detect_all() -> Vec<Gpu> {
 /// `KMPLIFY_GPU_BACKEND` names one explicitly; the older `KMPLIFY_CUDA=1/0`
 /// still forces CUDA on or off, because deployments already set it.
 pub async fn detect() -> (Backend, Option<Gpu>) {
+    resolve_backend(&detect_all().await)
+}
+
+/// The same answer as [`detect`], from a card list already probed.
+///
+/// Split out because the two callers that matter both already have one:
+/// `kmplify-node check` prints every card it found AND says which one is
+/// advertised, and asking [`detect`] for the second half re-ran every vendor
+/// tool — eight subprocesses to answer one question, on the command an
+/// operator runs when something is already wrong and slow.
+pub fn resolve_backend(all: &[Gpu]) -> (Backend, Option<Gpu>) {
+    let find = |b: Backend| all.iter().find(|g| g.backend == b).cloned();
     if let Ok(forced) = std::env::var("KMPLIFY_GPU_BACKEND") {
         if let Some(b) = Backend::parse(&forced) {
-            let found = detect_all().await.into_iter().find(|g| g.backend == b);
-            return (b, found);
+            return (b, find(b));
         }
     }
     match std::env::var("KMPLIFY_CUDA").ok().as_deref() {
         Some("0") => return (Backend::Cpu, None),
-        Some("1") => {
-            let found = probe_cuda().await;
-            return (Backend::Cuda, found);
-        }
+        Some("1") => return (Backend::Cuda, find(Backend::Cuda)),
         _ => {}
     }
-    match detect_all().await.into_iter().next() {
-        Some(g) => (g.backend, Some(g)),
+    match all.first() {
+        Some(g) => (g.backend, Some(g.clone())),
         None => (Backend::Cpu, None),
     }
 }
