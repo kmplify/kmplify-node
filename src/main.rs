@@ -872,6 +872,208 @@ fn ceiling<T: std::fmt::Display>(v: Option<T>, unit: &str) -> String {
         .unwrap_or_else(|| "unset".into())
 }
 
+/// `peers`: who may use this machine, and the verbs that decide.
+///
+/// The dashboard's peers screen for a shell — same gateway calls, same
+/// wording — because the machines that most need manual admission are the
+/// ones nobody is sitting in front of. Works whether or not a node is
+/// running here: the decision lives on the gateway, and this speaks to it
+/// with the node's stored credential.
+async fn run_peers(dir: &std::path::Path, cfg: &WorkerConfig, cli: &cli::Cli) -> i32 {
+    // The gateway the RUNNING node uses wins over this shell's environment:
+    // asking the wrong gateway about "my consumers" answers about a node
+    // that is not this one.
+    let gateway = match status::read_published(dir) {
+        Some(s) if !s.gateway.is_empty() => s.gateway,
+        _ => cfg.gateway_url.clone(),
+    };
+    let Some(creds) = kmplify_node::peers::credential(&cfg.creds_path) else {
+        eprintln!(
+            "no node identity at {} — nothing has run here yet, so there is nobody to admit",
+            cfg.creds_path.display()
+        );
+        return EXIT_UNUSABLE;
+    };
+    let timeout = Duration::from_secs(10);
+
+    match cli.args.first().map(String::as_str) {
+        Some(verb @ ("approve" | "deny" | "block" | "clear")) => {
+            let consumer = &cli.args[1];
+            let decision = match verb {
+                "approve" => Some("approved"),
+                "deny" => Some("denied"),
+                "block" => Some("blocked"),
+                _ => None,
+            };
+            match kmplify_node::peers::decide(&gateway, &creds.token, consumer, decision, timeout)
+                .await
+            {
+                Ok(()) => {
+                    println!(
+                        "{consumer}: {}",
+                        match decision {
+                            Some("approved") => "approved — admitted from now on",
+                            Some("denied") =>
+                                "denied — refused quietly while manual admission is on",
+                            Some("blocked") => "blocked — refused in every mode",
+                            _ => "standing rule cleared — the admission mode decides again",
+                        }
+                    );
+                    EXIT_OK
+                }
+                Err(e) => {
+                    eprintln!("the gateway refused: {e}");
+                    EXIT_UNUSABLE
+                }
+            }
+        }
+        Some("invite") => {
+            let label = cli.args.get(1).cloned().unwrap_or_default();
+            match kmplify_node::peers::invite(&gateway, &creds.token, &label, timeout).await {
+                Ok(inv) => {
+                    // The id is the whole point of the command, so it goes on
+                    // stdout alone and unadorned: `INV=$(kmplify-node peers
+                    // invite laptop)` has to work.
+                    println!("{}", inv.invitation_id);
+                    if !inv.invite_url.is_empty() {
+                        eprintln!("share: {}", inv.invite_url);
+                    }
+                    eprintln!("an invitation always connects, manual admission or not");
+                    EXIT_OK
+                }
+                Err(e) => {
+                    eprintln!("could not mint an invitation: {e}");
+                    EXIT_UNUSABLE
+                }
+            }
+        }
+        Some("revoke") => {
+            match kmplify_node::peers::revoke(&gateway, &creds.token, &cli.args[1], timeout).await {
+                Ok(()) => {
+                    println!("{}: revoked", cli.args[1]);
+                    EXIT_OK
+                }
+                Err(e) => {
+                    eprintln!("could not revoke: {e}");
+                    EXIT_UNUSABLE
+                }
+            }
+        }
+        // Bare `peers` lists.
+        _ => match kmplify_node::peers::fetch(&gateway, &creds.token, timeout).await {
+            Ok(p) => {
+                if cli.json {
+                    print_peers_json(&p, cfg);
+                } else {
+                    print_peers_text(&p, cfg);
+                }
+                EXIT_OK
+            }
+            Err(e) => {
+                eprintln!("cannot ask {gateway}: {e}");
+                EXIT_UNUSABLE
+            }
+        },
+    }
+}
+
+fn print_peers_text(p: &kmplify_node::peers::Peers, cfg: &WorkerConfig) {
+    let mode = p.approval_mode.clone().unwrap_or_else(|| {
+        // Offline: the gateway has no live hello to report, so say what this
+        // node WOULD advertise rather than nothing.
+        format!(
+            "{} (node offline; this is the configured mode)",
+            cfg.approval_mode
+        )
+    });
+    println!("admission : {mode}");
+
+    // What the GATEWAY believes, falling back to the configured value only
+    // while the node is offline: the two differ exactly when a change has
+    // not been re-advertised yet, and the gateway's answer is the one that
+    // decides who gets in.
+    let manual = p.approval_mode.as_deref().unwrap_or(&cfg.approval_mode) == "manual";
+    println!("\nwaiting for a decision ({})", p.pending.len());
+    if p.pending.is_empty() && !manual {
+        println!("  none — admission is automatic, so nobody has to wait");
+    } else if p.pending.is_empty() {
+        println!("  none right now; unknown consumers appear here until you decide");
+    }
+    for x in &p.pending {
+        println!(
+            "  {:<24} waiting {:<8} asked for {}",
+            x.consumer,
+            human_duration(Duration::from_secs(x.first_seen_seconds.max(0) as u64)),
+            if x.model.is_empty() { "—" } else { &x.model }
+        );
+        println!("      kmplify-node peers approve {}", x.consumer);
+    }
+
+    println!("\nconsumers seen recently ({})", p.consumers.len());
+    for c in &p.consumers {
+        println!(
+            "  {:<24} {:<7} via {:<18} last seen {:<8} {}",
+            c.consumer,
+            if c.active { "active" } else { "idle" },
+            if c.via.is_empty() { "—" } else { &c.via },
+            human_duration(Duration::from_secs(c.last_seen_seconds.max(0) as u64)),
+            c.rule.clone().unwrap_or_default()
+        );
+    }
+
+    let live: Vec<_> = p.invitations.iter().filter(|i| !i.revoked).collect();
+    println!("\ninvitations ({})", live.len());
+    for i in live {
+        println!(
+            "  {}  {:<20} {}",
+            i.invitation_id,
+            if i.label.is_empty() {
+                "(no label)"
+            } else {
+                &i.label
+            },
+            if i.paused {
+                "held".to_string()
+            } else if i.consumer_active {
+                "in use".to_string()
+            } else {
+                "idle".to_string()
+            }
+        );
+    }
+}
+
+fn print_peers_json(p: &kmplify_node::peers::Peers, cfg: &WorkerConfig) {
+    let body = serde_json::json!({
+        "approval_mode": p.approval_mode.clone().unwrap_or_else(|| cfg.approval_mode.clone()),
+        "online": p.approval_mode.is_some(),
+        "pending": p.pending.iter().map(|x| serde_json::json!({
+            "consumer": x.consumer,
+            "waiting_seconds": x.first_seen_seconds,
+            "last_seen_seconds": x.last_seen_seconds,
+            "model": x.model,
+        })).collect::<Vec<_>>(),
+        "consumers": p.consumers.iter().map(|c| serde_json::json!({
+            "consumer": c.consumer,
+            "active": c.active,
+            "via": c.via,
+            "connected_for_seconds": c.connected_for_seconds,
+            "last_seen_seconds": c.last_seen_seconds,
+            "rule": c.rule,
+        })).collect::<Vec<_>>(),
+        "invitations": p.invitations.iter().filter(|i| !i.revoked).map(|i| serde_json::json!({
+            "invitation_id": i.invitation_id,
+            "label": i.label,
+            "paused": i.paused,
+            "consumer_active": i.consumer_active,
+        })).collect::<Vec<_>>(),
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&body).unwrap_or_default()
+    );
+}
+
 /// `id`: the handle consumers pin and invite. Registers if this install has
 /// never had one, because a node id that does not exist yet cannot be pinned.
 async fn run_id(cfg: &WorkerConfig) -> i32 {
@@ -1136,6 +1338,7 @@ async fn main() {
             run_check(&cfg, &stored, &from_env, gpus, cli.json, cli.probe_timeout).await
         }
         cli::Cmd::Id => run_id(&cfg).await,
+        cli::Cmd::Peers => run_peers(&dir, &cfg, &cli).await,
         cli::Cmd::Set => unreachable!("handled above"),
         cli::Cmd::Run => serve(cfg, dir).await,
         cli::Cmd::Tui => run_tui(cfg, dir, &cli).await,

@@ -40,6 +40,9 @@ pub enum Cmd {
     /// Change what this machine lends, durably — the dashboard's sharing
     /// screen for scripts and shells with no terminal.
     Set,
+    /// Who may use this machine: list them, and decide — the dashboard's
+    /// peers screen for scripts and shells with no terminal.
+    Peers,
     Version,
     Help,
 }
@@ -67,6 +70,8 @@ pub struct Cli {
     pub clear_all: bool,
     /// `set --list`: print the stored overrides and change nothing.
     pub list: bool,
+    /// `peers`: the verb and its argument, e.g. `["approve", "node-9"]`.
+    pub args: Vec<String>,
 }
 
 impl Default for Cli {
@@ -82,6 +87,7 @@ impl Default for Cli {
             clear: Vec::new(),
             clear_all: false,
             list: false,
+            args: Vec::new(),
         }
     }
 }
@@ -198,6 +204,7 @@ pub fn usage() -> String {
          \x20 kmplify-node status [--json]     one-shot report of the running node\n\
          \x20 kmplify-node id                  print this install's node id\n\
          \x20 kmplify-node set KEY=VALUE …     change what this machine lends, durably\n\
+         \x20 kmplify-node peers [VERB …]      who may use it; approve, block, invite\n\
          \x20 kmplify-node version | help\n\
          \n\
          DASHBOARD\n\
@@ -218,7 +225,7 @@ pub fn usage() -> String {
          \x20 kmplify-node set --list\n\
          \n\
          OPTIONS\n\
-         \x20 --json                 machine-readable output (check, status)\n\
+         \x20 --json                 machine-readable output (check, status, peers)\n\
          \x20 --timeout SECS         per-probe ceiling in check (default 5)\n\
          \x20 --attach               tui: require a running node, never start one\n\
          \x20 --standalone           tui: run the node in this process\n\
@@ -240,6 +247,22 @@ pub fn usage() -> String {
             format!("--[no-]{}", flag.trim_start_matches("--")),
             *key
         ));
+    }
+    out.push_str(
+        "\n\
+         ADMISSION\n\
+         \x20 `auto` lets any consumer use this machine; `manual` parks unknown ones\n\
+         \x20 until you decide. Invitations always connect, in either mode.\n\
+         \n\
+         \x20 kmplify-node set approval-mode=manual\n\
+         \x20 kmplify-node peers                    # who is waiting, who is using it\n\
+         \x20 kmplify-node peers approve node-9abc\n\
+         \x20 kmplify-node peers block anon-1a2b3c4d\n\
+         \n\
+         \x20 verbs:\n",
+    );
+    for (verb, _, help) in PEER_VERBS {
+        out.push_str(&format!("\x20   {:<20} {help}\n", *verb));
     }
     out.push_str("\n SETTINGS (for `set`), each overriding the variable beside it\n");
     for (key, var) in kmplify_node::settings::KEYS {
@@ -276,6 +299,10 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
                         .push((key.trim().to_string(), value.to_string()));
                     continue;
                 }
+                if cli.cmd == Cmd::Peers {
+                    cli.args.push(arg);
+                    continue;
+                }
                 return Err(format!("unexpected argument `{arg}`"));
             }
             cmd_seen = true;
@@ -286,6 +313,7 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
                 "status" => Cmd::Status,
                 "id" | "node-id" => Cmd::Id,
                 "set" | "config" => Cmd::Set,
+                "peers" | "consumers" => Cmd::Peers,
                 "version" => Cmd::Version,
                 "help" => Cmd::Help,
                 other => return Err(format!("unknown command `{other}`")),
@@ -356,8 +384,8 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
     if cli.attach && cli.standalone {
         return Err("--attach and --standalone ask for opposite things".into());
     }
-    if cli.json && !matches!(cli.cmd, Cmd::Check | Cmd::Status) {
-        return Err("--json applies to `check` and `status`".into());
+    if cli.json && !matches!(cli.cmd, Cmd::Check | Cmd::Status | Cmd::Peers) {
+        return Err("--json applies to `check`, `status` and `peers`".into());
     }
     if (cli.attach || cli.standalone) && cli.cmd != Cmd::Tui {
         return Err("--attach and --standalone apply to `tui`".into());
@@ -374,7 +402,65 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
     if cli.list && touches_settings {
         return Err("--list only reports; drop it to change a setting".into());
     }
+    if !cli.args.is_empty() && cli.cmd != Cmd::Peers {
+        return Err(format!("unexpected argument `{}`", cli.args[0]));
+    }
+    if cli.cmd == Cmd::Peers {
+        validate_peers(&cli.args)?;
+    }
     Ok(cli)
+}
+
+/// What `kmplify-node peers <verb>` accepts, and how many arguments each
+/// verb takes. One table, so the parser, the usage text and the runner
+/// cannot disagree about what is a verb.
+pub const PEER_VERBS: &[(&str, usize, &str)] = &[
+    (
+        "approve",
+        1,
+        "admit this consumer (a standing rule, so it holds)",
+    ),
+    ("deny", 1, "refuse quietly in manual mode"),
+    ("block", 1, "refuse in EVERY mode, invitations aside"),
+    (
+        "clear",
+        1,
+        "drop the standing rule; the admission mode decides again",
+    ),
+    ("invite", 0, "mint an invitation, optionally labelled"),
+    ("revoke", 1, "revoke an invitation by id"),
+];
+
+fn validate_peers(args: &[String]) -> Result<(), String> {
+    let Some(verb) = args.first() else {
+        return Ok(()); // bare `peers` lists
+    };
+    let Some((_, takes, _)) = PEER_VERBS.iter().find(|(v, _, _)| v == verb) else {
+        return Err(format!(
+            "unknown `peers` verb `{verb}` (one of: {})",
+            PEER_VERBS
+                .iter()
+                .map(|(v, _, _)| *v)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    };
+    let given = args.len() - 1;
+    // `invite` takes an OPTIONAL label; everything else needs exactly its
+    // argument, because approving nobody in particular is not a thing.
+    let ok = if verb == "invite" {
+        given <= 1
+    } else {
+        given == *takes
+    };
+    if !ok {
+        return Err(match verb.as_str() {
+            "invite" => "`peers invite` takes at most a label".to_string(),
+            "revoke" => "`peers revoke` needs an invitation id".to_string(),
+            _ => format!("`peers {verb}` needs a consumer id"),
+        });
+    }
+    Ok(())
 }
 
 /// The value for `name`, from `--flag=value` or the next argument.
@@ -496,6 +582,65 @@ mod tests {
         );
         assert!(parse(&args(&["check", "--timeout", "0"])).is_err());
         assert!(parse(&args(&["check", "--timeout", "soon"])).is_err());
+    }
+
+    #[test]
+    fn peers_lists_by_default_and_decides_when_asked() {
+        assert_eq!(parse(&args(&["peers"])).unwrap().cmd, Cmd::Peers);
+        let cli = parse(&args(&["peers", "approve", "node-9"])).unwrap();
+        assert_eq!(cli.args, vec!["approve".to_string(), "node-9".to_string()]);
+        assert!(parse(&args(&["peers", "--json"])).is_ok());
+    }
+
+    #[test]
+    fn a_decision_needs_someone_to_decide_about() {
+        // "approve" on its own would otherwise be a call with an empty
+        // consumer id, which the gateway would happily store a rule for.
+        for verb in ["approve", "deny", "block", "clear", "revoke"] {
+            assert!(parse(&args(&["peers", verb])).is_err(), "{verb}");
+            assert!(
+                parse(&args(&["peers", verb, "x"])).is_ok(),
+                "{verb} with an argument"
+            );
+            assert!(
+                parse(&args(&["peers", verb, "x", "y"])).is_err(),
+                "{verb} extra"
+            );
+        }
+    }
+
+    #[test]
+    fn an_invitation_label_is_optional_but_at_most_one() {
+        assert!(parse(&args(&["peers", "invite"])).is_ok());
+        assert!(parse(&args(&["peers", "invite", "Anna's phone"])).is_ok());
+        assert!(parse(&args(&["peers", "invite", "a", "b"])).is_err());
+    }
+
+    #[test]
+    fn an_unknown_peers_verb_is_refused_rather_than_listing() {
+        // Silently listing would be worse than an error: a typo'd `blcok`
+        // would look like it worked.
+        let err = parse(&args(&["peers", "blcok", "node-9"])).unwrap_err();
+        assert!(err.contains("unknown"), "{err}");
+        assert!(err.contains("block"), "the error names the real verbs");
+    }
+
+    #[test]
+    fn peers_arguments_belong_to_peers_alone() {
+        assert!(parse(&args(&["status", "approve"])).is_err());
+        assert!(parse(&args(&["check", "node-9"])).is_err());
+    }
+
+    #[test]
+    fn the_usage_text_documents_every_peers_verb() {
+        let text = usage();
+        for (verb, _, _) in PEER_VERBS {
+            assert!(text.contains(verb), "{verb} missing from usage");
+        }
+        assert!(
+            text.contains("approval-mode"),
+            "how to switch mode is missing"
+        );
     }
 
     #[test]

@@ -182,6 +182,25 @@ would park every unknown consumer and nobody at the terminal could let them
 in. The screen talks to the gateway as the node, with the credential in
 `KMPLIFY_NODE_DIR`; an unreachable gateway costs the screen and nothing else.
 
+### Admission from a script
+
+The mode is a setting like any other, and the decisions have their own verbs,
+so a machine with no terminal in front of it is still yours to govern:
+
+```sh
+kmplify-node set approval-mode=manual   # unknown consumers wait for you
+kmplify-node peers                      # who is waiting, who is using it
+kmplify-node peers approve node-9abc    # standing rule: they are in
+kmplify-node peers block anon-1a2b3c4d  # refused in every mode
+kmplify-node peers clear node-9abc      # back to whatever the mode says
+kmplify-node peers invite "Anna's phone"   # prints the invitation id
+kmplify-node peers revoke <invitation-id>
+```
+
+`peers` talks to the gateway with the node's stored credential, so it works
+whether or not the node is currently running — approving from cron is fine.
+Invitations bypass manual admission by design: minting one is the approval.
+
 For scripts and monitoring, the same snapshot without the full screen:
 
 ```sh
