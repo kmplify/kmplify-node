@@ -2755,8 +2755,13 @@ fn draw_holding(f: &mut Frame, app: &App, area: Rect) {
                 MUTED
             }),
         ),
-        field("finished "),
-        Span::styled(format!("{:<8}", s.jobs.done), Style::new().fg(ACCENT)),
+        field("served "),
+        // Every lane, not just inference: a node hosting only functions is
+        // not an idle node.
+        Span::styled(
+            format!("{:<8}", s.delivered.calls()),
+            Style::new().fg(ACCENT),
+        ),
         field("fabric disk "),
         Span::styled(
             match s.fabric_disk_mb {
