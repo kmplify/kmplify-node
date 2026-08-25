@@ -1,0 +1,17 @@
+[package]
+name = "hash"
+version = "1.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+
+# Size first: every provider downloads these bytes once per hash, and a
+# sandbox with no allocator pressure gains nothing from speed tuning.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -17,6 +17,13 @@ readme = "README.md"
 keywords = ["gpu", "inference", "ollama", "peer-to-peer", "self-hosted"]
 categories = ["command-line-utilities", "network-programming"]
 
+# The catalog's function sources under functions/ are their own tiny crates,
+# built for wasm32-wasip1 by functions/build.sh and never as part of the node.
+# Excluded explicitly so `cargo test` here does not try to build a WASI
+# command for the host.
+[workspace]
+exclude = ["functions"]
+
 [lib]
 name = "kmplify_node"
 path = "src/lib.rs"
