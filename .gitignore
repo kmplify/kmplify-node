@@ -11,3 +11,9 @@ fabric_node.json
 # Build outputs of packaging/Dockerfile.node-build and the runtime image.
 /dist-node
 /dist
+
+# The catalog modules' own build output. The .wasm the fabric serves is
+# committed in the GATEWAY's repository (it is what gets signed); what lives
+# here is the source that produces it.
+/functions/*/target
+/functions/dist

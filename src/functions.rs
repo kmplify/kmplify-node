@@ -24,6 +24,7 @@
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
 #[cfg(feature = "wasm")]
 use std::time::{Duration, Instant};
 
@@ -395,9 +396,23 @@ pub fn run_module(
     let engine_for_timer = engine.clone();
     let timeout = Duration::from_millis(limits.timeout_ms);
     let started = Instant::now();
+    // The deadline thread waits on a CONDITION, not on a sleep. It used to
+    // sleep the whole budget and be joined afterwards, so every call took
+    // exactly its declared timeout no matter how fast the module was: a 1 ms
+    // function with a 10 s ceiling answered in 10 s. The limit is a ceiling,
+    // not a schedule.
+    let finished = Arc::new((Mutex::new(false), Condvar::new()));
+    let watched = finished.clone();
     let timer = std::thread::spawn(move || {
-        std::thread::sleep(timeout);
-        engine_for_timer.increment_epoch();
+        let (done, wake) = &*watched;
+        let guard = done.lock().unwrap_or_else(|p| p.into_inner());
+        let (guard, _) = wake
+            .wait_timeout_while(guard, timeout, |done| !*done)
+            .unwrap_or_else(|p| p.into_inner());
+        if !*guard {
+            // Still running when the budget ran out: trap it.
+            engine_for_timer.increment_epoch();
+        }
     });
 
     let instance = linker
@@ -410,6 +425,12 @@ pub fn run_module(
     let outcome = start.call(&mut store, ());
     let duration_ms = started.elapsed().as_millis() as u64;
     drop(store);
+    {
+        let (done, wake) = &*finished;
+        let mut guard = done.lock().unwrap_or_else(|p| p.into_inner());
+        *guard = true;
+        wake.notify_all();
+    }
     let _ = timer.join();
 
     let exit_code = match outcome {
@@ -645,6 +666,32 @@ mod tests {
     }
 
     #[cfg(feature = "wasm")]
+    #[test]
+    fn a_fast_module_answers_as_fast_as_it_ran() {
+        // The regression this guards is not subtle once seen: the deadline
+        // thread used to sleep the whole budget and be joined, so every call
+        // cost its declared timeout. A catalog whose limits are 10 s answered
+        // every request in 10 s, which is a lane nobody would use twice.
+        let wasm = wat::parse_str(ECHO_WAT).expect("echo module assembles");
+        let started = Instant::now();
+        let out = run_module(
+            &wasm,
+            b"quick",
+            &[],
+            Limits {
+                memory_mb: 16,
+                timeout_ms: 10_000,
+            },
+        )
+        .expect("echo runs");
+        assert_eq!(out.stdout, b"quick");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a 1 ms module held the call for {:?} of its 10 s budget",
+            started.elapsed()
+        );
+    }
+
     #[test]
     fn a_spinning_module_is_stopped_by_the_clock() {
         let wasm = wat::parse_str(SPIN_WAT).expect("spin module assembles");
