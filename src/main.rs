@@ -695,6 +695,19 @@ async fn run_check(
     }
 }
 
+/// Compute time, in the unit it actually happened in.
+///
+/// Seconds hide the answer when the answer is milliseconds: a node that
+/// served two functions in 40 ms should not read "0s of compute" and look
+/// like it did nothing.
+fn human_compute(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms} ms")
+    } else {
+        human_duration(Duration::from_millis(ms))
+    }
+}
+
 fn human_duration(d: Duration) -> String {
     let s = d.as_secs();
     match s {
@@ -779,11 +792,22 @@ fn run_status(dir: &std::path::Path, json: bool) -> i32 {
         snap.jobs.active, snap.jobs.done, snap.jobs.failed, snap.jobs.avg_ms
     );
     println!("  sessions : {}", snap.sessions.len());
+    let d = &snap.delivered;
     println!(
-        "  delivered: {} jobs, {} of hosted sessions",
-        snap.delivered.jobs,
-        human_duration(Duration::from_secs(snap.delivered.session_seconds))
+        "  delivered: {} calls ({} inference · {} functions · {} vector) in {} of compute",
+        d.calls(),
+        d.jobs,
+        d.functions,
+        d.vector_ops,
+        human_compute(d.compute_ms())
     );
+    if d.sessions > 0 || d.session_seconds > 0 {
+        println!(
+            "  hosted   : {} sessions, {} of machine time",
+            d.sessions,
+            human_duration(Duration::from_secs(d.session_seconds))
+        );
+    }
     EXIT_OK
 }
 
@@ -923,9 +947,18 @@ async fn run_rewards(dir: &std::path::Path, cfg: &WorkerConfig, stored: &Setting
             human_duration(snap.uptime())
         );
         println!(
-            "  jobs     : {} answered in {:.1} s of compute",
+            "  calls    : {} in {:.1} s of compute",
+            d.calls(),
+            d.compute_ms() as f64 / 1000.0
+        );
+        println!(
+            "    inference {} ({:.1} s) · functions {} ({:.1} s) · vector {} ({:.1} s)",
             d.jobs,
-            d.job_ms as f64 / 1000.0
+            d.job_ms as f64 / 1000.0,
+            d.functions,
+            d.function_ms as f64 / 1000.0,
+            d.vector_ops,
+            d.vector_ms as f64 / 1000.0
         );
         println!(
             "  sessions : {} hosted, {} of machine time",

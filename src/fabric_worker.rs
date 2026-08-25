@@ -4055,12 +4055,23 @@ async fn session(
                         }
                     }
                     Some("job") if frame["kind"].as_str() == Some("function") => {
-                        crate::status::count_function_call();
-                        tokio::spawn(run_function(sink.clone(), client.clone(), cfg.clone(), frame));
+                        // Counted like an inference job, and for the same
+                        // reason: what a provider gave up is the machine for
+                        // the length of the call, whatever lane it came down.
+                        let (sink, client, cfg) = (sink.clone(), client.clone(), cfg.clone());
+                        tokio::spawn(async move {
+                            let _counted =
+                                crate::status::JobGuard::lane(crate::status::Lane::Function);
+                            run_function(sink, client, cfg, frame).await;
+                        });
                     }
                     Some("job") if frame["kind"].as_str().is_some_and(|k| k.starts_with("vector_")) => {
-                        crate::status::count_vector_op();
-                        tokio::spawn(run_vector_job(sink.clone(), store.clone(), frame));
+                        let (sink, store) = (sink.clone(), store.clone());
+                        tokio::spawn(async move {
+                            let _counted =
+                                crate::status::JobGuard::lane(crate::status::Lane::Vector);
+                            run_vector_job(sink, store, frame).await;
+                        });
                     }
                     Some("job") => {
                         // Counted around the spawn, not inside run_job: the
