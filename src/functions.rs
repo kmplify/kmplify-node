@@ -24,6 +24,7 @@
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "wasm")]
 use std::sync::{Arc, Condvar, Mutex};
 #[cfg(feature = "wasm")]
 use std::time::{Duration, Instant};
@@ -692,6 +693,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "wasm")]
     #[test]
     fn a_spinning_module_is_stopped_by_the_clock() {
         let wasm = wat::parse_str(SPIN_WAT).expect("spin module assembles");

@@ -71,13 +71,19 @@ It gained a `delivered` block for this:
 
 ```json
 "delivered": {
-  "jobs": 914,
-  "job_ms": 742100,
-  "sessions": 3,
-  "session_seconds": 51840,
+  "jobs": 914,          "job_ms": 742100,
+  "functions": 51,      "function_ms": 1840,
+  "vector_ops": 210,    "vector_ms": 990,
+  "sessions": 3,        "session_seconds": 51840,
   "since_ms": 1787600000000
 }
 ```
+
+Every lane a peer can reach this node through is in there. A node that hosts
+only functions has served plenty, and reporting "0 jobs" for it would be the
+kind of accurate-but-useless answer that makes an operator think nobody wants
+their machine. Sessions stay in *seconds held* rather than compute, because
+holding a GPU for an hour and computing for an hour are not the same gift.
 
 Counted since the process started, and deliberately **not** persisted. A
 lifetime total kept by a node about its own earnings would be a ledger, and a

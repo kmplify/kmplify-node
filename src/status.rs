@@ -145,12 +145,39 @@ pub struct Delivered {
     pub jobs: u64,
     /// Wall-clock spent answering them, in ms.
     pub job_ms: u64,
+    /// Signed Wasm functions run for a peer.
+    pub functions: u64,
+    /// Wall-clock those calls held this machine — the whole call (verify,
+    /// fetch, sandbox), not the guest's own instruction time. What a
+    /// provider gave up is the machine.
+    pub function_ms: u64,
+    /// Vector-collection operations served (upsert, query, delete, drop).
+    pub vector_ops: u64,
+    pub vector_ms: u64,
     /// Peer sessions hosted to completion.
     pub sessions: u64,
     /// Seconds those sessions held this machine.
     pub session_seconds: u64,
     /// When the count started, unix ms — the process start.
     pub since_ms: u64,
+}
+
+impl Delivered {
+    /// Every call this node answered, whatever lane it came down.
+    ///
+    /// The headline number, because a node hosting only functions served
+    /// plenty and used to report "0 jobs delivered" — which reads as a node
+    /// nobody wanted.
+    pub fn calls(&self) -> u64 {
+        self.jobs + self.functions + self.vector_ops
+    }
+
+    /// Wall-clock spent on other people's work, in ms. Sessions are not in
+    /// it: they are counted in seconds HELD, which is a different and much
+    /// larger thing than compute time.
+    pub fn compute_ms(&self) -> u64 {
+        self.job_ms + self.function_ms + self.vector_ms
+    }
 }
 
 /// A peer's container currently running on this machine.
@@ -309,7 +336,9 @@ static JOBS_FAILED: AtomicU64 = AtomicU64::new(0);
 static JOBS_TOTAL_MS: AtomicU64 = AtomicU64::new(0);
 static JOBS_LAST_MS: AtomicU64 = AtomicU64::new(0);
 static FUNCTION_CALLS: AtomicU64 = AtomicU64::new(0);
+static FUNCTION_MS: AtomicU64 = AtomicU64::new(0);
 static VECTOR_OPS: AtomicU64 = AtomicU64::new(0);
+static VECTOR_MS: AtomicU64 = AtomicU64::new(0);
 static SESSIONS_HOSTED: AtomicU64 = AtomicU64::new(0);
 static SESSION_SECONDS: AtomicU64 = AtomicU64::new(0);
 static RECONNECTS: AtomicU64 = AtomicU64::new(0);
@@ -361,6 +390,10 @@ pub fn snapshot() -> Snapshot {
     s.delivered = Delivered {
         jobs: done,
         job_ms: JOBS_TOTAL_MS.load(Ordering::Relaxed),
+        functions: FUNCTION_CALLS.load(Ordering::Relaxed),
+        function_ms: FUNCTION_MS.load(Ordering::Relaxed),
+        vector_ops: VECTOR_OPS.load(Ordering::Relaxed),
+        vector_ms: VECTOR_MS.load(Ordering::Relaxed),
         sessions: SESSIONS_HOSTED.load(Ordering::Relaxed),
         session_seconds: SESSION_SECONDS.load(Ordering::Relaxed),
         since_ms: s.started_at_ms,
@@ -460,24 +493,46 @@ pub fn clock_hms(ms: u64) -> String {
     )
 }
 
-/// One inference job, counted for as long as this guard lives.
+/// Which lane a piece of work came down. All three are work this machine did
+/// for someone else, and all three belong in what it delivered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lane {
+    /// Chat and embeddings against the local model server.
+    Inference,
+    /// A signed Wasm function, in the sandbox.
+    Function,
+    /// An operation on a vector collection held here.
+    Vector,
+}
+
+/// One piece of work, counted for as long as this guard lives.
 ///
-/// RAII because the job paths have many early returns (bad model, dead
-/// upstream, refused kind) and a counter that is only decremented on the
-/// happy path reads as "12 jobs running" on an idle node forever.
+/// RAII because every lane has early returns (bad model, dead upstream,
+/// refused kind, unreadable manifest) and a counter that is only decremented
+/// on the happy path reads as "12 jobs running" on an idle node forever.
+/// A call that failed still held the machine, so it still counts as served;
+/// `Jobs::failed` is what says how many went wrong.
 pub struct JobGuard {
     started: std::time::Instant,
+    lane: Lane,
 }
 
 impl JobGuard {
+    /// An inference job for `model`.
     pub fn start(model: &str) -> Self {
-        JOBS_ACTIVE.fetch_add(1, Ordering::Relaxed);
         if !model.is_empty() {
             let model = model.to_string();
             update(|s| s.jobs.last_model = model);
         }
+        Self::lane(Lane::Inference)
+    }
+
+    /// Work in one of the other lanes.
+    pub fn lane(lane: Lane) -> Self {
+        JOBS_ACTIVE.fetch_add(1, Ordering::Relaxed);
         Self {
             started: std::time::Instant::now(),
+            lane,
         }
     }
 }
@@ -496,18 +551,24 @@ impl Drop for JobGuard {
     fn drop(&mut self) {
         let ms = self.started.elapsed().as_millis() as u64;
         JOBS_ACTIVE.fetch_sub(1, Ordering::Relaxed);
-        JOBS_DONE.fetch_add(1, Ordering::Relaxed);
-        JOBS_TOTAL_MS.fetch_add(ms, Ordering::Relaxed);
-        JOBS_LAST_MS.store(ms, Ordering::Relaxed);
+        match self.lane {
+            Lane::Inference => {
+                JOBS_DONE.fetch_add(1, Ordering::Relaxed);
+                JOBS_TOTAL_MS.fetch_add(ms, Ordering::Relaxed);
+                // "Last job" stays the inference one: it is the figure a
+                // provider reads to see their model server responding.
+                JOBS_LAST_MS.store(ms, Ordering::Relaxed);
+            }
+            Lane::Function => {
+                FUNCTION_CALLS.fetch_add(1, Ordering::Relaxed);
+                FUNCTION_MS.fetch_add(ms, Ordering::Relaxed);
+            }
+            Lane::Vector => {
+                VECTOR_OPS.fetch_add(1, Ordering::Relaxed);
+                VECTOR_MS.fetch_add(ms, Ordering::Relaxed);
+            }
+        }
     }
-}
-
-pub fn count_function_call() {
-    FUNCTION_CALLS.fetch_add(1, Ordering::Relaxed);
-}
-
-pub fn count_vector_op() {
-    VECTOR_OPS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// One peer session ended after holding this machine for `seconds`.
@@ -703,6 +764,17 @@ pub fn clear_published(node_dir: &Path) {
 mod tests {
     use super::*;
 
+    /// The counters are process-global, so the tests that assert deltas on
+    /// them run one at a time. Without this they pass alone and fail
+    /// together, which is the most expensive kind of green.
+    fn counters() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        match LOCK.get_or_init(|| Mutex::new(())).lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
     #[test]
     fn clock_formats_utc_hms() {
         assert_eq!(clock_hms(0), "00:00:00");
@@ -735,6 +807,68 @@ mod tests {
         assert_eq!(back.node_id, "old");
         assert_eq!(back.link, Link::Starting);
         assert!(back.models.is_empty());
+    }
+
+    #[test]
+    fn every_lane_lands_in_delivered() {
+        let _serial = counters();
+        // The regression this guards: a node hosting only functions reported
+        // "0 jobs delivered", which reads as a node nobody wanted.
+        let before = snapshot().delivered;
+        drop(JobGuard::lane(Lane::Function));
+        drop(JobGuard::lane(Lane::Vector));
+        let after = snapshot().delivered;
+        assert_eq!(after.functions, before.functions + 1);
+        assert_eq!(after.vector_ops, before.vector_ops + 1);
+        assert_eq!(after.calls(), before.calls() + 2);
+        // Inference is untouched by the other lanes: the split still means
+        // something.
+        assert_eq!(after.jobs, before.jobs);
+    }
+
+    #[test]
+    fn a_lane_that_is_not_inference_leaves_the_last_job_alone() {
+        let _serial = counters();
+        // "last model, in N ms" is the line a provider reads to see their
+        // model server answering; a function call must not overwrite it.
+        drop(JobGuard::start("llama3"));
+        let after_inference = snapshot().jobs.last_ms;
+        drop(JobGuard::lane(Lane::Function));
+        assert_eq!(snapshot().jobs.last_ms, after_inference);
+        assert_eq!(snapshot().jobs.last_model, "llama3");
+    }
+
+    #[test]
+    fn work_in_flight_counts_whatever_lane_it_is_in() {
+        let _serial = counters();
+        let idle = snapshot().jobs.active;
+        let guard = JobGuard::lane(Lane::Function);
+        assert_eq!(
+            snapshot().jobs.active,
+            idle + 1,
+            "a running function is work"
+        );
+        drop(guard);
+        assert_eq!(snapshot().jobs.active, idle);
+    }
+
+    #[test]
+    fn compute_time_adds_up_but_held_sessions_do_not() {
+        // Sessions are counted in seconds HELD, which is a much larger thing
+        // than compute; mixing them would flatter every provider.
+        let d = Delivered {
+            jobs: 2,
+            job_ms: 300,
+            functions: 3,
+            function_ms: 60,
+            vector_ops: 5,
+            vector_ms: 40,
+            sessions: 1,
+            session_seconds: 3_600,
+            since_ms: 0,
+        };
+        assert_eq!(d.calls(), 10);
+        assert_eq!(d.compute_ms(), 400);
     }
 
     #[test]
