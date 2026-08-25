@@ -44,6 +44,10 @@ decision anyone should make about a binary they cannot read.
   kmplify-node set functions=true functions-pubkey=$(curl -s https://fabric.kmplify.io/v1/functions | jq -r .pubkey)
   ```
 
+  The modules the public fabric asks nodes to run are in
+  [functions/](functions/) — source, build script and hashes — because a
+  signature says where bytes came from, not what they do.
+
 ### Hardware support
 
 | Platform | Accelerator | Serves inference | Hosts container sessions |
