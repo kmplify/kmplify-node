@@ -56,6 +56,12 @@ pub const KNOWN: &[Known] = &[
         hint: "`llama-server -m model.gguf` serves OpenAI-compatible on :8080",
     },
     Known {
+        id: "mlx",
+        name: "MLX",
+        default_base: "http://127.0.0.1:8080",
+        hint: "`mlx_lm.server` serves OpenAI-compatible on :8080 (Apple Silicon)",
+    },
+    Known {
         id: "vllm",
         name: "vLLM",
         default_base: "http://127.0.0.1:8000",
@@ -94,6 +100,7 @@ pub fn known(id: &str) -> Option<&'static Known> {
     let id = match id.as_str() {
         "llama.cpp" | "llama-cpp" | "llama_cpp" | "llamaserver" | "llama-server" => "llamacpp",
         "lm-studio" | "lm_studio" | "lm studio" => "lmstudio",
+        "mlx-lm" | "mlx_lm" => "mlx",
         other => other,
     }
     .to_string();
@@ -135,20 +142,28 @@ pub fn classify(base: &str, tags_answered: bool, owned_by: &[String]) -> (String
     if has("organization_owner") || has("lmstudio") || has("lm studio") {
         return ("lmstudio".into(), "LM Studio".into());
     }
+    if has("mlx") {
+        return ("mlx".into(), "MLX".into());
+    }
     if has("kmplify-fabric") {
         // Pointing a node at a fabric gateway would relay peers to peers;
         // name it so the wizard can refuse it as a local engine.
         return ("fabric".into(), "a KMPLIFY fabric gateway".into());
     }
-    // No evidence: fall back to the port's usual tenant, saying it is a
-    // guess by keeping the generic id.
-    for k in KNOWN {
-        if base.trim_end_matches('/') == k.default_base {
-            return (
-                "openai-compatible".into(),
-                format!("OpenAI-compatible ({}?)", k.name),
-            );
-        }
+    // No evidence: fall back to the port's usual tenants, saying it is a
+    // guess by keeping the generic id. Plural on purpose — llama.cpp and MLX
+    // share :8080, and naming only one would be a coin toss dressed up as
+    // detection.
+    let tenants: Vec<&str> = KNOWN
+        .iter()
+        .filter(|k| base.trim_end_matches('/') == k.default_base)
+        .map(|k| k.name)
+        .collect();
+    if !tenants.is_empty() {
+        return (
+            "openai-compatible".into(),
+            format!("OpenAI-compatible ({}?)", tenants.join(" or ")),
+        );
     }
     ("openai-compatible".into(), "OpenAI-compatible".into())
 }
@@ -209,7 +224,11 @@ pub async fn scan() -> Vec<Found> {
         .timeout(Duration::from_secs(2))
         .build()
         .unwrap_or_default();
-    let probes = KNOWN.iter().map(|k| probe(&client, k.default_base));
+    // Each BASE once: llama.cpp and MLX share a default port, and probing
+    // the same endpoint twice would list one server as two engines.
+    let mut bases: Vec<&str> = KNOWN.iter().map(|k| k.default_base).collect();
+    bases.dedup();
+    let probes = bases.into_iter().map(|b| probe(&client, b));
     let results = futures_util::future::join_all(probes).await;
     let mut found: Vec<Found> = results.into_iter().flatten().collect();
     // Two entries answering with the same identity on different ports is one
@@ -260,6 +279,14 @@ mod tests {
         let (id, name) = classify("http://127.0.0.1:8000", false, &[]);
         assert_eq!(id, "openai-compatible");
         assert!(name.contains("vLLM?"), "{name}");
+        // …a SHARED port names every usual tenant rather than a coin toss…
+        let (_, name8080) = classify("http://127.0.0.1:8080", false, &[]);
+        assert!(
+            name8080.contains("llama.cpp") && name8080.contains("MLX"),
+            "{name8080}"
+        );
+        let (id, _) = classify("http://127.0.0.1:8080", false, &["mlx".to_string()]);
+        assert_eq!(id, "mlx", "evidence beats the port guess");
         // …and on an unknown one nothing is invented.
         let (id, name) = classify("http://10.0.0.7:9090", false, &[]);
         assert_eq!(id, "openai-compatible");

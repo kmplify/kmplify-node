@@ -110,11 +110,39 @@ impl Io {
     }
 }
 
+/// The engine decision: running now, chosen for later, or none.
+enum EngineChoice {
+    Running(engines::Found),
+    /// Not running yet; the operator picked it anyway. The node will connect
+    /// and advertise nothing until it answers — said out loud, not hidden.
+    Planned(&'static engines::Known),
+    None,
+}
+
+impl EngineChoice {
+    fn base(&self) -> Option<String> {
+        match self {
+            EngineChoice::Running(f) => Some(f.base.clone()),
+            EngineChoice::Planned(k) => Some(k.default_base.to_string()),
+            EngineChoice::None => None,
+        }
+    }
+}
+
 /// What the wizard decided, applied to `settings` only at the very end.
+/// Capacities stay the strings the operator typed ("24g", "500"), because
+/// `Settings::set` owns the unit parsing and the wizard must not grow a
+/// second one that could disagree.
 struct Choices {
     engine: Option<String>,
+    colibri: Option<String>,
     share_inference: bool,
     share_cpu: bool,
+    workloads: Option<String>,
+    max_cpus: Option<String>,
+    max_vram: Option<String>,
+    max_ram: Option<String>,
+    max_disk: Option<String>,
     approval_manual: bool,
     country: String,
     functions: Option<String>, // Some(pubkey) = on, trusting this key
@@ -141,11 +169,11 @@ async fn walk(io: &Io, cfg: &WorkerConfig, dir: &std::path::Path) -> Result<i32,
     );
     println!(
         "   {}",
-        io.dim("Six steps. Nothing is shared until you confirm the summary; Ctrl-C abandons all of it.")
+        io.dim("Seven steps. Nothing is shared until you confirm the summary; Ctrl-C abandons all of it.")
     );
 
     // ------------------------------------------------------- 1: the machine
-    io.step(1, 6, "this machine");
+    io.step(1, 7, "this machine");
     hostcpu::start();
     let gpus = gpu::detect_all().await;
     let (accel, primary) = gpu::resolve_backend(&gpus);
@@ -174,7 +202,7 @@ async fn walk(io: &Io, cfg: &WorkerConfig, dir: &std::path::Path) -> Result<i32,
     );
 
     // ------------------------------------------------------- 2: the engine
-    io.step(2, 6, "inference engine");
+    io.step(2, 7, "inference engine");
     println!("   {}", io.dim("scanning localhost for running engines…"));
     let mut found = engines::scan().await;
     // A fabric gateway is not a local engine; offering it would relay peers
@@ -193,24 +221,53 @@ async fn walk(io: &Io, cfg: &WorkerConfig, dir: &std::path::Path) -> Result<i32,
         }
     });
 
-    let engine: Option<engines::Found> = loop {
-        if found.is_empty() {
-            println!("   nothing is listening on the usual ports. The engines this node can lend:");
-            for k in engines::KNOWN {
-                println!("     {:<10} {}", io.strong(k.id), io.dim(k.hint));
-            }
-        } else {
-            for (i, f) in found.iter().enumerate() {
+    // Colibri is not a primary engine but a SECOND upstream (frontier MoE
+    // models streamed from NVMe, advertised alongside the engine's). It gets
+    // its own question below rather than a slot in this menu.
+    let colibri_base = engines::known("colibri").map(|k| k.default_base.to_string());
+    let colibri_seen = found
+        .iter()
+        .any(|f| Some(f.base.as_str()) == colibri_base.as_deref());
+    found.retain(|f| Some(f.base.as_str()) != colibri_base.as_deref());
+
+    let engine: EngineChoice = loop {
+        // The whole roster, every time: what is running is pickable now, and
+        // what is not running is pickable FOR LATER — an operator setting up
+        // tonight's vLLM box should not be told to come back tomorrow.
+        let mut n = 0usize;
+        if !found.is_empty() {
+            println!("   {}", io.dim("running now:"));
+            for f in found.iter() {
+                n += 1;
                 let models = match f.models.len() {
                     0 => io.warn("0 models — online but would refuse every job"),
-                    n => io.good(&format!("{n} model(s)")),
+                    c => io.good(&format!("{c} model(s)")),
                 };
-                println!("   {}) {:<10} {:<28} {}", i + 1, f.name, f.base, models);
+                println!("   {n}) {:<10} {:<28} {}", f.name, f.base, models);
             }
         }
-        let extra_url = found.len() + 1;
-        let extra_rescan = found.len() + 2;
-        let extra_none = found.len() + 3;
+        let roster: Vec<&'static engines::Known> = engines::KNOWN
+            .iter()
+            .filter(|k| k.id != "colibri")
+            .filter(|k| {
+                !found
+                    .iter()
+                    .any(|f| f.base == k.default_base || f.id == k.id)
+            })
+            .collect();
+        if !roster.is_empty() {
+            println!(
+                "   {}",
+                io.dim("not running — pick one to set it up for later:")
+            );
+            for k in &roster {
+                n += 1;
+                println!("   {n}) {:<10} {}", k.name, io.dim(k.hint));
+            }
+        }
+        let extra_url = n + 1;
+        let extra_rescan = n + 2;
+        let extra_none = n + 3;
         println!("   {}) somewhere else (enter a URL)", extra_url);
         println!("   {}) rescan", extra_rescan);
         println!(
@@ -226,33 +283,69 @@ async fn walk(io: &Io, cfg: &WorkerConfig, dir: &std::path::Path) -> Result<i32,
         // A pasted URL is an answer to the question, not a menu mistake.
         if answer.starts_with("http://") || answer.starts_with("https://") {
             match probe_custom(io, &answer).await {
-                Some(f) => break Some(f),
+                Some(f) => break EngineChoice::Running(f),
                 None => continue,
             }
         }
         match answer.parse::<usize>() {
-            Ok(n) if n >= 1 && n <= found.len() => break Some(found[n - 1].clone()),
-            Ok(n) if n == extra_url => {
+            Ok(x) if x >= 1 && x <= found.len() => {
+                break EngineChoice::Running(found[x - 1].clone())
+            }
+            Ok(x) if x > found.len() && x <= found.len() + roster.len() => {
+                let k = roster[x - 1 - found.len()];
+                println!(
+                    "   {} {} is saved as the engine; the node will connect and advertise nothing until it answers at {}",
+                    io.warn("planned:"),
+                    k.name,
+                    k.default_base
+                );
+                println!("   {}", io.dim(k.hint));
+                break EngineChoice::Planned(k);
+            }
+            Ok(x) if x == extra_url => {
                 let url = io.ask("engine URL", "")?;
                 match probe_custom(io, &url).await {
-                    Some(f) => break Some(f),
+                    Some(f) => break EngineChoice::Running(f),
                     None => continue,
                 }
             }
-            Ok(n) if n == extra_rescan => {
+            Ok(x) if x == extra_rescan => {
                 found = engines::scan().await;
                 found.retain(|f| f.id != "fabric");
+                found.retain(|f| Some(f.base.as_str()) != colibri_base.as_deref());
                 continue;
             }
-            Ok(n) if n == extra_none => break None,
+            Ok(x) if x == extra_none => break EngineChoice::None,
             _ => println!("   {}", io.dim("pick a number from the list")),
         }
     };
 
+    // Colibri, only when something is where colibri usually listens: it is
+    // an addition to the engine, not an alternative.
+    let colibri = if colibri_seen {
+        let base = colibri_base.clone().unwrap_or_default();
+        println!(
+            "   {}",
+            io.dim(&format!(
+                "something answers at {base}, where colibri usually runs"
+            ))
+        );
+        if io.ask_yn(
+            "also lend the frontier MoE models colibri streams from NVMe?",
+            true,
+        )? {
+            Some(base)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // ------------------------------------------------------ 3: what you lend
-    io.step(3, 6, "what you lend");
+    io.step(3, 7, "what you lend");
     let share_inference = match &engine {
-        Some(f) => {
+        EngineChoice::Running(f) => {
             let q = format!(
                 "share inference from {} ({} models)?",
                 f.name,
@@ -260,7 +353,10 @@ async fn walk(io: &Io, cfg: &WorkerConfig, dir: &std::path::Path) -> Result<i32,
             );
             io.ask_yn(&q, true)?
         }
-        None => {
+        EngineChoice::Planned(k) => {
+            io.ask_yn(&format!("share inference once {} is up?", k.name), true)?
+        }
+        EngineChoice::None => {
             println!(
                 "   {}",
             io.dim("no engine chosen, so inference stays off; the switches below still make this node useful")
@@ -269,9 +365,112 @@ async fn walk(io: &Io, cfg: &WorkerConfig, dir: &std::path::Path) -> Result<i32,
         }
     };
     let share_cpu = io.ask_yn("lend spare CPU threads and RAM to peers?", false)?;
+    // Container sessions: only where the hardware can actually host them
+    // (macOS cannot pass a GPU into Docker), and only with Docker present —
+    // the preflight would fail loudly on a yes it cannot honour.
+    let workloads = if accel.hosts_container_sessions() {
+        if kmplify_node::proc::find("docker").is_none() {
+            println!(
+                "   {}",
+                io.dim("container sessions need Docker, which was not found; enable later with `kmplify-node set workloads=…`")
+            );
+            None
+        } else if io.ask_yn(
+            "host container sessions for peers? (vLLM, ComfyUI, Ollama images on your GPU)",
+            false,
+        )? {
+            let templates = kmplify_node::fabric_worker::hostable_templates(accel);
+            println!(
+                "   {}",
+                io.dim(&format!(
+                    "templates this host can run: {} — trim the list any time with `kmplify-node set workloads=…`",
+                    templates.join(", ")
+                ))
+            );
+            Some(templates.join(","))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
-    // ------------------------------------------------------ 4: who may use it
-    io.step(4, 6, "who may use it");
+    // ------------------------------------------------------ 4: ceilings
+    io.step(
+        4,
+        7,
+        "ceilings — peers never take more than this (Enter = all of it)",
+    );
+    // Only the ceilings that could bind anything, so a CPU-only inference
+    // node is not asked about session cores it will never grant.
+    let sessions_on = workloads.is_some();
+    let ask_capacity =
+        |io: &Io, prompt: &str, key: &'static str| -> Result<Option<String>, String> {
+            loop {
+                let answer = io.ask(prompt, "")?;
+                if answer.is_empty() {
+                    return Ok(None);
+                }
+                // Settings owns the unit parsing; the wizard borrows its judge
+                // so "24g" is legal here exactly when it is legal in `set`.
+                let mut probe = Settings::default();
+                match probe.set(key, &answer) {
+                    Ok(()) => return Ok(Some(answer)),
+                    Err(e) => println!("   {}", io.dim(&e)),
+                }
+            }
+        };
+    let mut max_cpus = None;
+    let mut max_vram = None;
+    let mut max_ram = None;
+    let mut max_disk = None;
+    let mut any_asked = false;
+    if sessions_on {
+        any_asked = true;
+        max_cpus = ask_capacity(
+            io,
+            &format!("CPU threads for peer sessions [all {}]", cpu.logical_cores),
+            "max-cpus",
+        )?;
+        max_disk = ask_capacity(
+            io,
+            "disk peer sessions may fill, e.g. 500g [no limit]",
+            "max-disk-gb",
+        )?;
+    }
+    if share_inference || sessions_on {
+        if let Some(g) = &primary {
+            any_asked = true;
+            max_vram = ask_capacity(
+                io,
+                &format!(
+                    "VRAM offered to peers, e.g. 24g [all {} GB]",
+                    g.total_mb / 1024
+                ),
+                "max-vram-mb",
+            )?;
+        }
+    }
+    if share_cpu {
+        any_asked = true;
+        max_ram = ask_capacity(
+            io,
+            &format!(
+                "system RAM offered to peers, e.g. 32g [all {} GB]",
+                hostcpu::read_ram_total_mb_now() / 1024
+            ),
+            "max-ram-mb",
+        )?;
+    }
+    if !any_asked {
+        println!(
+            "   {}",
+            io.dim("nothing to cap yet — ceilings become relevant with sessions, inference or CPU sharing, and `kmplify-node set` adds them any time")
+        );
+    }
+
+    // ------------------------------------------------------ 5: who may use it
+    io.step(5, 7, "who may use it");
     println!("   1) auto — any consumer on the fabric may use this node");
     println!("   2) manual — unknown consumers wait until you approve them (kmplify-node peers)");
     let approval_manual = loop {
@@ -300,7 +499,7 @@ async fn walk(io: &Io, cfg: &WorkerConfig, dir: &std::path::Path) -> Result<i32,
     };
 
     // ------------------------------------------------------ 5: extra lanes
-    io.step(5, 6, "extra lanes (both off by default)");
+    io.step(6, 7, "extra lanes (both off by default)");
     let functions = if io.ask_yn(
         "host signed Wasm functions? (small sandboxed jobs: HTML to text, CSV to JSON, …)",
         false,
@@ -335,11 +534,17 @@ async fn walk(io: &Io, cfg: &WorkerConfig, dir: &std::path::Path) -> Result<i32,
     )?;
 
     // ------------------------------------------------------ 6: save + preflight
-    io.step(6, 6, "summary");
+    io.step(7, 7, "summary");
     let choices = Choices {
-        engine: engine.as_ref().map(|f| f.base.clone()),
+        engine: engine.base(),
+        colibri,
         share_inference,
         share_cpu,
+        workloads,
+        max_cpus,
+        max_vram,
+        max_ram,
+        max_disk,
         approval_manual,
         country,
         functions,
@@ -353,11 +558,40 @@ async fn walk(io: &Io, cfg: &WorkerConfig, dir: &std::path::Path) -> Result<i32,
         }
     };
     match &engine {
-        Some(f) => println!("   engine    : {} at {}", f.name, f.base),
-        None => println!("   engine    : {}", io.dim("none")),
+        EngineChoice::Running(f) => println!("   engine    : {} at {}", f.name, f.base),
+        EngineChoice::Planned(k) => println!(
+            "   engine    : {} at {} {}",
+            k.name,
+            k.default_base,
+            io.warn("(not running yet)")
+        ),
+        EngineChoice::None => println!("   engine    : {}", io.dim("none")),
+    }
+    if let Some(base) = &choices.colibri {
+        println!("   colibri   : {base}");
     }
     println!("   inference : {}", on(choices.share_inference));
     println!("   cpu + ram : {}", on(choices.share_cpu));
+    match &choices.workloads {
+        Some(w) => println!("   sessions  : {}", w),
+        None => println!("   sessions  : {}", io.dim("off")),
+    }
+    {
+        let cap = |v: &Option<String>| v.clone().unwrap_or_else(|| "all".into());
+        if choices.max_cpus.is_some()
+            || choices.max_vram.is_some()
+            || choices.max_ram.is_some()
+            || choices.max_disk.is_some()
+        {
+            println!(
+                "   ceilings  : cpus {} · vram {} · ram {} · disk {}",
+                cap(&choices.max_cpus),
+                cap(&choices.max_vram),
+                cap(&choices.max_ram),
+                cap(&choices.max_disk)
+            );
+        }
+    }
     println!(
         "   admission : {}",
         if choices.approval_manual {
@@ -391,6 +625,22 @@ async fn walk(io: &Io, cfg: &WorkerConfig, dir: &std::path::Path) -> Result<i32,
     };
     if let Some(base) = &choices.engine {
         set(&mut stored, "engine", base)?;
+    }
+    if let Some(base) = &choices.colibri {
+        set(&mut stored, "colibri", base)?;
+    }
+    if let Some(w) = &choices.workloads {
+        set(&mut stored, "workloads", w)?;
+    }
+    for (key, value) in [
+        ("max-cpus", &choices.max_cpus),
+        ("max-vram-mb", &choices.max_vram),
+        ("max-ram-mb", &choices.max_ram),
+        ("max-disk-gb", &choices.max_disk),
+    ] {
+        if let Some(v) = value {
+            set(&mut stored, key, v)?;
+        }
     }
     set(
         &mut stored,
@@ -453,9 +703,29 @@ async fn walk(io: &Io, cfg: &WorkerConfig, dir: &std::path::Path) -> Result<i32,
     println!("   {}", io.dim("preflight…"));
     let mut effective = cfg.clone();
     stored.apply(&mut effective);
+    // The worker's own log lines belong in journald, not in the middle of a
+    // conversation; the ring still records them.
+    kmplify_node::status::set_quiet(true);
     let mut pf = super::gather(&effective, std::time::Duration::from_secs(5)).await;
+    kmplify_node::status::set_quiet(false);
     pf.gpus = gpus;
     super::judge(&effective, &mut pf);
+    // A PLANNED engine having no models yet is the plan, not a problem: the
+    // operator chose it thirty seconds ago and was told it is not running.
+    // Rephrase that one finding; everything else stays a problem.
+    if let EngineChoice::Planned(k) = &engine {
+        let before = pf.errors.len();
+        pf.errors.retain(|e| !e.contains("no models at"));
+        if pf.errors.len() < before {
+            println!(
+                "   {}",
+                io.dim(&format!(
+                    "as planned: {} is not up yet — this node preflights ready the moment it answers at {}",
+                    k.name, k.default_base
+                ))
+            );
+        }
+    }
     for w in &pf.warnings {
         println!("   {} {w}", io.warn("warning:"));
     }
