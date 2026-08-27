@@ -1372,6 +1372,148 @@ fn is_fabric_volume(name: &str, target: &str) -> bool {
         && !target.contains(':')
 }
 
+/// One file a template asks this node to place into a fabric volume before
+/// its container starts (protocol v3.4). Parsed from the `models` field of a
+/// `workload_start` frame, and distrusted accordingly: see `parse_models`.
+#[derive(Debug, Clone, PartialEq)]
+struct ModelSpec {
+    volume: String,
+    path: String,
+    url: String,
+    sha256: String,
+    bytes: u64,
+}
+
+const MAX_MANIFEST_ENTRIES: usize = 16;
+const MAX_MODEL_BYTES: u64 = 64 << 30;
+const MAX_MANIFEST_BYTES: u64 = 96 << 30;
+
+/// Where model downloads may come from. huggingface.co unless the operator
+/// widens it with KMPLIFY_FABRIC_MODEL_HOSTS="host1,host2". An allow-list,
+/// not a deny-list, because the URL arrives over the wire and this process
+/// runs with a view of the provider's LAN: "any https host" would still
+/// reach the router's admin page.
+fn model_hosts() -> Vec<String> {
+    let mut hosts = vec!["huggingface.co".to_string()];
+    if let Ok(extra) = std::env::var("KMPLIFY_FABRIC_MODEL_HOSTS") {
+        hosts.extend(
+            extra
+                .split(',')
+                .map(|h| h.trim().to_ascii_lowercase())
+                .filter(|h| !h.is_empty()),
+        );
+    }
+    hosts
+}
+
+/// A path this node will create inside a fabric volume: relative, boring
+/// charset, no traversal. Rejected rather than normalised — a manifest that
+/// needs normalising is a manifest to distrust.
+fn model_path_ok(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 256
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'))
+        && !path.starts_with('/')
+        && path
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
+/// https, printable, and the authority is exactly one allow-listed host — no
+/// userinfo, no port. Redirects are followed by the fetcher (Hugging Face
+/// resolves to its CDN); the allow-list vouches for the first hop, which is
+/// the party that controls where the redirect goes.
+fn manifest_url_ok(url: &str, hosts: &[String]) -> bool {
+    if !url.bytes().all(|b| b.is_ascii_graphic()) || url.contains('\'') || url.contains('"') {
+        return false;
+    }
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    !authority.is_empty()
+        && !authority.contains('@')
+        && !authority.contains(':')
+        && rest.len() > authority.len()
+        && hosts.iter().any(|h| h == &authority.to_ascii_lowercase())
+}
+
+/// Parse and validate the `models` field of a `workload_start` frame.
+///
+/// `mounted` is the set of fabric volumes this very session mounts: a
+/// manifest may only fill storage the workload reaches anyway, so the frame
+/// cannot use the prefetcher to write into some other template's volume. The
+/// whole manifest is refused on the first bad entry — a gateway that gets
+/// one field wrong is not a gateway to meet halfway on the rest.
+fn parse_models(
+    frame: &Value,
+    mounted: &std::collections::HashSet<String>,
+) -> Result<Vec<ModelSpec>, String> {
+    let Some(list) = frame.as_array() else {
+        return if frame.is_null() {
+            Ok(Vec::new())
+        } else {
+            Err("models is not a list".into())
+        };
+    };
+    if list.len() > MAX_MANIFEST_ENTRIES {
+        return Err(format!(
+            "manifest lists {} files (max {MAX_MANIFEST_ENTRIES})",
+            list.len()
+        ));
+    }
+    let hosts = model_hosts();
+    let mut specs = Vec::new();
+    let mut total: u64 = 0;
+    for m in list {
+        let volume = m["volume"].as_str().unwrap_or_default().to_string();
+        let path = m["path"].as_str().unwrap_or_default().to_string();
+        let url = m["url"].as_str().unwrap_or_default().to_string();
+        let sha256 = m["sha256"]
+            .as_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let bytes = m["bytes"].as_u64().unwrap_or(0);
+        if !volume.starts_with("kmplify-fabric-") || !mounted.contains(&volume) {
+            return Err(format!(
+                "model volume {volume:?} is not mounted by this session"
+            ));
+        }
+        if !model_path_ok(&path) {
+            return Err(format!("refusing model path {path:?}"));
+        }
+        if !manifest_url_ok(&url, &hosts) {
+            return Err(format!(
+                "refusing model URL {url:?} (https on an allow-listed host only)"
+            ));
+        }
+        if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("model {path:?} has no usable sha256"));
+        }
+        if bytes == 0 || bytes > MAX_MODEL_BYTES {
+            return Err(format!("model {path:?} declares an unusable size"));
+        }
+        total += bytes;
+        specs.push(ModelSpec {
+            volume,
+            path,
+            url,
+            sha256,
+            bytes,
+        });
+    }
+    if total > MAX_MANIFEST_BYTES {
+        return Err(format!(
+            "manifest totals {} GB (max {} GB)",
+            total >> 30,
+            MAX_MANIFEST_BYTES >> 30
+        ));
+    }
+    Ok(specs)
+}
+
 /// The image REPOSITORY each template may run, decided here rather than by
 /// whoever is on the other end of the socket.
 ///
@@ -2112,6 +2254,290 @@ fn fetch_script_args(path: &str, url: &str) -> Vec<String> {
     ]
 }
 
+/// Image the model prefetch helpers run. Tiny, official, and pulled like any
+/// other image the first time a manifest runs on this machine.
+const MODEL_FETCH_IMAGE: &str = "alpine:3.20";
+/// One budget for the whole manifest, matching the image pull's philosophy:
+/// patience is for the consumer to grant, not for retries to multiply.
+const MODEL_FETCH_TOTAL_TIMEOUT: Duration = Duration::from_secs(3600);
+
+fn prefetch_container_name(session: &str) -> String {
+    format!(
+        "kmplify-fabric-prefetch-{}",
+        &session[..12.min(session.len())]
+    )
+}
+
+/// Run one argv in a throwaway container that mounts a single fabric volume
+/// at /models — offline, unprivileged, and with no shell anywhere: every
+/// manifest-derived string stays an argument, never part of a command line.
+/// The worker cannot touch volume contents any other way (on Docker Desktop
+/// and WSL2 the volume lives inside the VM), which makes this the honest
+/// primitive rather than a convenience.
+async fn volume_exec(volume: &str, rw: bool, argv: &[&str]) -> Result<String, String> {
+    let mount = if rw {
+        format!("{volume}:/models")
+    } else {
+        format!("{volume}:/models:ro")
+    };
+    let mut args: Vec<String> = [
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "-v",
+        &mount,
+        MODEL_FETCH_IMAGE,
+    ]
+    .iter()
+    .map(|a| a.to_string())
+    .collect();
+    args.extend(argv.iter().map(|a| a.to_string()));
+    match crate::proc::command("docker").args(&args).output().await {
+        Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).trim().to_string()),
+        Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        Err(e) => Err(format!("docker unavailable: {e}")),
+    }
+}
+
+/// Size of a file in the volume, or None when it does not exist.
+async fn volume_file_size(volume: &str, path: &str) -> Option<u64> {
+    volume_exec(
+        volume,
+        false,
+        &["stat", "-c", "%s", &format!("/models/{path}")],
+    )
+    .await
+    .ok()
+    .and_then(|out| out.parse().ok())
+}
+
+/// Fetch every missing manifest file into its volume, digest-verified.
+///
+/// Ok(true): all present. Ok(false): the session was stopped mid-fetch and
+/// the caller should unwind quietly. Err: a failure worth showing the
+/// consumer. Progress rides the existing `pulling` state so the one bar the
+/// consumer is already watching moves through image and models alike.
+///
+/// Every file lands under a `.part` name and is renamed only after its
+/// sha256 matches, so a presence check can never mistake a torso for a
+/// model, and a file already present costs nothing — the manifest is paid
+/// for once per provider, not once per session.
+async fn prefetch_models(
+    sink: &Arc<Mutex<WsSink>>,
+    session: &str,
+    stopped: &Stopped,
+    specs: &[ModelSpec],
+) -> Result<bool, String> {
+    let total: u64 = specs.iter().map(|s| s.bytes).sum();
+    let mut done: u64 = 0;
+    let deadline = std::time::Instant::now() + MODEL_FETCH_TOTAL_TIMEOUT;
+    let helper = prefetch_container_name(session);
+    for (i, spec) in specs.iter().enumerate() {
+        if volume_file_size(&spec.volume, &spec.path).await.is_some() {
+            done += spec.bytes;
+            continue;
+        }
+        let label = format!(
+            "fetching model {}/{}: {} ({:.1} GB)",
+            i + 1,
+            specs.len(),
+            spec.path.rsplit('/').next().unwrap_or(&spec.path),
+            spec.bytes as f64 / (1 << 30) as f64
+        );
+        log(format!("session {session}: {label}"));
+        workload_progress(sink, session, pct(done, total), &label).await;
+        let part = format!("{}.part", spec.path);
+        if let Some((dir, _)) = spec.path.rsplit_once('/') {
+            volume_exec(
+                &spec.volume,
+                true,
+                &["mkdir", "-p", &format!("/models/{dir}")],
+            )
+            .await
+            .map_err(|e| format!("could not create {dir:?} in {}: {e}", spec.volume))?;
+        }
+        // Downloader: detached so the loop below can watch bytes arrive,
+        // report progress, and honor a stop. Network is the default bridge —
+        // this is the one helper that must reach the model host.
+        let _ = remove_container(&helper).await;
+        let run = crate::proc::command("docker")
+            .args([
+                "run",
+                "-d",
+                "--name",
+                &helper,
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--memory",
+                "256m",
+                "--pids-limit",
+                "64",
+                "-v",
+                &format!("{}:/models", spec.volume),
+                MODEL_FETCH_IMAGE,
+                "wget",
+                "-q",
+                "-O",
+                &format!("/models/{part}"),
+                &spec.url,
+            ])
+            .output()
+            .await;
+        match run {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                return Err(format!(
+                    "could not start the downloader: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ))
+            }
+            Err(e) => return Err(format!("docker unavailable: {e}")),
+        }
+        let failure = loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            if stopped.lock().await.remove(session) {
+                let _ = remove_container(&helper).await;
+                let _ = volume_exec(
+                    &spec.volume,
+                    true,
+                    &["rm", "-f", &format!("/models/{part}")],
+                )
+                .await;
+                return Ok(false);
+            }
+            if std::time::Instant::now() >= deadline {
+                break Some(format!(
+                    "model fetch exceeded {} min — the provider's line may be too slow for this template",
+                    MODEL_FETCH_TOTAL_TIMEOUT.as_secs() / 60
+                ));
+            }
+            let running = crate::proc::command("docker")
+                .args([
+                    "inspect",
+                    "-f",
+                    "{{.State.Running}} {{.State.ExitCode}}",
+                    &helper,
+                ])
+                .output()
+                .await;
+            let (running, exit_code) = match running {
+                Ok(o) if o.status.success() => {
+                    let out = String::from_utf8_lossy(&o.stdout);
+                    let mut it = out.split_whitespace();
+                    (
+                        it.next() == Some("true"),
+                        it.next().and_then(|c| c.parse::<i64>().ok()).unwrap_or(-1),
+                    )
+                }
+                // The container vanished under us (daemon restart, manual rm).
+                _ => break Some("the downloader disappeared mid-fetch".to_string()),
+            };
+            if !running {
+                if exit_code == 0 {
+                    break None;
+                }
+                let logs = crate::proc::command("docker")
+                    .args(["logs", "--tail", "3", &helper])
+                    .output()
+                    .await
+                    .map(|o| {
+                        format!(
+                            "{}{}",
+                            String::from_utf8_lossy(&o.stdout).trim(),
+                            String::from_utf8_lossy(&o.stderr).trim()
+                        )
+                    })
+                    .unwrap_or_default();
+                break Some(format!("download failed (exit {exit_code}): {logs}"));
+            }
+            let sofar = volume_file_size(&spec.volume, &part).await.unwrap_or(0);
+            workload_progress(
+                sink,
+                session,
+                pct(done + sofar.min(spec.bytes), total),
+                &format!(
+                    "{label} — {:.1} / {:.1} GB",
+                    (done + sofar) as f64 / (1 << 30) as f64,
+                    total as f64 / (1 << 30) as f64
+                ),
+            )
+            .await;
+        };
+        let _ = remove_container(&helper).await;
+        if let Some(why) = failure {
+            let _ = volume_exec(
+                &spec.volume,
+                true,
+                &["rm", "-f", &format!("/models/{part}")],
+            )
+            .await;
+            return Err(why);
+        }
+        // The digest decides, not the exit code: only a file that hashes to
+        // the manifest's sha256 may take the final name.
+        let digest = volume_exec(
+            &spec.volume,
+            false,
+            &["sha256sum", &format!("/models/{part}")],
+        )
+        .await
+        .map_err(|e| format!("could not hash the download: {e}"))?;
+        let digest = digest
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if digest != spec.sha256 {
+            let _ = volume_exec(
+                &spec.volume,
+                true,
+                &["rm", "-f", &format!("/models/{part}")],
+            )
+            .await;
+            return Err(format!(
+                "{} hashed to {}… instead of the manifest's {}… — refusing the file",
+                spec.path,
+                &digest[..12.min(digest.len())],
+                &spec.sha256[..12]
+            ));
+        }
+        volume_exec(
+            &spec.volume,
+            true,
+            &[
+                "mv",
+                &format!("/models/{part}"),
+                &format!("/models/{}", spec.path),
+            ],
+        )
+        .await
+        .map_err(|e| format!("could not move {} into place: {e}", spec.path))?;
+        done += spec.bytes;
+        workload_progress(
+            sink,
+            session,
+            pct(done, total),
+            &format!("model {} ready", i + 1),
+        )
+        .await;
+    }
+    Ok(true)
+}
+
+fn pct(done: u64, total: u64) -> f64 {
+    if total == 0 {
+        return 100.0;
+    }
+    (done as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
+}
+
 fn container_name(session: &str) -> String {
     format!("kmplify-fabric-{}", &session[..12.min(session.len())])
 }
@@ -2524,6 +2950,78 @@ async fn start_workload(
         return;
     }
 
+    // Optional named-volume mounts from the template (e.g. Ollama's model
+    // store, ComfyUI's install and its models), so a re-launched session
+    // doesn't re-download gigabytes of weights every time. ONLY
+    // fabric-namespaced NAMED volumes are accepted, never a host path: a
+    // hostile or buggy gateway must not be able to mount the provider's
+    // filesystem into a consumer-driven container.
+    //
+    // `volumes` (list) supersedes `volume` (single) — a gateway sends both so
+    // that a node predating the list still gets the primary mount rather than
+    // none at all. Extracted before `docker run` is even composed because the
+    // model prefetch below may only fill volumes this session mounts.
+    let mounts: Vec<String> = match frame["volumes"].as_array() {
+        Some(list) => list
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect(),
+        None => frame["volume"]
+            .as_str()
+            .map(str::to_owned)
+            .into_iter()
+            .collect(),
+    };
+    let mounted_fabric: std::collections::HashSet<String> = mounts
+        .iter()
+        .filter_map(|v| v.split_once(':'))
+        .filter(|(vname, target)| is_fabric_volume(vname, target))
+        .map(|(vname, _)| vname.to_string())
+        .collect();
+
+    // Protocol v3.4: model files the template wants in a fabric volume
+    // before its app starts, so a cold peer's first consumer meets a
+    // workflow that runs instead of a missing-models dialog. Everything in
+    // the frame is re-validated here; a refused manifest fails the session
+    // loudly rather than starting an app the catalog says is incomplete.
+    match parse_models(&frame["models"], &mounted_fabric) {
+        Err(why) => {
+            hosted_remove(&session).await;
+            workload_status(
+                &sink,
+                &session,
+                "error",
+                &format!("model manifest refused: {why}"),
+            )
+            .await;
+            return;
+        }
+        Ok(specs) if !specs.is_empty() => {
+            match prefetch_models(&sink, &session, &stopped, &specs).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    hosted_remove(&session).await;
+                    log(format!(
+                        "session {session} stopped during model fetch — not starting"
+                    ));
+                    return;
+                }
+                Err(why) => {
+                    hosted_remove(&session).await;
+                    workload_status(
+                        &sink,
+                        &session,
+                        "error",
+                        &format!("model fetch failed: {why}"),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+        Ok(_) => {}
+    }
+
     // Hardening (README, "Trust model"): no capabilities, no privilege escalation,
     // memory/pid caps, loopback-only ephemeral port.
     //
@@ -2632,28 +3130,9 @@ async fn start_workload(
         // the render node for Intel. None of them widen the sandbox.
         args.extend(need.docker_args());
     }
-    // Optional named-volume mounts from the template (e.g. Ollama's model
-    // store, ComfyUI's install and its models), so a re-launched session
-    // doesn't re-download gigabytes of weights every time. ONLY
-    // fabric-namespaced NAMED volumes are accepted, never a host path: a
-    // hostile or buggy gateway must not be able to mount the provider's
-    // filesystem into a consumer-driven container.
-    //
-    // `volumes` (list) supersedes `volume` (single) — a gateway sends both so
-    // that a node predating the list still gets the primary mount rather than
-    // none at all.
-    let mounts: Vec<String> = match frame["volumes"].as_array() {
-        Some(list) => list
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_owned))
-            .collect(),
-        None => frame["volume"]
-            .as_str()
-            .map(str::to_owned)
-            .into_iter()
-            .collect(),
-    };
-    for vol in mounts {
+    // The named-volume mounts hoisted above, filtered by the same rule that
+    // fed the prefetcher: fabric-namespaced named volumes only.
+    for vol in &mounts {
         if let Some((vname, target)) = vol.split_once(':') {
             if is_fabric_volume(vname, target) {
                 args.push("-v".into());
@@ -5198,5 +5677,108 @@ mod hardening_tests {
         assert!(!env_key_ok("A B"));
         assert!(!env_key_ok("A\nB"));
         assert!(!env_key_ok("--privileged"));
+    }
+}
+
+#[cfg(test)]
+mod model_manifest_tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashSet;
+
+    fn mounted() -> HashSet<String> {
+        ["kmplify-fabric-comfyui-models".to_string()]
+            .into_iter()
+            .collect()
+    }
+
+    fn entry() -> Value {
+        json!({
+            "volume": "kmplify-fabric-comfyui-models",
+            "path": "diffusion_models/krea2_turbo_int8_convrot.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/Krea-2/resolve/main/diffusion_models/krea2_turbo_int8_convrot.safetensors",
+            "sha256": "8e4eeda70dd5037ab1ba2bef6b417f9f901e26093117cf397f741fc1fdaaf3f1",
+            "bytes": 13492686496u64,
+        })
+    }
+
+    #[test]
+    fn the_comfyui_manifest_parses() {
+        let specs = parse_models(&json!([entry()]), &mounted()).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].bytes, 13492686496);
+    }
+
+    #[test]
+    fn absent_field_means_no_manifest_not_an_error() {
+        assert_eq!(parse_models(&Value::Null, &mounted()).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn a_volume_this_session_does_not_mount_is_refused() {
+        // The frame cannot use the prefetcher to write into some OTHER
+        // template's store — even a perfectly fabric-namespaced one.
+        let mut m = entry();
+        m["volume"] = json!("kmplify-fabric-ollama");
+        assert!(parse_models(&json!([m]), &mounted()).is_err());
+    }
+
+    #[test]
+    fn traversal_and_absolute_paths_are_refused() {
+        for bad in [
+            "../escape.safetensors",
+            "loras/../../escape",
+            "/etc/passwd",
+            "loras//x",
+            "loras/./x",
+            "",
+            "loras/a b.safetensors",
+            "loras/a'b.safetensors",
+        ] {
+            let mut m = entry();
+            m["path"] = json!(bad);
+            assert!(parse_models(&json!([m]), &mounted()).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn only_https_on_an_allow_listed_host_passes() {
+        let hosts = vec!["huggingface.co".to_string()];
+        assert!(manifest_url_ok(
+            "https://huggingface.co/Comfy-Org/Krea-2/resolve/main/x.safetensors",
+            &hosts
+        ));
+        for bad in [
+            "http://huggingface.co/x",               // not https
+            "https://evil.example/x",                // wrong host
+            "https://huggingface.co.evil.example/x", // suffix trick
+            "https://huggingface.co@evil.example/x", // userinfo trick
+            "https://huggingface.co:8443/x",         // port games
+            "https://huggingface.co",                // no path at all
+            "https://huggingface.co/x'y",            // quote smuggling
+            "https://huggingface.co/x y",            // whitespace
+        ] {
+            assert!(!manifest_url_ok(bad, &hosts), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn digest_and_size_must_be_usable() {
+        let mut m = entry();
+        m["sha256"] = json!("deadbeef");
+        assert!(parse_models(&json!([m]), &mounted()).is_err());
+        let mut m = entry();
+        m["bytes"] = json!(0);
+        assert!(parse_models(&json!([m]), &mounted()).is_err());
+        let mut m = entry();
+        m["bytes"] = json!(200u64 << 30);
+        assert!(parse_models(&json!([m]), &mounted()).is_err());
+    }
+
+    #[test]
+    fn progress_is_a_fraction_of_the_whole_manifest() {
+        assert_eq!(pct(0, 0), 100.0);
+        assert_eq!(pct(5, 10), 50.0);
+        assert_eq!(pct(20, 10), 100.0); // a file larger than declared never overflows the bar
     }
 }
