@@ -377,5 +377,47 @@ than a socket that accepts and stays mute (30s open timeout). A pre-v2.2 node
 simply ignores `ws_open`, so the consumer's socket times out and closes — an
 older provider degrades to today's behaviour instead of breaking.
 
+## Protocol v3.4 — template model prefetch
+
+A `workload_start` frame may carry a **model manifest**: files this node
+downloads into one of the session's named fabric volumes before the container
+starts. First user: the ComfyUI templates, whose default Krea-2 Turbo
+workflows reference ~19.5 GB of weights the image does not carry — without
+the manifest, every cold peer greeted its first consumer with a "4 required
+models are missing" dialog.
+
+```json
+"models": [
+  { "volume": "kmplify-fabric-comfyui-models",
+    "path": "diffusion_models/krea2_turbo_int8_convrot.safetensors",
+    "url": "https://huggingface.co/Comfy-Org/Krea-2/resolve/main/…",
+    "sha256": "8e4eeda7…",
+    "bytes": 13492686496 }
+]
+```
+
+The frame is a request, not an instruction; the node re-validates everything
+and refuses the whole manifest on the first violation:
+
+- `volume` must be fabric-namespaced **and** one this very session mounts.
+- `path` is relative, traversal-free, `[A-Za-z0-9._/-]` only.
+- `url` must be https on an allow-listed host — `huggingface.co` by default,
+  extendable with `KMPLIFY_FABRIC_MODEL_HOSTS="host1,host2"`. Redirects from
+  an allow-listed host are followed (Hugging Face resolves to its CDN).
+- `sha256` and `bytes` are mandatory; after download the node hashes the file
+  and **discards it on mismatch**, failing the session — a moved or tampered
+  URL cannot poison the provider's volume.
+- At most 16 entries, with per-file and whole-manifest size ceilings.
+
+Downloads run in throwaway hardened helper containers (`alpine`, cap-drop,
+no-new-privileges, memory/pid caps, argv only — no shell ever sees a
+manifest string) mounting only the target volume. Files land under a `.part`
+name and are renamed only after the digest verifies, so a presence check can
+never mistake a torso for a model; a file already present is skipped, making
+the manifest cost each provider its size once per volume, not per session.
+Progress rides the existing `pulling` state as byte progress across the whole
+manifest. A node predating v3.4 ignores the field: the session starts as
+before and the app reports its own missing files.
+
 Still on the optimization path: an optional P2P data channel (WebRTC/QUIC)
 for heavy image/video traffic.
