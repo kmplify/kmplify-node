@@ -1,6 +1,6 @@
 [package]
 name = "kmplify-node"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 # What the dependency floor actually is, now that both lanes ship by default:
 # ratatui asks for 1.88 and wasmtime for 1.95. Claiming 1.77 while the tree
