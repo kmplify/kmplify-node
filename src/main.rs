@@ -49,6 +49,7 @@
 //! on a machine whose owner believed they had set one.
 
 mod cli;
+mod onboard;
 #[cfg(feature = "tui")]
 mod tui;
 
@@ -375,10 +376,18 @@ fn judge(cfg: &WorkerConfig, pf: &mut Preflight) {
             cfg.ollama_base, cfg.ollama_base, cfg.ollama_base
         ));
     }
-    if !cfg.share_inference && cfg.workload_templates.is_empty() && !cfg.share_cpu {
+    // Every lane counts as sharing, the v3.0 ones included: a functions-only
+    // node is a real provider, not a misconfiguration.
+    if !cfg.share_inference
+        && cfg.workload_templates.is_empty()
+        && !cfg.share_cpu
+        && !cfg.functions.enabled
+        && !cfg.vectors.enabled
+    {
         pf.errors.push(
-            "nothing is shared: inference off, no session templates, CPU sharing off — \
-             this node would connect and offer the fabric nothing"
+            "nothing is shared: inference off, no session templates, no CPU sharing, \
+             functions off, vectors off — this node would connect and offer the fabric \
+             nothing"
                 .into(),
         );
     }
@@ -1011,6 +1020,59 @@ async fn run_rewards(dir: &std::path::Path, cfg: &WorkerConfig, stored: &Setting
     }
 }
 
+/// `engines`: what is serving on this machine, and which one the node uses.
+///
+/// The read half of engine selection. The write half is one of:
+/// `kmplify-node set engine=<name|url>` or the init wizard.
+async fn run_engines(cfg: &WorkerConfig, json: bool) -> i32 {
+    let found = kmplify_node::engines::scan().await;
+    let active = cfg.ollama_base.trim_end_matches('/');
+    if json {
+        let body = serde_json::json!({
+            "active": active,
+            "found": found,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        );
+        return EXIT_OK;
+    }
+    if found.is_empty() {
+        println!("no inference engine is answering on the usual localhost ports.");
+        println!("the node can lend any of these once one runs:");
+        for k in kmplify_node::engines::KNOWN {
+            println!("  {:<10} {}", k.id, k.hint);
+        }
+        println!("\nactive setting: {active} (nothing answered there)");
+        return EXIT_UNUSABLE;
+    }
+    let mut active_seen = false;
+    for f in &found {
+        let mark = if f.base == active {
+            active_seen = true;
+            " <- active"
+        } else {
+            ""
+        };
+        let models = if f.models.is_empty() {
+            "0 models (online, but would refuse every job)".to_string()
+        } else if f.models.len() <= 4 {
+            format!("{} ({})", f.models.len(), f.models.join(", "))
+        } else {
+            format!("{} ({}, …)", f.models.len(), f.models[..3].join(", "))
+        };
+        println!("  {:<12} {:<28} {models}{mark}", f.name, f.base);
+    }
+    if !active_seen {
+        println!(
+            "\nactive setting: {active} — which is NOT one of the engines that answered.\n\
+             pick one:  kmplify-node set engine=<name or URL from the list above>"
+        );
+    }
+    EXIT_OK
+}
+
 /// `peers`: who may use this machine, and the verbs that decide.
 ///
 /// The dashboard's peers screen for a shell — same gateway calls, same
@@ -1481,6 +1543,8 @@ async fn main() {
         }
         cli::Cmd::Id => run_id(&cfg).await,
         cli::Cmd::Peers => run_peers(&dir, &cfg, &cli).await,
+        cli::Cmd::Init => onboard::run(&cfg, &dir).await,
+        cli::Cmd::Engines => run_engines(&cfg, cli.json).await,
         cli::Cmd::Rewards => run_rewards(&dir, &cfg, &stored).await,
         cli::Cmd::Set => unreachable!("handled above"),
         cli::Cmd::Run => serve(cfg, dir).await,
@@ -1666,6 +1730,16 @@ mod tests {
         let mut pf = empty_preflight();
         judge(&cfg, &mut pf);
         assert!(pf.errors.iter().any(|e| e.contains("nothing is shared")));
+        // …but any single lane, the v3.0 ones included, is a real provider.
+        let mut cfg2 = cfg.clone();
+        cfg2.functions.enabled = true;
+        cfg2.functions.trusted_pubkey = "ab".repeat(32);
+        let mut pf2 = empty_preflight();
+        judge(&cfg2, &mut pf2);
+        assert!(
+            !pf2.errors.iter().any(|e| e.contains("nothing is shared")),
+            "a functions-only node shares plenty"
+        );
         clear();
     }
 
