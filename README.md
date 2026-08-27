@@ -156,7 +156,8 @@ opt into that lane, saves everything, preflights it and offers to start.
 Nothing is shared until you confirm the summary, and Ctrl-C abandons all of
 it. The answers land in the same `settings.json` that `kmplify-node set` and
 the dashboard write, so nothing about the wizard is special — it is just the
-guided way in.
+guided way in. The full annotated walkthrough, captured from a real run, is
+in [docs/ONBOARDING.md](docs/ONBOARDING.md).
 
 Already configured? The short loop is:
 
