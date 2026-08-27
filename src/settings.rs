@@ -396,9 +396,9 @@ impl Settings {
             }
             "colibri-key" => self.colibri_api_key = Some(value.to_string()),
             "max-cpus" => self.max_cpus = Some(parse_num::<f64>(key, value)?),
-            "max-vram-mb" => self.max_vram_mb = Some(parse_num::<u64>(key, value)?),
-            "max-ram-mb" => self.max_ram_mb = Some(parse_num::<u64>(key, value)?),
-            "max-disk-gb" => self.max_disk_gb = Some(parse_num::<u64>(key, value)?),
+            "max-vram-mb" => self.max_vram_mb = Some(parse_capacity(key, value, Unit::Mb)?),
+            "max-ram-mb" => self.max_ram_mb = Some(parse_capacity(key, value, Unit::Mb)?),
+            "max-disk-gb" => self.max_disk_gb = Some(parse_capacity(key, value, Unit::Gb)?),
             "functions" => self.functions = Some(parse_bool(key, value)?),
             "functions-pubkey" => {
                 let v = value.to_ascii_lowercase();
@@ -533,6 +533,46 @@ fn parse_bool(key: &str, value: &str) -> Result<bool, String> {
         "0" | "false" | "no" | "off" => Ok(false),
         _ => Err(format!("{key} must be true or false, not {value:?}")),
     }
+}
+
+/// The unit a capacity key is stored in.
+#[derive(Clone, Copy, PartialEq)]
+enum Unit {
+    Mb,
+    Gb,
+}
+
+/// A capacity, in whatever unit a person reaches for.
+///
+/// The ceilings are stored in the wire's units (MB for VRAM and RAM, GB for
+/// disk), and nobody thinks about their card in megabytes: the desktop's
+/// sliders say "48 / 48 GB". So `set max-vram-mb=48g` means what it looks
+/// like, `49152` still means what it always did (the bare number IS the
+/// key's own unit — the unit is in its name), and `1t` works for the disk
+/// on a machine that actually has one.
+fn parse_capacity(key: &str, value: &str, native: Unit) -> Result<u64, String> {
+    let v = value.trim().to_ascii_lowercase();
+    let (digits, suffix) = v.split_at(
+        v.find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(v.len()),
+    );
+    let n: f64 = digits
+        .parse()
+        .map_err(|_| format!("{key} must be a number, optionally with mb/gb/tb, not {value:?}"))?;
+    let mb = match suffix.trim() {
+        "" => match native {
+            Unit::Mb => n,
+            Unit::Gb => n * 1024.0,
+        },
+        "m" | "mb" | "mib" => n,
+        "g" | "gb" | "gib" => n * 1024.0,
+        "t" | "tb" | "tib" => n * 1024.0 * 1024.0,
+        other => return Err(format!("{key}: unknown unit {other:?} (use mb, gb or tb)")),
+    };
+    Ok(match native {
+        Unit::Mb => mb.round() as u64,
+        Unit::Gb => (mb / 1024.0).round() as u64,
+    })
 }
 
 fn parse_num<T: std::str::FromStr>(key: &str, value: &str) -> Result<T, String> {
@@ -703,6 +743,26 @@ mod tests {
         // Emptying it is how an operator says "trust nothing again".
         s.set("functions-pubkey", "").unwrap();
         assert_eq!(s.functions_pubkey.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn capacities_speak_the_units_people_think_in() {
+        let mut s = Settings::default();
+        // The desktop's slider says "48 / 48 GB"; the CLI now accepts the
+        // same sentence.
+        s.set("max-vram-mb", "48g").unwrap();
+        assert_eq!(s.max_vram_mb, Some(49_152));
+        s.set("max-ram-mb", "0.5tb").unwrap();
+        assert_eq!(s.max_ram_mb, Some(524_288));
+        // A bare number stays the key's own unit — the unit is in its name.
+        s.set("max-vram-mb", "16000").unwrap();
+        assert_eq!(s.max_vram_mb, Some(16_000));
+        s.set("max-disk-gb", "1t").unwrap();
+        assert_eq!(s.max_disk_gb, Some(1024));
+        s.set("max-disk-gb", "512000mb").unwrap();
+        assert_eq!(s.max_disk_gb, Some(500));
+        assert!(s.set("max-vram-mb", "48 potatoes").is_err());
+        assert!(s.set("max-vram-mb", "lots").is_err());
     }
 
     #[test]
