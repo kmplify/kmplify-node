@@ -1064,6 +1064,29 @@ async fn run_engines(cfg: &WorkerConfig, json: bool) -> i32 {
         };
         println!("  {:<12} {:<28} {models}{mark}", f.name, f.base);
     }
+    let missing: Vec<&kmplify_node::engines::Known> = kmplify_node::engines::KNOWN
+        .iter()
+        .filter(|k| {
+            !found
+                .iter()
+                .any(|f| f.base == k.default_base || f.id == k.id)
+        })
+        .collect();
+    if !missing.is_empty() {
+        // The roster is part of the answer: "what could this machine run"
+        // matters exactly when the wanted engine is not up yet.
+        println!("\nnot running (pick one now, start it later):");
+        for k in missing {
+            // Colibri is the SECOND upstream, lent alongside the engine,
+            // and its setting says so.
+            let cmd = if k.id == "colibri" {
+                format!("kmplify-node set colibri={}", k.default_base)
+            } else {
+                format!("kmplify-node set engine={}", k.id)
+            };
+            println!("  {:<10} {:<44} {}", k.name, cmd, k.hint);
+        }
+    }
     if !active_seen {
         println!(
             "\nactive setting: {active} — which is NOT one of the engines that answered.\n\
