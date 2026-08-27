@@ -43,6 +43,11 @@ pub enum Cmd {
     /// Who may use this machine: list them, and decide — the dashboard's
     /// peers screen for scripts and shells with no terminal.
     Peers,
+    /// First-run wizard: find the engine, ask the sharing questions, save,
+    /// preflight, offer to start.
+    Init,
+    /// Scan localhost for inference engines and say which one is active.
+    Engines,
     /// What this node delivered, and what an optional rewards companion
     /// makes of it.
     Rewards,
@@ -207,6 +212,8 @@ pub fn usage() -> String {
          \x20 kmplify-node status [--json]     one-shot report of the running node\n\
          \x20 kmplify-node id                  print this install's node id\n\
          \x20 kmplify-node set KEY=VALUE …     change what this machine lends, durably\n\
+         \x20 kmplify-node init                first-run wizard: engine, sharing, preflight\n\
+         \x20 kmplify-node engines             scan localhost for inference engines\n\
          \x20 kmplify-node peers [VERB …]      who may use it; approve, block, invite\n\
          \x20 kmplify-node rewards             delivered work, and an optional payout companion\n\
          \x20 kmplify-node version | help\n\
@@ -216,6 +223,15 @@ pub fn usage() -> String {
          \x20 drives it: pause and resume sharing, evict a peer's session, force a\n\
          \x20 reconnect, stop the node. With no node running it starts one itself, so\n\
          \x20 a GUI-less machine is operated entirely from the terminal.\n\
+         \n\
+         ENGINES\n\
+         \x20 The node lends whatever OpenAI-compatible engine you already run:\n\
+         \x20 Ollama, llama.cpp, vLLM, LM Studio, LiteLLM, Jan, colibri. Find and\n\
+         \x20 pick one:\n\
+         \n\
+         \x20 kmplify-node engines                  # what is running, what it serves\n\
+         \x20 kmplify-node set engine=llamacpp      # a name resolves to its usual port\n\
+         \x20 kmplify-node set engine=http://10.0.0.7:8000   # or say exactly where\n\
          \n\
          SHARING\n\
          \x20 What this machine lends is the dashboard's sharing screen (key 5) and,\n\
@@ -318,6 +334,8 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
                 "id" | "node-id" => Cmd::Id,
                 "set" | "config" => Cmd::Set,
                 "peers" | "consumers" => Cmd::Peers,
+                "init" | "onboard" | "setup" => Cmd::Init,
+                "engines" | "engine" => Cmd::Engines,
                 "rewards" | "earnings" => Cmd::Rewards,
                 "version" => Cmd::Version,
                 "help" => Cmd::Help,
@@ -389,8 +407,13 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
     if cli.attach && cli.standalone {
         return Err("--attach and --standalone ask for opposite things".into());
     }
-    if cli.json && !matches!(cli.cmd, Cmd::Check | Cmd::Status | Cmd::Peers) {
-        return Err("--json applies to `check`, `status` and `peers`".into());
+    if cli.json
+        && !matches!(
+            cli.cmd,
+            Cmd::Check | Cmd::Status | Cmd::Peers | Cmd::Engines
+        )
+    {
+        return Err("--json applies to `check`, `status`, `peers` and `engines`".into());
     }
     if (cli.attach || cli.standalone) && cli.cmd != Cmd::Tui {
         return Err("--attach and --standalone apply to `tui`".into());

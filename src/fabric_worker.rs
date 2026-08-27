@@ -879,7 +879,14 @@ pub async fn local_models(client: &reqwest::Client, ollama_base: &str) -> Vec<St
         // without this the fallback below was unreachable and the node
         // silently advertised nothing.
         Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
-            Ok(body) => return models_from_native(&body),
+            // Only a body that actually CARRIES a model list is an Ollama
+            // answering. LM Studio (and anything else that 200s unknown
+            // routes) answers /api/tags with 200 and a JSON error body; the
+            // old early-return took that as "an Ollama with no models" and
+            // the /v1/models fallback below became unreachable — a node
+            // pointed at LM Studio advertised nothing, silently.
+            Ok(body) if body.get("models").is_some() => return models_from_native(&body),
+            Ok(_) => "200 without a model list (not an Ollama)".to_string(),
             Err(e) => format!("unreadable body: {e}"),
         },
         Ok(resp) => format!("http {}", resp.status()),

@@ -143,8 +143,22 @@ are attached to every [GitHub release](https://github.com/kmplify/kmplify-node/r
 
 ## Run
 
-Two commands, in this order. The first connects to nothing and tells you
-whether this machine can actually serve; the second joins the fabric.
+First time? One command walks the whole setup with you:
+
+```bash
+kmplify-node init
+```
+
+It looks at the machine, scans localhost for the inference engine you already
+run (Ollama, llama.cpp, vLLM, LM Studio, LiteLLM, Jan, colibri), asks the
+sharing questions in plain words, fetches the fabric's function key if you
+opt into that lane, saves everything, preflights it and offers to start.
+Nothing is shared until you confirm the summary, and Ctrl-C abandons all of
+it. The answers land in the same `settings.json` that `kmplify-node set` and
+the dashboard write, so nothing about the wizard is special — it is just the
+guided way in.
+
+Already configured? The short loop is:
 
 ```bash
 kmplify-node check
@@ -160,7 +174,36 @@ Then watch and steer it from a terminal:
 kmplify-node tui
 ```
 
-Everything below is the detail behind those three.
+### Your engine, found rather than typed
+
+KMPLIFY ships no model runner of its own; the node lends whatever
+OpenAI-compatible engine you already run. `engines` shows what is listening
+and which one the node uses:
+
+```bash
+kmplify-node engines
+```
+
+```
+  Ollama       http://127.0.0.1:11434   17 (qwen3:0.6b, bge-m3:567m, …) <- active
+  LM Studio    http://127.0.0.1:1234    28 (qwen/qwen3.8-27b, …)
+```
+
+Switching is one durable setting, by name or by URL, applied on the
+reconnect it triggers:
+
+```bash
+kmplify-node set engine=lmstudio
+```
+
+```bash
+kmplify-node set engine=http://10.0.0.7:8000
+```
+
+(The underlying variable keeps its historic name, `OLLAMA_BASE`; the engine
+behind it is anything that speaks the OpenAI API.)
+
+Everything below is the detail behind those commands.
 
 ## The CLI
 
@@ -170,7 +213,9 @@ so a machine with no desktop is no harder to run than one with a window.
 
 | Command | What it does |
 |---|---|
+| `kmplify-node init` | First-run wizard: find your engine, answer six questions, preflight, start. |
 | `kmplify-node` / `run` | Join the fabric and serve. Logs to stdout, stops cleanly on SIGTERM. |
+| `kmplify-node engines` | Scan localhost for inference engines; say which one is active. `--json`. |
 | `kmplify-node tui` | Terminal dashboard: watch **and control** the node. |
 | `kmplify-node check` | Preflight this host. Connects to nothing. `--json`, `--timeout SECS`. |
 | `kmplify-node status` | Is it serving right now, and how hard is the machine working. `--json`. |
