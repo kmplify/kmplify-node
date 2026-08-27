@@ -1416,7 +1416,9 @@ fn model_path_ok(path: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'))
         && !path.starts_with('/')
-        && path.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+        && path
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
 }
 
 /// https, printable, and the authority is exactly one allow-listed host — no
@@ -1469,7 +1471,10 @@ fn parse_models(
         let volume = m["volume"].as_str().unwrap_or_default().to_string();
         let path = m["path"].as_str().unwrap_or_default().to_string();
         let url = m["url"].as_str().unwrap_or_default().to_string();
-        let sha256 = m["sha256"].as_str().unwrap_or_default().to_ascii_lowercase();
+        let sha256 = m["sha256"]
+            .as_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         let bytes = m["bytes"].as_u64().unwrap_or(0);
         if !volume.starts_with("kmplify-fabric-") || !mounted.contains(&volume) {
             return Err(format!(
@@ -2257,7 +2262,10 @@ const MODEL_FETCH_IMAGE: &str = "alpine:3.20";
 const MODEL_FETCH_TOTAL_TIMEOUT: Duration = Duration::from_secs(3600);
 
 fn prefetch_container_name(session: &str) -> String {
-    format!("kmplify-fabric-prefetch-{}", &session[..12.min(session.len())])
+    format!(
+        "kmplify-fabric-prefetch-{}",
+        &session[..12.min(session.len())]
+    )
 }
 
 /// Run one argv in a throwaway container that mounts a single fabric volume
@@ -2298,10 +2306,14 @@ async fn volume_exec(volume: &str, rw: bool, argv: &[&str]) -> Result<String, St
 
 /// Size of a file in the volume, or None when it does not exist.
 async fn volume_file_size(volume: &str, path: &str) -> Option<u64> {
-    volume_exec(volume, false, &["stat", "-c", "%s", &format!("/models/{path}")])
-        .await
-        .ok()
-        .and_then(|out| out.parse().ok())
+    volume_exec(
+        volume,
+        false,
+        &["stat", "-c", "%s", &format!("/models/{path}")],
+    )
+    .await
+    .ok()
+    .and_then(|out| out.parse().ok())
 }
 
 /// Fetch every missing manifest file into its volume, digest-verified.
@@ -2341,9 +2353,13 @@ async fn prefetch_models(
         workload_progress(sink, session, pct(done, total), &label).await;
         let part = format!("{}.part", spec.path);
         if let Some((dir, _)) = spec.path.rsplit_once('/') {
-            volume_exec(&spec.volume, true, &["mkdir", "-p", &format!("/models/{dir}")])
-                .await
-                .map_err(|e| format!("could not create {dir:?} in {}: {e}", spec.volume))?;
+            volume_exec(
+                &spec.volume,
+                true,
+                &["mkdir", "-p", &format!("/models/{dir}")],
+            )
+            .await
+            .map_err(|e| format!("could not create {dir:?} in {}: {e}", spec.volume))?;
         }
         // Downloader: detached so the loop below can watch bytes arrive,
         // report progress, and honor a stop. Network is the default bridge —
@@ -2388,8 +2404,12 @@ async fn prefetch_models(
             tokio::time::sleep(Duration::from_secs(10)).await;
             if stopped.lock().await.remove(session) {
                 let _ = remove_container(&helper).await;
-                let _ = volume_exec(&spec.volume, true, &["rm", "-f", &format!("/models/{part}")])
-                    .await;
+                let _ = volume_exec(
+                    &spec.volume,
+                    true,
+                    &["rm", "-f", &format!("/models/{part}")],
+                )
+                .await;
                 return Ok(false);
             }
             if std::time::Instant::now() >= deadline {
@@ -2399,7 +2419,12 @@ async fn prefetch_models(
                 ));
             }
             let running = crate::proc::command("docker")
-                .args(["inspect", "-f", "{{.State.Running}} {{.State.ExitCode}}", &helper])
+                .args([
+                    "inspect",
+                    "-f",
+                    "{{.State.Running}} {{.State.ExitCode}}",
+                    &helper,
+                ])
                 .output()
                 .await;
             let (running, exit_code) = match running {
@@ -2447,19 +2472,35 @@ async fn prefetch_models(
         };
         let _ = remove_container(&helper).await;
         if let Some(why) = failure {
-            let _ =
-                volume_exec(&spec.volume, true, &["rm", "-f", &format!("/models/{part}")]).await;
+            let _ = volume_exec(
+                &spec.volume,
+                true,
+                &["rm", "-f", &format!("/models/{part}")],
+            )
+            .await;
             return Err(why);
         }
         // The digest decides, not the exit code: only a file that hashes to
         // the manifest's sha256 may take the final name.
-        let digest = volume_exec(&spec.volume, false, &["sha256sum", &format!("/models/{part}")])
-            .await
-            .map_err(|e| format!("could not hash the download: {e}"))?;
-        let digest = digest.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+        let digest = volume_exec(
+            &spec.volume,
+            false,
+            &["sha256sum", &format!("/models/{part}")],
+        )
+        .await
+        .map_err(|e| format!("could not hash the download: {e}"))?;
+        let digest = digest
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
         if digest != spec.sha256 {
-            let _ =
-                volume_exec(&spec.volume, true, &["rm", "-f", &format!("/models/{part}")]).await;
+            let _ = volume_exec(
+                &spec.volume,
+                true,
+                &["rm", "-f", &format!("/models/{part}")],
+            )
+            .await;
             return Err(format!(
                 "{} hashed to {}… instead of the manifest's {}… — refusing the file",
                 spec.path,
@@ -2470,12 +2511,22 @@ async fn prefetch_models(
         volume_exec(
             &spec.volume,
             true,
-            &["mv", &format!("/models/{part}"), &format!("/models/{}", spec.path)],
+            &[
+                "mv",
+                &format!("/models/{part}"),
+                &format!("/models/{}", spec.path),
+            ],
         )
         .await
         .map_err(|e| format!("could not move {} into place: {e}", spec.path))?;
         done += spec.bytes;
-        workload_progress(sink, session, pct(done, total), &format!("model {} ready", i + 1)).await;
+        workload_progress(
+            sink,
+            session,
+            pct(done, total),
+            &format!("model {} ready", i + 1),
+        )
+        .await;
     }
     Ok(true)
 }
@@ -5698,14 +5749,14 @@ mod model_manifest_tests {
             &hosts
         ));
         for bad in [
-            "http://huggingface.co/x",                  // not https
-            "https://evil.example/x",                   // wrong host
-            "https://huggingface.co.evil.example/x",    // suffix trick
-            "https://huggingface.co@evil.example/x",    // userinfo trick
-            "https://huggingface.co:8443/x",            // port games
-            "https://huggingface.co",                   // no path at all
-            "https://huggingface.co/x'y",               // quote smuggling
-            "https://huggingface.co/x y",               // whitespace
+            "http://huggingface.co/x",               // not https
+            "https://evil.example/x",                // wrong host
+            "https://huggingface.co.evil.example/x", // suffix trick
+            "https://huggingface.co@evil.example/x", // userinfo trick
+            "https://huggingface.co:8443/x",         // port games
+            "https://huggingface.co",                // no path at all
+            "https://huggingface.co/x'y",            // quote smuggling
+            "https://huggingface.co/x y",            // whitespace
         ] {
             assert!(!manifest_url_ok(bad, &hosts), "{bad:?}");
         }
