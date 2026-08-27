@@ -15,6 +15,7 @@
 //! the operator's view.
 
 pub mod control;
+pub mod engines;
 pub mod fabric_worker;
 pub mod functions;
 pub mod gpu;
