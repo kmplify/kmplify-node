@@ -64,6 +64,11 @@ pub struct Settings {
     /// ISO-3166-1 alpha-2, or empty to declare nothing (`PROVIDER_COUNTRY`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub country: Option<String>,
+    /// The local inference engine's base URL (`OLLAMA_BASE` — the variable
+    /// keeps its historic name; the engine behind it is anything that speaks
+    /// the OpenAI API: Ollama, llama.cpp, vLLM, LM Studio, LiteLLM, Jan).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
     /// Colibri gateway, empty to switch it off (`COLIBRI_BASE`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub colibri_base: Option<String>,
@@ -117,6 +122,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("workloads", "PROVIDER_WORKLOADS"),
     ("approval-mode", "PROVIDER_APPROVAL_MODE"),
     ("country", "PROVIDER_COUNTRY"),
+    ("engine", "OLLAMA_BASE"),
     ("colibri", "COLIBRI_BASE"),
     ("colibri-key", "COLIBRI_API_KEY"),
     ("max-cpus", "PROVIDER_MAX_CPUS"),
@@ -181,6 +187,9 @@ impl Settings {
         }
         if let Some(v) = &self.country {
             cfg.country = v.clone();
+        }
+        if let Some(v) = &self.engine {
+            cfg.ollama_base = v.clone();
         }
         if let Some(v) = &self.colibri_base {
             cfg.colibri_base = v.clone();
@@ -275,6 +284,9 @@ impl Settings {
         if let Some(v) = &self.country {
             note("PROVIDER_COUNTRY", from_env.country.clone(), v.clone());
         }
+        if let Some(v) = &self.engine {
+            note("OLLAMA_BASE", from_env.ollama_base.clone(), v.clone());
+        }
         if let Some(v) = &self.colibri_base {
             note("COLIBRI_BASE", from_env.colibri_base.clone(), v.clone());
         }
@@ -356,6 +368,23 @@ impl Settings {
                 }
                 self.country = Some(up);
             }
+            "engine" => {
+                // A URL, or the name of a known engine, which resolves to
+                // where that engine listens by default. `set engine=llamacpp`
+                // beats asking someone to know its port.
+                let resolved = match crate::engines::known(value) {
+                    Some(k) => k.default_base.to_string(),
+                    None => value.trim_end_matches('/').to_string(),
+                };
+                if !resolved.starts_with("http://") && !resolved.starts_with("https://") {
+                    let names: Vec<&str> = crate::engines::KNOWN.iter().map(|k| k.id).collect();
+                    return Err(format!(
+                        "{key} must be a URL or one of: {}",
+                        names.join(", ")
+                    ));
+                }
+                self.engine = Some(resolved);
+            }
             "colibri" => {
                 if !value.is_empty()
                     && !value.starts_with("http://")
@@ -404,6 +433,7 @@ impl Settings {
             "workloads" => self.workloads = None,
             "approval-mode" => self.approval_mode = None,
             "country" => self.country = None,
+            "engine" => self.engine = None,
             "colibri" => self.colibri_base = None,
             "colibri-key" => self.colibri_api_key = None,
             "max-cpus" => self.max_cpus = None,
@@ -442,6 +472,7 @@ impl Settings {
         push("workloads", self.workloads.as_ref().map(|v| v.join(",")));
         push("approval-mode", self.approval_mode.clone());
         push("country", self.country.clone());
+        push("engine", self.engine.clone());
         push("colibri", self.colibri_base.clone());
         push(
             "colibri-key",
@@ -675,6 +706,22 @@ mod tests {
     }
 
     #[test]
+    fn an_engine_can_be_named_instead_of_addressed() {
+        let mut s = Settings::default();
+        s.set("engine", "llama.cpp").unwrap();
+        assert_eq!(s.engine.as_deref(), Some("http://127.0.0.1:8080"));
+        s.set("engine", "http://10.0.0.7:8000/").unwrap();
+        assert_eq!(s.engine.as_deref(), Some("http://10.0.0.7:8000"));
+        // A typo lists the names it could have meant.
+        let err = s.set("engine", "gpt4all").unwrap_err();
+        assert!(err.contains("ollama") && err.contains("llamacpp"), "{err}");
+        // …and the choice actually steers the worker.
+        let mut cfg = env_cfg();
+        s.apply(&mut cfg);
+        assert_eq!(cfg.ollama_base, "http://10.0.0.7:8000");
+    }
+
+    #[test]
     fn the_listing_never_prints_the_colibri_key() {
         let mut s = Settings::default();
         s.set("colibri-key", "super-secret").unwrap();
@@ -721,6 +768,7 @@ mod tests {
                 "functions-pubkey" => &"a".repeat(64),
                 "approval-mode" => "auto",
                 "country" => "DE",
+                "engine" => "ollama",
                 "colibri" => "http://127.0.0.1:5000",
                 "colibri-key" => "k",
                 "workloads" => "ollama-cpu",

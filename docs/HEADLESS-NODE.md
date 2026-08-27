@@ -92,6 +92,11 @@ into its stack `.env`:
 | `KMPLIFY_NODE_DIR` | `~/.config/kmplify-node` | identity/credentials directory |
 | `KMPLIFY_CUDA` | autodetected | force CUDA advertising `1`/`0` |
 
+On an interactive shell, `kmplify-node init` does everything this section
+describes as a guided first run: engine scan and selection, sharing choices,
+country, the optional lanes, preflight. The variables below are the same
+knobs for unit files and scripts.
+
 Always start with the preflight — it prints the resolved configuration and
 probes docker/nvidia-smi/the gateway/Ollama without connecting, and exits
 non-zero when the host cannot serve as configured, so provisioning scripts
