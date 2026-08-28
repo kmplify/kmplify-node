@@ -129,6 +129,32 @@ impl EngineChoice {
     }
 }
 
+/// The Enter-accept answer for the engine menu.
+///
+/// Ranking: the hardware-matched engine when it is RUNNING; otherwise any
+/// running engine (first found) — live models beat a plan; otherwise the
+/// hardware-matched roster row as a Planned choice, whose "advertises
+/// nothing until it answers" note keeps the default honest; and a rescan
+/// only when there is nothing to suggest at all. Pure so the ranking is
+/// testable without a terminal.
+fn engine_default(
+    found: &[engines::Found],
+    roster: &[&'static engines::Known],
+    rec_id: &str,
+    extra_rescan: usize,
+) -> String {
+    if let Some(i) = found.iter().position(|f| f.id == rec_id) {
+        return (i + 1).to_string();
+    }
+    if !found.is_empty() {
+        return "1".to_string();
+    }
+    if let Some(i) = roster.iter().position(|k| k.id == rec_id) {
+        return (found.len() + i + 1).to_string();
+    }
+    extra_rescan.to_string()
+}
+
 /// What the wizard decided, applied to `settings` only at the very end.
 /// Capacities stay the strings the operator typed ("24g", "500"), because
 /// `Settings::set` owns the unit parsing and the wizard must not grow a
@@ -230,6 +256,13 @@ async fn walk(io: &Io, cfg: &WorkerConfig, dir: &std::path::Path) -> Result<i32,
         .any(|f| Some(f.base.as_str()) == colibri_base.as_deref());
     found.retain(|f| Some(f.base.as_str()) != colibri_base.as_deref());
 
+    // What this hardware is best served by — shown as a green tag on the
+    // matching row and, when it decides nothing better, as the Enter-accept
+    // default. The operator's number always wins; this is a suggestion with
+    // a reason attached, not a decision.
+    let (rec_id, rec_why) = engines::recommend(accel);
+    let fits = |io: &Io| io.good(&format!("← fits this machine ({rec_why})"));
+
     let engine: EngineChoice = loop {
         // The whole roster, every time: what is running is pickable now, and
         // what is not running is pickable FOR LATER — an operator setting up
@@ -243,7 +276,12 @@ async fn walk(io: &Io, cfg: &WorkerConfig, dir: &std::path::Path) -> Result<i32,
                     0 => io.warn("0 models — online but would refuse every job"),
                     c => io.good(&format!("{c} model(s)")),
                 };
-                println!("   {n}) {:<10} {:<28} {}", f.name, f.base, models);
+                let tag = if f.id == rec_id {
+                    format!("  {}", fits(io))
+                } else {
+                    String::new()
+                };
+                println!("   {n}) {:<10} {:<28} {}{}", f.name, f.base, models, tag);
             }
         }
         let roster: Vec<&'static engines::Known> = engines::KNOWN
@@ -262,7 +300,12 @@ async fn walk(io: &Io, cfg: &WorkerConfig, dir: &std::path::Path) -> Result<i32,
             );
             for k in &roster {
                 n += 1;
-                println!("   {n}) {:<10} {}", k.name, io.dim(k.hint));
+                let tag = if k.id == rec_id {
+                    format!("  {}", fits(io))
+                } else {
+                    String::new()
+                };
+                println!("   {n}) {:<10} {}{}", k.name, io.dim(k.hint), tag);
             }
         }
         let extra_url = n + 1;
@@ -274,11 +317,7 @@ async fn walk(io: &Io, cfg: &WorkerConfig, dir: &std::path::Path) -> Result<i32,
             "   {}) no engine — lend CPU, functions or vector storage only",
             extra_none
         );
-        let default = if found.is_empty() {
-            extra_rescan.to_string()
-        } else {
-            "1".to_string()
-        };
+        let default = engine_default(&found, &roster, rec_id, extra_rescan);
         let answer = io.ask("engine", &default)?;
         // A pasted URL is an answer to the question, not a menu mistake.
         if answer.starts_with("http://") || answer.starts_with("https://") {
@@ -832,5 +871,55 @@ async fn fetch_function_key(gateway: &str) -> Result<String, String> {
         Ok(key)
     } else {
         Err("the gateway published no usable key".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn running(id: &str) -> engines::Found {
+        engines::Found {
+            base: format!("http://127.0.0.1:1/{id}"),
+            id: id.to_string(),
+            name: id.to_string(),
+            models: vec!["m".into()],
+        }
+    }
+
+    fn roster_without(running: &[&str]) -> Vec<&'static engines::Known> {
+        engines::KNOWN
+            .iter()
+            .filter(|k| k.id != "colibri" && !running.contains(&k.id))
+            .collect()
+    }
+
+    #[test]
+    fn a_running_match_is_the_default_wherever_it_sits() {
+        let found = vec![running("ollama"), running("mlx")];
+        let roster = roster_without(&["ollama", "mlx"]);
+        assert_eq!(engine_default(&found, &roster, "mlx", 99), "2");
+    }
+
+    #[test]
+    fn any_running_engine_beats_a_planned_suggestion() {
+        let found = vec![running("ollama"), running("lmstudio")];
+        let roster = roster_without(&["ollama", "lmstudio"]);
+        assert_eq!(engine_default(&found, &roster, "mlx", 99), "1");
+    }
+
+    #[test]
+    fn with_nothing_running_the_suggestion_row_is_the_default() {
+        let roster = roster_without(&[]);
+        let want = roster.iter().position(|k| k.id == "mlx").unwrap() + 1;
+        assert_eq!(engine_default(&[], &roster, "mlx", 99), want.to_string());
+    }
+
+    #[test]
+    fn no_suggestion_available_falls_back_to_rescan() {
+        // A roster that somehow lacks the recommended id: the old behaviour
+        // (rescan) is the only honest default left.
+        let roster = roster_without(&["llamacpp", "mlx"]);
+        assert_eq!(engine_default(&[], &roster, "mlx", 7), "7");
     }
 }
