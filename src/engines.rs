@@ -107,6 +107,28 @@ pub fn known(id: &str) -> Option<&'static Known> {
     KNOWN.iter().find(|k| k.id == id)
 }
 
+/// The engine this hardware is best served by, and the reason a human reads
+/// next to the suggestion.
+///
+/// Advice, never a decision: callers highlight this row and may move the
+/// Enter-accept default onto it, and the operator overrides it with one
+/// keystroke. The mapping follows what the desktop app ships per platform —
+/// MLX on Apple Silicon, llama.cpp with GPU offloading everywhere else a
+/// card is usable, llama.cpp on plain CPUs (GGUF quantization is what makes
+/// a CPU node worth lending). A running engine of ANY kind still beats a
+/// suggested one that is not up yet; that ranking lives with the caller,
+/// because only it knows what is running.
+pub fn recommend(accel: crate::gpu::Backend) -> (&'static str, &'static str) {
+    use crate::gpu::Backend;
+    match accel {
+        Backend::Metal => ("mlx", "Apple Silicon"),
+        Backend::Cuda => ("llamacpp", "NVIDIA GPU, CUDA offloading"),
+        Backend::Rocm => ("llamacpp", "AMD GPU, ROCm offloading"),
+        Backend::OneApi => ("llamacpp", "Intel GPU, SYCL offloading"),
+        Backend::Cpu => ("llamacpp", "CPU host, quantized GGUF models"),
+    }
+}
+
 /// What a probe found at one base URL.
 #[derive(Clone, Debug, Serialize)]
 pub struct Found {
@@ -241,6 +263,33 @@ pub async fn scan() -> Vec<Found> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_recommendation_is_a_real_roster_engine() {
+        use crate::gpu::Backend;
+        for accel in [
+            Backend::Cuda,
+            Backend::Rocm,
+            Backend::OneApi,
+            Backend::Metal,
+            Backend::Cpu,
+        ] {
+            let (id, why) = recommend(accel);
+            assert!(
+                known(id).is_some(),
+                "recommend({accel:?}) names '{id}', which the roster does not know"
+            );
+            assert!(!why.is_empty(), "recommend({accel:?}) has no reason text");
+        }
+    }
+
+    #[test]
+    fn apple_silicon_gets_mlx_and_nvidia_gets_llamacpp() {
+        // The two pairings the website promises by name; the rest are
+        // covered by the roster check above.
+        assert_eq!(recommend(crate::gpu::Backend::Metal).0, "mlx");
+        assert_eq!(recommend(crate::gpu::Backend::Cuda).0, "llamacpp");
+    }
 
     #[test]
     fn the_native_api_is_the_strongest_evidence() {
