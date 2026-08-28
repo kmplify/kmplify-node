@@ -307,6 +307,29 @@ means `KMPLIFY_GPU_BACKEND` is forcing something this host does not have. The
 hello frame reports `cpu` in that case rather than a phantom card, because
 the scheduler reads advertised VRAM as capacity.
 
+## Running next to KMPLIFY Desktop
+
+The desktop app's provider mode and this node coexist on one machine by
+design, and nothing needs configuring to make that true:
+
+- **Separate identities.** The desktop registers its own fabric node
+  (`de.kmplify.desktop`'s app folder), this node its own
+  (`KMPLIFY_NODE_DIR`). The gateway sees two providers and never confuses
+  them.
+- **No listening ports to collide.** Both connect outbound-only; neither
+  binds a port on this machine, so there is no port to fight over.
+- **Session containers cannot clash.** Names derive from gateway-unique
+  session ids, and host ports are ephemeral (`127.0.0.1:0`), picked by
+  Docker at start.
+
+The one thing worth thinking about is the engine: if both are set to lend
+the *same* engine (the desktop's default and this node's default are both
+the local Ollama), the fabric counts one GPU's models as two nodes'
+capacity, and peers can oversubscribe it. `kmplify-node check` and the
+`init` preflight say so out loud when they see it. Running both anyway
+works; to avoid the double-count, lend different engines
+(`kmplify-node set engine=…`) or share inference from only one of them.
+
 ## Scope, honestly
 
 - Serves: fabric container sessions (vLLM / ComfyUI / Ollama / speech STT+TTS /
