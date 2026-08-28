@@ -1027,10 +1027,17 @@ async fn run_rewards(dir: &std::path::Path, cfg: &WorkerConfig, stored: &Setting
 async fn run_engines(cfg: &WorkerConfig, json: bool) -> i32 {
     let found = kmplify_node::engines::scan().await;
     let active = cfg.ollama_base.trim_end_matches('/');
+    // Same suggestion the init wizard highlights: what this hardware is
+    // best served by, as advice with a reason — never applied by itself.
+    let (rec_id, rec_why) = {
+        let (accel, _) = kmplify_node::gpu::resolve_backend(&kmplify_node::gpu::detect_all().await);
+        kmplify_node::engines::recommend(accel)
+    };
     if json {
         let body = serde_json::json!({
             "active": active,
             "found": found,
+            "suggested": { "id": rec_id, "why": rec_why },
         });
         println!(
             "{}",
@@ -1042,7 +1049,12 @@ async fn run_engines(cfg: &WorkerConfig, json: bool) -> i32 {
         println!("no inference engine is answering on the usual localhost ports.");
         println!("the node can lend any of these once one runs:");
         for k in kmplify_node::engines::KNOWN {
-            println!("  {:<10} {}", k.id, k.hint);
+            let tag = if k.id == rec_id {
+                format!("  <- fits this machine ({rec_why})")
+            } else {
+                String::new()
+            };
+            println!("  {:<10} {}{tag}", k.id, k.hint);
         }
         println!("\nactive setting: {active} (nothing answered there)");
         return EXIT_UNUSABLE;
@@ -1091,6 +1103,17 @@ async fn run_engines(cfg: &WorkerConfig, json: bool) -> i32 {
         println!(
             "\nactive setting: {active} — which is NOT one of the engines that answered.\n\
              pick one:  kmplify-node set engine=<name or URL from the list above>"
+        );
+    }
+    let active_is_rec = found.iter().any(|f| f.base == active && f.id == rec_id);
+    if !active_is_rec {
+        let verb = if found.iter().any(|f| f.id == rec_id) {
+            "it is running"
+        } else {
+            "it is not running yet"
+        };
+        println!(
+            "\nsuggestion: {rec_id} fits this machine ({rec_why}), {verb} — kmplify-node set engine={rec_id}"
         );
     }
     EXIT_OK

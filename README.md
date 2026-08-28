@@ -188,7 +188,14 @@ kmplify-node engines
 ```
   Ollama       http://127.0.0.1:11434   17 (qwen3:0.6b, bge-m3:567m, …) <- active
   LM Studio    http://127.0.0.1:1234    28 (qwen/qwen3.8-27b, …)
+
+suggestion: mlx fits this machine (Apple Silicon), it is not running yet — kmplify-node set engine=mlx
 ```
+
+The suggestion is the hardware speaking — MLX on Apple Silicon, llama.cpp
+with CUDA/ROCm offloading where a card is usable — and `init` highlights the
+same row in its engine menu. It never applies itself: switching stays your
+one deliberate command.
 
 Switching is one durable setting, by name or by URL, applied on the
 reconnect it triggers:

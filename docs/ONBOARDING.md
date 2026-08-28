@@ -21,7 +21,8 @@ Three properties worth knowing before you start:
 ```
 $ kmplify-node init
 
-◆ kmplify-node setup — lend this machine to the KMPLIFY Compute Fabric
+
+ ◆ kmplify-node setup — lend this machine to the KMPLIFY Compute Fabric
    Seven steps. Nothing is shared until you confirm the summary; Ctrl-C abandons all of it.
 
  [1/7] this machine
@@ -41,10 +42,10 @@ usable.
    scanning localhost for running engines…
    running now:
    1) Ollama     http://127.0.0.1:11434       17 model(s)
-   2) LM Studio  http://127.0.0.1:1234        28 model(s)
+   2) LM Studio  http://127.0.0.1:1234        10 model(s)
    not running — pick one to set it up for later:
    3) llama.cpp  `llama-server -m model.gguf` serves OpenAI-compatible on :8080
-   4) MLX        `mlx_lm.server` serves OpenAI-compatible on :8080 (Apple Silicon)
+   4) MLX        `mlx_lm.server` serves OpenAI-compatible on :8080 (Apple Silicon)  ← fits this machine (Apple Silicon)
    5) vLLM       `vllm serve <model>` listens on :8000 (CUDA/ROCm hosts)
    6) LiteLLM    `litellm --model …` proxies many engines on :4000
    7) Jan        Jan → Local API Server (:1337)
@@ -61,6 +62,17 @@ the choice is saved, and the wizard says plainly that the node will
 advertise nothing until that engine answers. Detection is by evidence, not
 port: a scan identifies each engine by how it answers, and a model count of
 `0` is shown as the warning it is.
+
+The green `← fits this machine` tag is the wizard reading step 1 for you:
+MLX on Apple Silicon, llama.cpp with CUDA/ROCm/SYCL offloading where a card
+is usable, llama.cpp with quantized GGUF models on plain CPUs. It is advice
+with a reason attached, never a decision — the pick stays yours. The
+Enter-accept default follows a simple ranking: the suggested engine when it
+is already running, otherwise any running engine (live models beat a plan),
+and only on a machine with nothing running does Enter accept the suggestion
+as a *for later* choice — with the same "advertises nothing until it
+answers" honesty. `kmplify-node engines` prints the same suggestion outside
+the wizard.
 
 - Engine on another machine or port? Option 8, or just paste the URL.
 - colibri gets its own question rather than a menu slot, because it is a
@@ -118,7 +130,7 @@ capacity can find you; leaving it empty records `XX`.
    host signed Wasm functions? (small sandboxed jobs: HTML to text, CSV to JSON, …) [y/N]: y
    this fabric signs its catalog with 58c84fcafcc81e04… — only modules under this key will run
    trust it? [Y/n]: 
-   hold peers' vector collections? (replicated RAG indexes, payloads opaque to you) [y/N]:
+   hold peers' vector collections? (replicated RAG indexes, payloads opaque to you) [y/N]: 
 ```
 
 **Step 6** is the protocol v3.0 lanes. Opting into functions makes the
