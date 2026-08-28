@@ -288,6 +288,12 @@ struct Preflight {
     models: Vec<String>,
     engines: HashMap<String, String>,
     gateway: Result<u16, String>,
+    /// The engine base KMPLIFY Desktop's provider mode on THIS machine is
+    /// set to lend, when the app is installed and sharing is switched on.
+    /// The two providers coexist by design — separate identities, no
+    /// listening ports, ephemeral session ports — so this is a fact for one
+    /// specific warning, not a conflict detector.
+    desktop_lends: Option<String>,
     /// Stored sharing choices that are overriding the environment.
     overrides: Vec<String>,
     warnings: Vec<String>,
@@ -348,10 +354,61 @@ async fn gather(cfg: &WorkerConfig, timeout: Duration) -> Preflight {
         models,
         engines,
         gateway,
+        desktop_lends: desktop_provider_lends(),
         overrides: Vec::new(),
         warnings: Vec::new(),
         errors: Vec::new(),
     }
+}
+
+/// The engine base KMPLIFY Desktop's provider prefs lend, read from one
+/// candidate directory. `None` when the file is absent or unreadable, or
+/// when sharing is off — an installed-but-idle desktop is not lending.
+///
+/// Only `enabled` and `engine_base` are read. The file also carries the
+/// desktop's colibri key; it is never touched, printed or kept, the same
+/// way companions read `identity.json` and never `fabric_node.json`.
+fn desktop_provider_lends_in(dir: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(dir.join("provider_sharing.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    if !v.get("enabled").and_then(|b| b.as_bool()).unwrap_or(false) {
+        return None;
+    }
+    Some(
+        v.get("engine_base")
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            // The desktop's default when no engine was ever chosen.
+            .unwrap_or("http://127.0.0.1:11434")
+            .trim_end_matches('/')
+            .to_string(),
+    )
+}
+
+/// Where KMPLIFY Desktop (Tauri identifier `de.kmplify.desktop`) keeps its
+/// app data on this OS. Checked in order; first readable prefs file wins.
+fn desktop_provider_lends() -> Option<String> {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    #[cfg(target_os = "macos")]
+    if let Some(h) = std::env::var_os("HOME") {
+        dirs.push(
+            std::path::PathBuf::from(h).join("Library/Application Support/de.kmplify.desktop"),
+        );
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(a) = std::env::var_os("APPDATA") {
+        dirs.push(std::path::PathBuf::from(a).join("de.kmplify.desktop"));
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(x) = std::env::var_os("XDG_DATA_HOME") {
+            dirs.push(std::path::PathBuf::from(x).join("de.kmplify.desktop"));
+        }
+        if let Some(h) = std::env::var_os("HOME") {
+            dirs.push(std::path::PathBuf::from(h).join(".local/share/de.kmplify.desktop"));
+        }
+    }
+    dirs.iter().find_map(|d| desktop_provider_lends_in(d))
 }
 
 /// Turn the gathered facts into the verdicts, so the text and JSON renderings
@@ -410,6 +467,23 @@ fn judge(cfg: &WorkerConfig, pf: &mut Preflight) {
              filtering for EU residency will not see this node"
                 .into(),
         );
+    }
+    // Desktop and node side by side is a supported setup, not a conflict:
+    // separate fabric identities, no listening ports, session containers on
+    // ephemeral host ports. The one thing worth saying out loud is the same
+    // engine lent twice — while both are online, the fabric counts one GPU's
+    // models as two nodes' capacity and peers can oversubscribe it.
+    if cfg.share_inference {
+        if let Some(base) = &pf.desktop_lends {
+            if base == cfg.ollama_base.trim_end_matches('/') {
+                pf.warnings.push(format!(
+                    "KMPLIFY Desktop on this machine is also set to lend {base} — \
+                     running both advertises the same engine twice. Fine to run in \
+                     parallel; to avoid double-counting, lend a different engine here \
+                     (`kmplify-node set engine=…`) or share from only one of them."
+                ));
+            }
+        }
     }
     if cfg.functions.enabled && cfg.functions.trusted_pubkey.is_empty() {
         // Naming the endpoint, because the key is now the ONLY thing between
@@ -1821,6 +1895,75 @@ mod tests {
         clear();
     }
 
+    #[test]
+    fn desktop_prefs_are_read_narrowly_and_only_when_enabled() {
+        let dir = std::env::temp_dir().join(format!("kmplify-coexist-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("provider_sharing.json");
+
+        // Sharing off: an installed-but-idle desktop is not lending.
+        std::fs::write(
+            &p,
+            r#"{"enabled": false, "engine_base": "http://127.0.0.1:1234"}"#,
+        )
+        .unwrap();
+        assert_eq!(desktop_provider_lends_in(&dir), None);
+
+        // Enabled with no engine choice: the desktop's default Ollama.
+        std::fs::write(&p, r#"{"enabled": true}"#).unwrap();
+        assert_eq!(
+            desktop_provider_lends_in(&dir).as_deref(),
+            Some("http://127.0.0.1:11434")
+        );
+
+        // Enabled with a chosen engine, trailing slash normalized away.
+        std::fs::write(
+            &p,
+            r#"{"enabled": true, "engine_base": "http://127.0.0.1:1234/"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            desktop_provider_lends_in(&dir).as_deref(),
+            Some("http://127.0.0.1:1234")
+        );
+
+        // Unreadable JSON and a missing file both answer None, not a panic.
+        std::fs::write(&p, "not json").unwrap();
+        assert_eq!(desktop_provider_lends_in(&dir), None);
+        std::fs::remove_file(&p).unwrap();
+        assert_eq!(desktop_provider_lends_in(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lending_the_engine_the_desktop_lends_is_a_warning_not_an_error() {
+        let _g = env_lock();
+        clear();
+        let mut errs = Vec::new();
+        let cfg = resolve_config(&mut errs);
+        let mut pf = empty_preflight();
+        pf.models = vec!["m".into()];
+        pf.desktop_lends = Some(cfg.ollama_base.trim_end_matches('/').to_string());
+        judge(&cfg, &mut pf);
+        assert!(
+            pf.warnings.iter().any(|w| w.contains("KMPLIFY Desktop")),
+            "same engine lent twice must be said out loud: {:?}",
+            pf.warnings
+        );
+        assert!(
+            !pf.errors.iter().any(|e| e.contains("KMPLIFY Desktop")),
+            "coexistence is supported, never an error"
+        );
+
+        // A different engine is full coexistence — nothing to say.
+        let mut pf = empty_preflight();
+        pf.models = vec!["m".into()];
+        pf.desktop_lends = Some("http://127.0.0.1:1234".into());
+        judge(&cfg, &mut pf);
+        assert!(!pf.warnings.iter().any(|w| w.contains("KMPLIFY Desktop")));
+        clear();
+    }
+
     fn empty_preflight() -> Preflight {
         Preflight {
             docker: None,
@@ -1832,6 +1975,7 @@ mod tests {
             models: Vec::new(),
             engines: HashMap::new(),
             gateway: Ok(405),
+            desktop_lends: None,
             overrides: Vec::new(),
             warnings: Vec::new(),
             errors: Vec::new(),
