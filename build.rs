@@ -9,19 +9,19 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
-    // Deliberately NOT rerun-if-changed on a .git path. Declaring any
-    // rerun-if-changed switches Cargo off its default "rerun when any file in
-    // the package changed", and the only thing that told us the tree was
-    // dirty was the source files themselves: the stamp would keep saying
-    // clean while you edited the worker. rerun-if-env-changed does not
-    // disable the default, so this keeps it.
-    //
-    // The cost is re-running on every source change, which is two cheap git
-    // calls. The old form had the opposite problem AND was worse in a git
-    // worktree or submodule, where .git is a FILE: the declared path never
-    // matched, so the script re-ran every single build and dragged a
-    // dependent recompile with it.
+    // Emitting ANY rerun-if directive replaces Cargo's default "rerun when
+    // any file in the package changed" — rerun-if-env-changed included,
+    // despite what an earlier revision here believed. With only the env
+    // directive the script never reran on an incremental rebuild, so a
+    // binary built right after a commit still carried the PREVIOUS commit's
+    // stamp until a cargo clean. So the inputs that decide the stamp are
+    // declared explicitly instead: the sources whose edits flip the dirty
+    // flag, and the git files that move when HEAD does.
     println!("cargo:rerun-if-env-changed=KMPLIFY_BUILD");
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=Cargo.lock");
+    println!("cargo:rerun-if-changed=src");
 
     if std::env::var("KMPLIFY_BUILD").is_ok() {
         return;
@@ -35,6 +35,28 @@ fn main() {
     let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
     if dir.is_empty() || !Path::new(&dir).join(".git").exists() {
         return;
+    }
+
+    // Rerun when HEAD moves — a commit, a checkout — even when no source
+    // file changed, so the stamp follows the tree out of "-dirty". The
+    // gitdir is resolved through git rather than assumed at .git/: in a
+    // worktree or submodule .git is a FILE, and declaring a path that never
+    // exists made cargo rerun the script every single build, which is the
+    // trap the old always-default behaviour fell into from the other side.
+    if let Some(gitdir) = git(&dir, &["rev-parse", "--absolute-git-dir"]) {
+        let head = Path::new(&gitdir).join("HEAD");
+        if head.exists() {
+            println!("cargo:rerun-if-changed={}", head.display());
+        }
+        // The branch ref HEAD names advances on every commit. It can be
+        // missing as a loose file (packed refs after a gc) — committing
+        // recreates it, and the HEAD/source watches cover until then.
+        if let Some(refname) = git(&dir, &["symbolic-ref", "-q", "HEAD"]) {
+            let r = Path::new(&gitdir).join(&refname);
+            if r.exists() {
+                println!("cargo:rerun-if-changed={}", r.display());
+            }
+        }
     }
 
     let Some(short) = git(&dir, &["rev-parse", "--short", "HEAD"]) else {
