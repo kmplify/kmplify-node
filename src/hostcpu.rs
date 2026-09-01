@@ -61,29 +61,34 @@ pub fn start() {
     if STARTED.set(()).is_err() {
         return;
     }
-    std::thread::spawn(|| {
-        use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
-        let mut sys = System::new_with_specifics(
-            RefreshKind::new()
-                .with_cpu(CpuRefreshKind::everything())
-                .with_memory(MemoryRefreshKind::everything()),
-        );
+    use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
+    let mut sys = System::new_with_specifics(
+        RefreshKind::new()
+            .with_cpu(CpuRefreshKind::everything())
+            .with_memory(MemoryRefreshKind::everything()),
+    );
 
-        // Static facts, read once: a CPU does not grow cores at runtime.
-        let model = sys
-            .cpus()
-            .first()
-            .map(|c| c.brand().trim().to_string())
-            .unwrap_or_default();
-        let logical = sys.cpus().len();
-        let physical = sys.physical_core_count().unwrap_or(logical).max(1);
-        {
-            let mut w = cell().lock().unwrap();
-            w.model = model;
-            w.logical_cores = logical.max(1);
-            w.physical_cores = physical;
-        }
+    // Static facts, read once — and read HERE, before the sampler thread
+    // exists. The wizard's "this machine" mirror and the worker's first
+    // hello snapshot immediately after start() returns, and a thread that
+    // has not run yet left them the default: no model name and 0 cores for
+    // exactly the caller that asked first. A CPU does not grow cores at
+    // runtime, so reading synchronously is also simply correct.
+    let model = sys
+        .cpus()
+        .first()
+        .map(|c| c.brand().trim().to_string())
+        .unwrap_or_default();
+    let logical = sys.cpus().len();
+    let physical = sys.physical_core_count().unwrap_or(logical).max(1);
+    {
+        let mut w = cell().lock().unwrap();
+        w.model = model;
+        w.logical_cores = logical.max(1);
+        w.physical_cores = physical;
+    }
 
+    std::thread::spawn(move || {
         let mut warmed = false;
         loop {
             std::thread::sleep(SAMPLE_INTERVAL);
