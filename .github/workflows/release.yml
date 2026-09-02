@@ -176,6 +176,36 @@ jobs:
           cd release
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
+      # Sign the manifest, so scripts/install.sh can tell a substituted release
+      # from a corrupted one. The checksum alone cannot: it travels with the
+      # assets, so replacing both is one action (audit F13).
+      #
+      # Skipped, loudly, until the secret exists — a release that cannot be
+      # signed should still ship, and install.sh treats an unsigned release as
+      # checksum-only rather than refusing it, until its RELEASE_PUBKEY is set.
+      #
+      # The key must be ECDSA or RSA. `openssl dgst -verify`, which install.sh
+      # uses, cannot verify Ed25519 at all.
+      - name: Sign SHA256SUMS
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RELEASE_SIGNING_KEY:-}" ]; then
+            echo "::warning::RELEASE_SIGNING_KEY is not set — publishing an UNSIGNED release. See scripts/install.sh."
+            exit 0
+          fi
+          umask 077
+          printf '%s\n' "$RELEASE_SIGNING_KEY" > signing-key.pem
+          openssl dgst -sha256 -sign signing-key.pem \
+            -out release/SHA256SUMS.sig release/SHA256SUMS
+          # Prove what was just produced actually verifies, here, rather than
+          # finding out on someone's machine.
+          openssl pkey -in signing-key.pem -pubout -out signing-pub.pem
+          openssl dgst -sha256 -verify signing-pub.pem \
+            -signature release/SHA256SUMS.sig release/SHA256SUMS
+          rm -f signing-key.pem signing-pub.pem
+          echo "SHA256SUMS signed and verified"
       # Draft first. `install.sh` resolves `releases/latest` and then fetches
       # SHA256SUMS, so a release that exists while its assets are still
       # uploading is a real failure window: the installer would find the

@@ -586,9 +586,75 @@ async fn write_private(path: &Path, bytes: Vec<u8>) -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        tokio::fs::write(path, bytes).await
+        tokio::fs::write(path, bytes).await?;
+        restrict_to_current_user(path).await;
+        Ok(())
     }
 }
+
+/// Windows equivalent of the 0600 above: this file, this user, nobody else.
+///
+/// The Unix branch has always been careful and this one was a bare write, so
+/// the node's token inherited whatever the containing directory granted. Under
+/// the default `%USERPROFILE%` that is already per-user and the exposure is
+/// small — but `KMPLIFY_NODE_DIR` is configurable, and pointing a service
+/// install at somewhere like `C:\ProgramData` inherits an ACL that grants
+/// Users read. The token authenticates this machine to the fabric, so "small
+/// under the default" is not the same as restricted. See F10 in
+/// docs/security/AUDIT-2026-08-24.md.
+///
+/// `icacls` rather than a Windows-API crate: this is one call on a path the
+/// process just wrote, the repo already shells out for docker, and a new
+/// dependency (plus unsafe FFI) to set one DACL is a poor trade for an
+/// Apache-2.0 crate other people vendor.
+///
+/// Best effort, like the MySQL session mode in the RAG service: a machine
+/// where icacls is missing or refuses should lose the hardening, not the
+/// node. The warning says which happened.
+#[cfg(windows)]
+async fn restrict_to_current_user(path: &Path) {
+    // /inheritance:r drops the inherited ACEs — without it the grant below is
+    // added to whatever the parent directory already allowed, which is the
+    // thing being removed. Both grants are then required: with inheritance
+    // gone, an ACL naming nobody locks the owner out too.
+    let user = match std::env::var("USERNAME") {
+        Ok(u) if !u.trim().is_empty() => u,
+        _ => {
+            log(format!(
+                "could not restrict {} — USERNAME is not set, so there is no \
+                 account to grant it to; the file keeps the folder's permissions",
+                path.display()
+            ));
+            return;
+        }
+    };
+    let out = crate::proc::command("icacls")
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("{user}:F"))
+        .arg("/grant:r")
+        .arg("SYSTEM:F")
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => log(format!(
+            "could not restrict {}: icacls said {}",
+            path.display(),
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => log(format!(
+            "could not restrict {}: icacls did not run ({e})",
+            path.display()
+        )),
+    }
+}
+
+/// Nothing to do off Windows: the Unix branch above already created the file
+/// with mode 0600.
+#[cfg(all(not(unix), not(windows)))]
+async fn restrict_to_current_user(_path: &Path) {}
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
