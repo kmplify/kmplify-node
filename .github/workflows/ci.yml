@@ -23,6 +23,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets
 
+  # The window and the router are opt-in features, so the default build
+  # above never compiles them; this one does, on the three desktops, with
+  # the tray on the two that have one.
+  gui:
+    name: gui (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gui
+      - name: Linux display libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev
+      - run: cargo test --all-targets --features gui
+      - run: cargo clippy --all-targets --features gui
+
   lint:
     runs-on: ubuntu-latest
     steps:

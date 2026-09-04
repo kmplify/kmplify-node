@@ -30,7 +30,9 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
-use rustls::{ClientConfig, DigitallySignedStruct, DistinguishedName, ServerConfig, SignatureScheme};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, DistinguishedName, ServerConfig, SignatureScheme,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use spake2::{Ed25519Group, Identity as SpakeIdentity, Password, Spake2};
@@ -108,9 +110,10 @@ impl Identity {
         }
         let key_pair = rcgen::KeyPair::generate().map_err(|e| format!("key generation: {e}"))?;
         let host = super::hostname();
-        let mut params = rcgen::CertificateParams::new(vec![
-            format!("{}.kmplify-node.local", &node_id[..12.min(node_id.len())]),
-        ])
+        let mut params = rcgen::CertificateParams::new(vec![format!(
+            "{}.kmplify-node.local",
+            &node_id[..12.min(node_id.len())]
+        )])
         .map_err(|e| format!("certificate parameters: {e}"))?;
         params
             .distinguished_name
@@ -188,7 +191,10 @@ impl ClusterFile {
     }
 
     pub fn fingerprints(&self) -> HashSet<String> {
-        self.members.values().map(|m| m.fingerprint.clone()).collect()
+        self.members
+            .values()
+            .map(|m| m.fingerprint.clone())
+            .collect()
     }
 }
 
@@ -235,7 +241,9 @@ impl PinnedVerifier {
         if self.pins.contains(&fingerprint(end_entity.as_ref())) {
             Ok(())
         } else {
-            Err(rustls::Error::General("certificate is not pinned by this node".into()))
+            Err(rustls::Error::General(
+                "certificate is not pinned by this node".into(),
+            ))
         }
     }
 }
@@ -249,7 +257,8 @@ impl ServerCertVerifier for PinnedVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        self.check(end_entity).map(|_| ServerCertVerified::assertion())
+        self.check(end_entity)
+            .map(|_| ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -298,7 +307,8 @@ impl ClientCertVerifier for PinnedVerifier {
         _intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
-        self.check(end_entity).map(|_| ClientCertVerified::assertion())
+        self.check(end_entity)
+            .map(|_| ClientCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -421,6 +431,18 @@ impl Invite {
         }
     }
 
+    /// An invitation as another process published it: the PIN, what is
+    /// left of its five minutes, the wrong guesses so far. For display
+    /// only — it holds no sessions and answers no joiner.
+    pub fn restored(pin: String, remaining: Duration, wrong_attempts: u32) -> Self {
+        Self {
+            pin,
+            created: Instant::now() - INVITE_TTL.saturating_sub(remaining),
+            wrong_attempts,
+            sessions: BTreeMap::new(),
+        }
+    }
+
     pub fn expired(&self) -> bool {
         self.created.elapsed() > INVITE_TTL || self.wrong_attempts >= INVITE_ATTEMPTS
     }
@@ -522,7 +544,8 @@ pub fn handle_pair(
             msg,
             joiner_info_port,
         } => {
-            let joiner_der = hex::decode(&joiner_cert).map_err(|_| (400, "joiner_cert is not hex".to_string()))?;
+            let joiner_der = hex::decode(&joiner_cert)
+                .map_err(|_| (400, "joiner_cert is not hex".to_string()))?;
             let their_msg = hex::decode(&msg).map_err(|_| (400, "msg is not hex".to_string()))?;
             if joiner_id == self_id {
                 return Err((400, "a node cannot pair with itself".into()));
@@ -659,7 +682,11 @@ pub async fn join(shared: Shared, address: String, pin: String) -> Result<String
         let Some(identity) = r.identity.clone() else {
             return Err("this node has no certificate".into());
         };
-        (identity, r.self_id.clone(), r.local().map(|n| n.name.clone()).unwrap_or_default())
+        (
+            identity,
+            r.self_id.clone(),
+            r.local().map(|n| n.name.clone()).unwrap_or_default(),
+        )
     };
     let (state, our_msg) = Spake2::<Ed25519Group>::start_symmetric(
         &Password::new(pin.as_bytes()),
@@ -670,13 +697,17 @@ pub async fn join(shared: Shared, address: String, pin: String) -> Result<String
         .build()
         .map_err(|e| e.to_string())?;
     let url = pair_url(&address);
-    let started: PairResponse = post(&client, &url, &PairRequest::Start {
-        joiner_id: self_id.clone(),
-        joiner_name: self_name.clone(),
-        joiner_cert: hex::encode(identity.cert.as_ref()),
-        msg: hex::encode(our_msg),
-        joiner_info_port: Some(node_info_port()),
-    })
+    let started: PairResponse = post(
+        &client,
+        &url,
+        &PairRequest::Start {
+            joiner_id: self_id.clone(),
+            joiner_name: self_name.clone(),
+            joiner_cert: hex::encode(identity.cert.as_ref()),
+            msg: hex::encode(our_msg),
+            joiner_info_port: Some(node_info_port()),
+        },
+    )
     .await?;
     let PairResponse::Started {
         session,
@@ -691,7 +722,8 @@ pub async fn join(shared: Shared, address: String, pin: String) -> Result<String
         return Err("unexpected answer to the first pairing step".into());
     };
     let their_msg = hex::decode(&msg).map_err(|_| "malformed key exchange message".to_string())?;
-    let inviter_der = hex::decode(&inviter_cert).map_err(|_| "malformed certificate".to_string())?;
+    let inviter_der =
+        hex::decode(&inviter_cert).map_err(|_| "malformed certificate".to_string())?;
     let key = state
         .finish(&their_msg)
         .map_err(|_| "malformed key exchange message".to_string())?;
@@ -707,12 +739,20 @@ pub async fn join(shared: Shared, address: String, pin: String) -> Result<String
             return Err("this node is already in a different cluster; leave it first".into());
         }
     }
-    let done: PairResponse = post(&client, &url, &PairRequest::Confirm {
-        session,
-        confirm: hex::encode(confirm_tag(&key, b"joiner", &transcript)),
-    })
+    let done: PairResponse = post(
+        &client,
+        &url,
+        &PairRequest::Confirm {
+            session,
+            confirm: hex::encode(confirm_tag(&key, b"joiner", &transcript)),
+        },
+    )
     .await?;
-    let PairResponse::Done { cluster_id, members } = done else {
+    let PairResponse::Done {
+        cluster_id,
+        members,
+    } = done
+    else {
         return Err("unexpected answer to the confirmation step".into());
     };
     let mut r = lock(&shared);
@@ -739,7 +779,11 @@ pub async fn join(shared: Shared, address: String, pin: String) -> Result<String
                     super::Source::Member,
                     Instant::now(),
                 );
-                node.info_port = if m.info_port == 0 { node_info_port() } else { m.info_port };
+                node.info_port = if m.info_port == 0 {
+                    node_info_port()
+                } else {
+                    m.info_port
+                };
                 r.upsert_peer(node);
             }
             r.admit(m);
@@ -767,14 +811,24 @@ pub async fn join(shared: Shared, address: String, pin: String) -> Result<String
         }
     }
     let size = r.cluster.members.len() + 1;
-    r.push_log(format!("paired with {inviter_name}; cluster of {size} node(s)"));
+    r.push_log(format!(
+        "paired with {inviter_name}; cluster of {size} node(s)"
+    ));
     Ok(format!(
         "paired with {inviter_name}{}",
-        if added > 0 { format!(" and {added} other member(s)") } else { String::new() }
+        if added > 0 {
+            format!(" and {added} other member(s)")
+        } else {
+            String::new()
+        }
     ))
 }
 
-async fn post(client: &reqwest::Client, url: &str, req: &PairRequest) -> Result<PairResponse, String> {
+async fn post(
+    client: &reqwest::Client,
+    url: &str,
+    req: &PairRequest,
+) -> Result<PairResponse, String> {
     let resp = client
         .post(url)
         .json(req)
@@ -807,7 +861,9 @@ impl Router {
     /// remaining member's report does not add it back.
     pub fn remove_member(&mut self, id: &str) {
         if self.cluster.members.remove(id).is_some() {
-            self.cluster.removed.insert(id.to_string(), crate::status::now_ms());
+            self.cluster
+                .removed
+                .insert(id.to_string(), crate::status::now_ms());
             self.refresh_trust();
         }
     }
@@ -943,7 +999,12 @@ mod tests {
     /// The two ends of the protocol in one process, no network: the
     /// joiner's steps are what `join` sends, the inviter's what
     /// `handle_pair` answers.
-    fn run_pairing(inviter: &Shared, joiner: &Shared, joiner_id: &Identity, pin: &str) -> Result<PairResponse, (u16, String)> {
+    fn run_pairing(
+        inviter: &Shared,
+        joiner: &Shared,
+        joiner_id: &Identity,
+        pin: &str,
+    ) -> Result<PairResponse, (u16, String)> {
         let (state, msg) = Spake2::<Ed25519Group>::start_symmetric(
             &Password::new(pin.as_bytes()),
             &SpakeIdentity::new(SPAKE_ID),
@@ -960,14 +1021,25 @@ mod tests {
             },
             Some("10.0.0.9".parse().unwrap()),
         )?;
-        let PairResponse::Started { session, inviter_cert, msg, cluster_id, confirm, .. } = started else {
+        let PairResponse::Started {
+            session,
+            inviter_cert,
+            msg,
+            cluster_id,
+            confirm,
+            ..
+        } = started
+        else {
             panic!("expected Started");
         };
         let key = state.finish(&hex::decode(msg).unwrap()).unwrap();
         let inviter_fp = fingerprint(&hex::decode(inviter_cert).unwrap());
         let t = transcript(&joiner_id.fingerprint, &inviter_fp, &cluster_id);
         assert!(
-            constant_eq(&confirm_tag(&key, b"inviter", &t), &hex::decode(&confirm).unwrap()),
+            constant_eq(
+                &confirm_tag(&key, b"inviter", &t),
+                &hex::decode(&confirm).unwrap()
+            ),
             "the inviter's confirmation must verify under the joiner's key"
         );
         handle_pair(
@@ -982,10 +1054,17 @@ mod tests {
 
     #[test]
     fn an_identity_is_minted_once_and_reloaded_after() {
-        let dir = std::env::temp_dir().join(format!("kmplify-id-test-{}-{}", std::process::id(), rand::random::<u32>()));
+        let dir = std::env::temp_dir().join(format!(
+            "kmplify-id-test-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
         let a = Identity::load_or_create(&dir, "abcdef0123456789").unwrap();
         let b = Identity::load_or_create(&dir, "abcdef0123456789").unwrap();
-        assert_eq!(a.fingerprint, b.fingerprint, "a second start must not change the fingerprint peers pinned");
+        assert_eq!(
+            a.fingerprint, b.fingerprint,
+            "a second start must not change the fingerprint peers pinned"
+        );
         assert_eq!(a.fingerprint.len(), 64);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -996,17 +1075,34 @@ mod tests {
         let (joiner, joiner_id) = party("joiner");
         let pin = lock(&inviter).open_invite();
         let done = run_pairing(&inviter, &joiner, &joiner_id, &pin).expect("pairing");
-        let PairResponse::Done { cluster_id, members } = done else { panic!("expected Done") };
+        let PairResponse::Done {
+            cluster_id,
+            members,
+        } = done
+        else {
+            panic!("expected Done")
+        };
         assert!(!cluster_id.is_empty());
-        assert!(members.iter().any(|m| m.fingerprint == inviter_id.fingerprint));
+        assert!(members
+            .iter()
+            .any(|m| m.fingerprint == inviter_id.fingerprint));
         let r = lock(&inviter);
         assert!(r.is_member("joiner"));
         assert!(r.pins.contains(&joiner_id.fingerprint));
-        assert_eq!(r.cluster.members["joiner"].fingerprint, joiner_id.fingerprint);
+        assert_eq!(
+            r.cluster.members["joiner"].fingerprint,
+            joiner_id.fingerprint
+        );
         let card = &r.nodes["joiner"];
-        assert_eq!(card.address, "10.0.0.9", "the joiner gets a card at the address it paired from");
+        assert_eq!(
+            card.address, "10.0.0.9",
+            "the joiner gets a card at the address it paired from"
+        );
         assert_eq!(card.info_port, 24418);
-        assert_eq!(r.cluster.members["joiner"].address, "10.0.0.9", "and the address is remembered");
+        assert_eq!(
+            r.cluster.members["joiner"].address, "10.0.0.9",
+            "and the address is remembered"
+        );
         assert_eq!(r.cluster.members["joiner"].info_port, 24418);
     }
 
@@ -1015,8 +1111,28 @@ mod tests {
         let (shared, _) = party("seed");
         let mut r = lock(&shared);
         r.cluster.cluster_id = "c".into();
-        r.cluster.members.insert("a".into(), Member { id: "a".into(), name: "a".into(), fingerprint: "fa".into(), added_ms: 0, address: "10.0.0.2".into(), info_port: 24418 });
-        r.cluster.members.insert("b".into(), Member { id: "b".into(), name: "b".into(), fingerprint: "fb".into(), added_ms: 0, address: String::new(), info_port: 0 });
+        r.cluster.members.insert(
+            "a".into(),
+            Member {
+                id: "a".into(),
+                name: "a".into(),
+                fingerprint: "fa".into(),
+                added_ms: 0,
+                address: "10.0.0.2".into(),
+                info_port: 24418,
+            },
+        );
+        r.cluster.members.insert(
+            "b".into(),
+            Member {
+                id: "b".into(),
+                name: "b".into(),
+                fingerprint: "fb".into(),
+                added_ms: 0,
+                address: String::new(),
+                info_port: 0,
+            },
+        );
         r.seed_member_cards();
         assert_eq!(r.nodes["a"].address, "10.0.0.2");
         assert_eq!(r.nodes["a"].info_port, 24418);
@@ -1048,19 +1164,35 @@ mod tests {
                 },
                 None,
             );
-            let Ok(PairResponse::Started { session, msg, inviter_cert, cluster_id, confirm, .. }) = started else {
-                panic!("start is answered even for a wrong PIN: the PIN is checked at confirmation");
+            let Ok(PairResponse::Started {
+                session,
+                msg,
+                inviter_cert,
+                cluster_id,
+                confirm,
+                ..
+            }) = started
+            else {
+                panic!(
+                    "start is answered even for a wrong PIN: the PIN is checked at confirmation"
+                );
             };
             let key = state.finish(&hex::decode(msg).unwrap()).unwrap();
             let inviter_fp = fingerprint(&hex::decode(inviter_cert).unwrap());
             let t = transcript(&joiner_id.fingerprint, &inviter_fp, &cluster_id);
             assert!(
-                !constant_eq(&confirm_tag(&key, b"inviter", &t), &hex::decode(&confirm).unwrap()),
+                !constant_eq(
+                    &confirm_tag(&key, b"inviter", &t),
+                    &hex::decode(&confirm).unwrap()
+                ),
                 "a joiner with the wrong PIN cannot verify the inviter either"
             );
             let err = handle_pair(
                 &mut lock(&inviter),
-                PairRequest::Confirm { session, confirm: hex::encode(confirm_tag(&key, b"joiner", &t)) },
+                PairRequest::Confirm {
+                    session,
+                    confirm: hex::encode(confirm_tag(&key, b"joiner", &t)),
+                },
                 None,
             )
             .unwrap_err();
@@ -1096,7 +1228,14 @@ mod tests {
         let (shared, _) = party("merge");
         let mut r = lock(&shared);
         r.cluster.cluster_id = "c1".into();
-        let m = |id: &str| Member { id: id.into(), name: id.into(), fingerprint: format!("fp-{id}"), added_ms: 0, address: String::new(), info_port: 0 };
+        let m = |id: &str| Member {
+            id: id.into(),
+            name: id.into(),
+            fingerprint: format!("fp-{id}"),
+            added_ms: 0,
+            address: String::new(),
+            info_port: 0,
+        };
         assert_eq!(r.merge_members("other", vec![m("a")]), 0);
         assert_eq!(r.merge_members("c1", vec![m("a"), m("b")]), 2);
         r.remove_member("a");
@@ -1104,14 +1243,20 @@ mod tests {
         assert!(r.pins.contains("fp-b"));
         assert!(!r.pins.contains("fp-a"));
         r.admit(m("a"));
-        assert!(r.pins.contains("fp-a"), "pairing again clears the tombstone");
+        assert!(
+            r.pins.contains("fp-a"),
+            "pairing again clears the tombstone"
+        );
     }
 
     #[test]
     fn a_pinned_certificate_passes_the_verifier_and_a_stranger_does_not() {
         let (_, id) = party("verify");
         let pins = Pins::default();
-        let v = PinnedVerifier { pins: pins.clone(), provider: provider() };
+        let v = PinnedVerifier {
+            pins: pins.clone(),
+            provider: provider(),
+        };
         let now = UnixTime::now();
         assert!(v.verify_client_cert(&id.cert, &[], now).is_err());
         pins.set(HashSet::from([id.fingerprint.clone()]));
@@ -1131,7 +1276,14 @@ mod tests {
         let (shared, _) = party("leave");
         let mut r = lock(&shared);
         r.open_invite();
-        r.admit(Member { id: "p".into(), name: "p".into(), fingerprint: "f".into(), added_ms: 0, address: String::new(), info_port: 0 });
+        r.admit(Member {
+            id: "p".into(),
+            name: "p".into(),
+            fingerprint: "f".into(),
+            added_ms: 0,
+            address: String::new(),
+            info_port: 0,
+        });
         r.leave_cluster();
         assert!(!r.cluster.is_clustered());
         assert!(r.invite.is_none());

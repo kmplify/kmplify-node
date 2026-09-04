@@ -99,10 +99,25 @@ mod tests {
     fn stale_or_missing_telemetry_is_neutral_not_idle() {
         let now = Instant::now();
         let mut r = Router::default();
-        let mut fresh = Node::new_peer("f".into(), "f".into(), String::new(), Source::Discovered, now);
+        let mut fresh = Node::new_peer(
+            "f".into(),
+            "f".into(),
+            String::new(),
+            Source::Discovered,
+            now,
+        );
         fresh.metrics.observe_gpu(95.0, now);
-        let mut stale = Node::new_peer("s".into(), "s".into(), String::new(), Source::Discovered, now);
-        stale.metrics.observe_gpu(0.0, now - TELEMETRY_STALE - std::time::Duration::from_secs(1));
+        let mut stale = Node::new_peer(
+            "s".into(),
+            "s".into(),
+            String::new(),
+            Source::Discovered,
+            now,
+        );
+        stale.metrics.observe_gpu(
+            0.0,
+            now - TELEMETRY_STALE - std::time::Duration::from_secs(1),
+        );
         r.nodes.insert("f".into(), fresh);
         r.nodes.insert("s".into(), stale);
         assert_eq!(pressure_of(&r, "f", now), 3);
@@ -115,7 +130,8 @@ mod tests {
         let now = Instant::now();
         let mut r = Router::default();
         for (id, pending, gpu) in [("c", 0, 0.0), ("a", 0, 0.0), ("b", 2, 0.0), ("d", 0, 90.0)] {
-            let mut n = Node::new_peer(id.into(), id.into(), String::new(), Source::Discovered, now);
+            let mut n =
+                Node::new_peer(id.into(), id.into(), String::new(), Source::Discovered, now);
             n.reported_pending = pending;
             n.metrics.observe_gpu(gpu, now);
             r.nodes.insert(id.into(), n);

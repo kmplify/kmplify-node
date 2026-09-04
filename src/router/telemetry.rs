@@ -30,7 +30,7 @@ pub async fn sample_local(shared: Shared, accel: Backend) {
         tokio::time::sleep(TICK).await;
         tick = tick.wrapping_add(1);
         let cpu = hostcpu::snapshot();
-        if accel != Backend::Cpu && tick % GPU_EVERY == 0 {
+        if accel != Backend::Cpu && tick.is_multiple_of(GPU_EVERY) {
             let (p, v) = gpu::utilization(accel).await;
             gpu_pct = p;
             vram_used = v;
@@ -48,7 +48,10 @@ pub async fn sample_local(shared: Shared, accel: Backend) {
             m.sampled = true;
         }
         m.ram_used_mb = cpu.ram_used_mb;
-        m.ram.push(percent(cpu.ram_used_mb, cpu.ram_total_mb.max(me.ram_total_mb)));
+        m.ram.push(percent(
+            cpu.ram_used_mb,
+            cpu.ram_total_mb.max(me.ram_total_mb),
+        ));
         if let Some(p) = gpu_pct {
             m.observe_gpu(p as f32, Instant::now());
         }
@@ -150,6 +153,67 @@ pub fn roster_from(found: &[engines::Found]) -> Vec<Engine> {
         }
     }
     out
+}
+
+/// Work the fabric sends this node, as cards in the jobs column. The
+/// fabric worker publishes counters and the last model, not a list; a
+/// finished job becomes a card when the counter moves. Only meaningful
+/// where the worker runs in this process (`run --router`, or a standalone
+/// dashboard); elsewhere the in-process snapshot is empty and nothing is
+/// invented. Nothing about a job's content is available here, by design.
+pub async fn mirror_fabric_jobs(shared: Shared) {
+    let first = crate::status::snapshot();
+    let (mut seen_done, mut seen_failed) = (first.jobs.done, first.jobs.failed);
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let snap = crate::status::snapshot();
+        if snap.pid != std::process::id() {
+            continue;
+        }
+        if snap.jobs.done < seen_done || snap.jobs.failed < seen_failed {
+            // The worker restarted its counters.
+            seen_done = snap.jobs.done;
+            seen_failed = snap.jobs.failed;
+            continue;
+        }
+        if snap.jobs.done == seen_done && snap.jobs.failed == seen_failed {
+            continue;
+        }
+        let mut r = lock(&shared);
+        let self_id = r.self_id.clone();
+        let local_name = r.local().map(|n| n.name.clone()).unwrap_or_default();
+        let gateway = snap
+            .gateway
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .to_string();
+        let card = |i: u64, state: super::JobState, error: &str| super::Job {
+            id: format!("{}-fabric-{i}", &self_id[..8.min(self_id.len())]),
+            model: snap.jobs.last_model.clone(),
+            engine: "fabric".into(),
+            requested_from: gateway.clone(),
+            ran_on: local_name.clone(),
+            node_id: self_id.clone(),
+            state,
+            at_ms: crate::status::now_ms(),
+            error: error.into(),
+            local_origin: false,
+        };
+        for i in seen_done..snap.jobs.done {
+            let j = card(i, super::JobState::Completed, "");
+            r.push_job(j);
+        }
+        for i in seen_failed..snap.jobs.failed {
+            let j = card(
+                1_000_000 + i,
+                super::JobState::Failed,
+                "the fabric reported an error for this job",
+            );
+            r.push_job(j);
+        }
+        seen_done = snap.jobs.done;
+        seen_failed = snap.jobs.failed;
+    }
 }
 
 /// Drop peers that stopped announcing. Discovery removals arrive too, but

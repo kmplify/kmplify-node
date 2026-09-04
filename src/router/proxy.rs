@@ -128,7 +128,10 @@ pub fn classify(info: &PeerInfo, lan_ingress: bool) -> Caller {
 /// The `model` a request names, if its body is JSON with one.
 pub fn model_of(body: &[u8]) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-    v.get("model")?.as_str().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    v.get("model")?
+        .as_str()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Should this status send the request to the next advertised owner?
@@ -230,14 +233,16 @@ async fn handle(
     let requested_from = origin.clone().unwrap_or_else(|| self_name.clone());
     let mut last_err = String::new();
     for node_id in order {
-        let Some((target, engine_id, ran_on)) = target_for(&ctx, &node_id, &model, &path, &query) else {
+        let Some((target, engine_id, ran_on)) = target_for(&ctx, &node_id, &model, &path, &query)
+        else {
             continue;
         };
         let job_id = Job::new_id(&self_id);
-        // A model listing is bookkeeping, not work: a peer's fan-out lands
-        // here once per refresh and would fill the jobs column with
-        // entries nobody asked about.
-        if !listing {
+        // Only a request that names a model is work. A listing (a peer's
+        // fan-out lands here once per refresh) and the version and health
+        // calls a client makes on connect are bookkeeping, and would fill
+        // the jobs column with entries nobody asked about.
+        if !listing && model.is_some() {
             let mut r = lock(&ctx.shared);
             r.push_job(Job {
                 id: job_id.clone(),
@@ -288,7 +293,10 @@ async fn handle(
             }
         }
     }
-    error(StatusCode::BAD_GATEWAY, &format!("every capable node failed; last: {last_err}"))
+    error(
+        StatusCode::BAD_GATEWAY,
+        &format!("every capable node failed; last: {last_err}"),
+    )
 }
 
 /// Where a request for `node_id` goes: this machine's engine directly, a
@@ -310,14 +318,21 @@ fn target_for(
             None => n.running_engines().find(|e| ctx.api.accepts(&e.id))?,
         };
         let base = engine.base.trim_end_matches('/');
-        Some((format!("{base}{path}{q}"), engine.id.clone(), n.name.clone()))
+        Some((
+            format!("{base}{path}{q}"),
+            engine.id.clone(),
+            n.name.clone(),
+        ))
     } else {
         let port = match ctx.api {
             Api::Ollama => n.proxy_ports.0,
             Api::OpenAi => n.proxy_ports.1,
         };
         let engine = match model {
-            Some(m) => n.serves(m, ctx.api).map(|e| e.id.clone()).unwrap_or_default(),
+            Some(m) => n
+                .serves(m, ctx.api)
+                .map(|e| e.id.clone())
+                .unwrap_or_default(),
             None => String::new(),
         };
         Some((
@@ -337,8 +352,14 @@ fn forward_headers(src: &HeaderMap) -> HeaderMap {
         let name = k.as_str();
         if matches!(
             name,
-            "host" | "content-length" | "connection" | "transfer-encoding" | "keep-alive"
-                | "proxy-connection" | "upgrade" | "te"
+            "host"
+                | "content-length"
+                | "connection"
+                | "transfer-encoding"
+                | "keep-alive"
+                | "proxy-connection"
+                | "upgrade"
+                | "te"
         ) || name.starts_with("x-kmplify-")
         {
             continue;
@@ -364,12 +385,20 @@ fn relay(ctx: &Ctx, resp: reqwest::Response, job_id: String) -> Response {
     }
     let shared = ctx.shared.clone();
     if !status.is_success() {
-        lock(&shared).set_job_state(&job_id, JobState::Failed, format!("upstream answered {status}"));
+        lock(&shared).set_job_state(
+            &job_id,
+            JobState::Failed,
+            format!("upstream answered {status}"),
+        );
     }
     let guard = JobGuard {
         shared,
         job_id,
-        outcome: status.is_success().then_some(JobState::Completed).unwrap_or(JobState::Failed),
+        outcome: if status.is_success() {
+            JobState::Completed
+        } else {
+            JobState::Failed
+        },
         error: String::new(),
     };
     let stream = resp.bytes_stream().map(move |chunk| {
@@ -409,14 +438,22 @@ async fn fan_out(ctx: &Ctx, path: &str) -> Response {
         for n in r.nodes.values().filter(|n| n.online(now)) {
             if n.is_local() {
                 for e in n.running_engines().filter(|e| ctx.api.accepts(&e.id)) {
-                    t.push((format!("{}{path}", e.base.trim_end_matches('/')), n.name.clone(), false));
+                    t.push((
+                        format!("{}{path}", e.base.trim_end_matches('/')),
+                        n.name.clone(),
+                        false,
+                    ));
                 }
             } else if r.is_member(&n.id) && n.running_engines().any(|e| ctx.api.accepts(&e.id)) {
                 let port = match ctx.api {
                     Api::Ollama => n.proxy_ports.0,
                     Api::OpenAi => n.proxy_ports.1,
                 };
-                t.push((format!("https://{}:{port}{path}", n.address), n.name.clone(), true));
+                t.push((
+                    format!("https://{}:{port}{path}", n.address),
+                    n.name.clone(),
+                    true,
+                ));
             }
         }
         (
@@ -434,14 +471,28 @@ async fn fan_out(ctx: &Ctx, path: &str) -> Response {
             if peer {
                 req = req.header(HOP_HEADER, "1").header(ORIGIN_HEADER, self_name);
             }
-            let v = req.send().await.ok()?.json::<serde_json::Value>().await.ok()?;
+            let v = req
+                .send()
+                .await
+                .ok()?
+                .json::<serde_json::Value>()
+                .await
+                .ok()?;
             Some((node, v))
         }
     });
-    let answers: Vec<(String, serde_json::Value)> =
-        futures_util::future::join_all(fetches).await.into_iter().flatten().collect();
+    let answers: Vec<(String, serde_json::Value)> = futures_util::future::join_all(fetches)
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
     let merged = merge_listings(path, answers);
-    (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], merged.to_string()).into_response()
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        merged.to_string(),
+    )
+        .into_response()
 }
 
 /// One list from many, keyed by model name (`/api/tags`) or id
@@ -478,7 +529,10 @@ pub fn merge_listings(path: &str, answers: Vec<(String, serde_json::Value)>) -> 
             }
         }
     }
-    let list: Vec<Value> = order.into_iter().filter_map(|id| seen.remove(&id)).collect();
+    let list: Vec<Value> = order
+        .into_iter()
+        .filter_map(|id| seen.remove(&id))
+        .collect();
     if path == "/api/tags" {
         json!({ "models": list })
     } else {
@@ -505,20 +559,39 @@ mod tests {
     fn loopback_routes_paired_nodes_are_served_everyone_else_is_refused() {
         use crate::router::listen::TlsPeer;
         let lan: std::net::SocketAddr = "192.168.1.25:4".parse().unwrap();
-        let local = PeerInfo { addr: "127.0.0.1:4".parse().unwrap(), tls: None };
-        let local6 = PeerInfo { addr: "[::1]:4".parse().unwrap(), tls: None };
-        let plain = PeerInfo { addr: lan, tls: None };
+        let local = PeerInfo {
+            addr: "127.0.0.1:4".parse().unwrap(),
+            tls: None,
+        };
+        let local6 = PeerInfo {
+            addr: "[::1]:4".parse().unwrap(),
+            tls: None,
+        };
+        let plain = PeerInfo {
+            addr: lan,
+            tls: None,
+        };
         let member = PeerInfo {
             addr: lan,
-            tls: Some(TlsPeer { node_id: "n".into(), fingerprint: "f".into() }),
+            tls: Some(TlsPeer {
+                node_id: "n".into(),
+                fingerprint: "f".into(),
+            }),
         };
         let pinned_unlisted = PeerInfo {
             addr: lan,
-            tls: Some(TlsPeer { node_id: String::new(), fingerprint: "f".into() }),
+            tls: Some(TlsPeer {
+                node_id: String::new(),
+                fingerprint: "f".into(),
+            }),
         };
         assert_eq!(classify(&local, true), Caller::Local);
         assert_eq!(classify(&local6, false), Caller::Local);
-        assert_eq!(classify(&plain, true), Caller::Refused, "plaintext from the network is never served");
+        assert_eq!(
+            classify(&plain, true),
+            Caller::Refused,
+            "plaintext from the network is never served"
+        );
         assert_eq!(classify(&member, true), Caller::Peer);
         assert_eq!(classify(&member, false), Caller::Refused, "LAN ingress off");
         assert_eq!(classify(&pinned_unlisted, true), Caller::Refused);
@@ -526,7 +599,10 @@ mod tests {
 
     #[test]
     fn the_model_is_read_from_json_and_nothing_else() {
-        assert_eq!(model_of(br#"{"model":" qwen3 ","messages":[]}"#), Some("qwen3".into()));
+        assert_eq!(
+            model_of(br#"{"model":" qwen3 ","messages":[]}"#),
+            Some("qwen3".into())
+        );
         assert_eq!(model_of(br#"{"model":""}"#), None);
         assert_eq!(model_of(b"not json"), None);
         assert_eq!(model_of(br#"{"prompt":"x"}"#), None);

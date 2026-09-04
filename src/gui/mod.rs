@@ -14,8 +14,12 @@
 //! reports. The router side (discovery, meters, routing) lives in this
 //! process either way.
 
+mod autostart;
 mod chart;
+mod icon;
 mod theme;
+#[cfg(any(windows, target_os = "macos"))]
+mod tray;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -23,10 +27,10 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Color32, Layout, Pos2, RichText, Sense, Stroke, Vec2};
 
-use kmplify_node::control::{self, Command};
+use kmplify_node::control::{self, Command, RouterCommand};
 use kmplify_node::fabric_worker::WorkerConfig;
 use kmplify_node::gpu::{Backend, Gpu};
-use kmplify_node::router::{self, Job, JobState, Node, Router, Shared, Source};
+use kmplify_node::router::{self, Job, JobState, Node, Router, RouterHandle, Source};
 use kmplify_node::settings::Settings;
 use kmplify_node::status::{self, Link, Snapshot};
 
@@ -86,14 +90,19 @@ pub async fn main(
         Some(crate::start_node(cfg, dir.clone()).await)
     };
 
-    let shared = router::new_shared(&dir, &gpus, router::lan_address());
-    router::spawn(shared.clone(), accel);
+    // The router: attached to the one the node (or another view) already
+    // runs here, or started in this process. Either way the window draws
+    // the same state and issues the same orders.
+    let handle = RouterHandle::open(&dir, &gpus, accel, standalone);
 
-    let app = GuiApp::new(shared, dir.clone(), attach_mode, accel, engine_base, live);
+    #[allow(unused_mut)]
+    let mut app = GuiApp::new(handle, dir.clone(), attach_mode, accel, engine_base, live);
     let title = format!("KMPLIFY Node · {}", router::hostname());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(&title)
+            .with_app_id("io.kmplify.node")
+            .with_icon(icon::window_icon(64))
             .with_inner_size([1180.0, 780.0])
             .with_min_inner_size([900.0, 600.0]),
         ..Default::default()
@@ -102,12 +111,20 @@ pub async fn main(
     // other workers keep the samplers and the fabric worker running
     // meanwhile; block_in_place tells tokio this thread is gone for a while
     // so it does not wait on it.
+    let tray_title = title.clone();
     let result = tokio::task::block_in_place(|| {
         eframe::run_native(
             &title,
             options,
-            Box::new(|cc| {
+            Box::new(move |cc| {
                 theme::apply(&cc.egui_ctx);
+                // The tray wants the event loop to exist first, which is
+                // exactly what this closure guarantees.
+                #[cfg(any(windows, target_os = "macos"))]
+                match tray::Tray::build(&cc.egui_ctx, &tray_title) {
+                    Ok(t) => app.tray = Some(t),
+                    Err(e) => status::push_log(format!("no tray icon: {e}")),
+                }
                 Ok(Box::new(app))
             }),
         )
@@ -181,7 +198,10 @@ impl Form {
                 .as_deref()
                 .unwrap_or(&snap.approval_mode)
                 == "manual",
-            country: stored.country.clone().unwrap_or_else(|| snap.country.clone()),
+            country: stored
+                .country
+                .clone()
+                .unwrap_or_else(|| snap.country.clone()),
             engine: stored
                 .engine
                 .clone()
@@ -210,7 +230,11 @@ impl Form {
         s.set("share-cpu", &self.share_cpu.to_string())?;
         s.set(
             "approval-mode",
-            if self.manual_approval { "manual" } else { "auto" },
+            if self.manual_approval {
+                "manual"
+            } else {
+                "auto"
+            },
         )?;
         s.set("country", self.country.trim())?;
         if !self.engine.trim().is_empty() {
@@ -223,11 +247,15 @@ impl Form {
             s.set("functions-pubkey", self.functions_pubkey.trim())?;
         }
         s.set("share-vectors", &self.share_vectors.to_string())?;
-        ceiling(&mut s, "max-vram-mb", self.max_vram_mb as u64)?;
-        ceiling(&mut s, "max-ram-mb", self.max_ram_mb as u64)?;
+        ceiling(&mut s, "max-vram-mb", self.max_vram_mb)?;
+        ceiling(&mut s, "max-ram-mb", self.max_ram_mb)?;
         ceiling(&mut s, "max-cpus", self.max_cpus as u64)?;
-        s.save(dir)
-            .map_err(|e| format!("cannot write {}: {e}", kmplify_node::settings::path(dir).display()))
+        s.save(dir).map_err(|e| {
+            format!(
+                "cannot write {}: {e}",
+                kmplify_node::settings::path(dir).display()
+            )
+        })
     }
 }
 
@@ -243,7 +271,7 @@ fn ceiling(s: &mut Settings, key: &str, value: u64) -> Result<(), String> {
 }
 
 struct GuiApp {
-    shared: Shared,
+    handle: RouterHandle,
     node_dir: PathBuf,
     attached: bool,
     accel: Backend,
@@ -251,11 +279,8 @@ struct GuiApp {
     filter: JobsFilter,
     form: Form,
     saved_form: Form,
-    /// The last fabric snapshot, and the counters it had, so a finished
-    /// fabric job becomes a card in the jobs column.
+    /// The last fabric snapshot: link state, counters, sharing.
     snap: Snapshot,
-    seen_done: u64,
-    seen_failed: u64,
     last_poll: Instant,
     /// Per node: the legend entry soloed on its chart.
     solo: HashMap<String, String>,
@@ -263,20 +288,38 @@ struct GuiApp {
     engines_open: HashMap<String, bool>,
     /// Per node and engine: the model typed into the pull field.
     pull_input: HashMap<String, String>,
+    /// Where each job card and each node's ring were drawn last frame, in
+    /// screen space, so the connection lines can join them. A frame behind
+    /// is invisible at this cadence and avoids ordering the panels.
+    job_anchor: HashMap<String, Pos2>,
+    node_anchor: HashMap<String, Pos2>,
+    /// The area the lines may cross: below the top bar, above the status
+    /// bar, so a line never runs over a title or a button.
+    canvas: egui::Rect,
     add_node: Option<String>,
     endpoints_open: bool,
     chat_open: bool,
     chat: Chat,
     notice: Option<(String, Color32, Instant)>,
-    /// The join form on the cluster card, and the attempt in flight.
+    /// The join form on the cluster card.
     join_addr: String,
     join_pin: String,
-    join_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Result<String, String>>>,
+    /// The tray icon, where the platform has one; closing the window then
+    /// hides it while this process hosts the node or the router.
+    #[cfg(any(windows, target_os = "macos"))]
+    tray: Option<tray::Tray>,
+    /// Set by the tray's Quit: the next close request is a real one.
+    quit: bool,
+    /// Whether the window is hidden in the tray right now.
+    hidden: bool,
+    /// The sign-in autostart entry, read once and kept in step with the
+    /// checkbox that toggles it.
+    autostart: bool,
 }
 
 impl GuiApp {
     fn new(
-        shared: Shared,
+        handle: RouterHandle,
         node_dir: PathBuf,
         attached: bool,
         accel: Backend,
@@ -287,7 +330,7 @@ impl GuiApp {
         let snap = live.unwrap_or_else(status::snapshot);
         let form = Form::from_node(&snap, &stored, &engine_base);
         Self {
-            shared,
+            handle,
             node_dir,
             attached,
             accel,
@@ -300,13 +343,14 @@ impl GuiApp {
             },
             saved_form: form.clone(),
             form,
-            seen_done: snap.jobs.done,
-            seen_failed: snap.jobs.failed,
             snap,
             last_poll: Instant::now() - POLL,
             solo: HashMap::new(),
             engines_open: HashMap::new(),
             pull_input: HashMap::new(),
+            job_anchor: HashMap::new(),
+            node_anchor: HashMap::new(),
+            canvas: egui::Rect::NOTHING,
             add_node: None,
             endpoints_open: false,
             chat_open: false,
@@ -314,7 +358,57 @@ impl GuiApp {
             notice: None,
             join_addr: String::new(),
             join_pin: String::new(),
-            join_rx: None,
+            #[cfg(any(windows, target_os = "macos"))]
+            tray: None,
+            quit: false,
+            hidden: false,
+            autostart: autostart::enabled(),
+        }
+    }
+
+    /// Does closing this window stop something? True when the node or the
+    /// router runs in this process rather than being attached to.
+    fn hosts_something(&self) -> bool {
+        !self.attached || !self.handle.attached()
+    }
+
+    /// Close requests and tray orders: hide instead of closing while this
+    /// process hosts the node or the router and a tray exists to come back
+    /// from; a real quit comes from the tray menu.
+    fn tray_and_close(&mut self, ctx: &egui::Context) {
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            let action = self.tray.as_ref().and_then(|t| t.poll());
+            match action {
+                Some(tray::TrayAction::Open) => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.hidden = false;
+                }
+                Some(tray::TrayAction::Quit) => {
+                    self.quit = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                None => {}
+            }
+            let closing = ctx.input(|i| i.viewport().close_requested());
+            if closing && !self.quit && self.tray.is_some() && self.hosts_something() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.hidden = true;
+            }
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            let _ = ctx;
+        }
+    }
+
+    /// An order for the router, wherever it runs, and a notice about it.
+    fn order(&mut self, cmd: RouterCommand) {
+        match self.handle.command(cmd) {
+            Ok(m) => self.notify(m, theme::OK),
+            Err(e) => self.notify(e, theme::ERR),
         }
     }
 
@@ -322,10 +416,9 @@ impl GuiApp {
         self.notice = Some((text.into(), color, Instant::now()));
     }
 
-    /// Re-read the fabric node once a second and turn its counters into
-    /// cards: the snapshot says how many jobs finished and which model was
-    /// last, which is enough for "model X ran here at T" without the
-    /// fabric worker ever handing prompts to anyone.
+    /// Re-read the fabric node once a second. Fabric jobs become cards in
+    /// the jobs column on the router's side (`telemetry::mirror_fabric_jobs`),
+    /// wherever the router runs.
     fn poll(&mut self) {
         if self.last_poll.elapsed() < POLL {
             return;
@@ -336,58 +429,10 @@ impl GuiApp {
         } else {
             Some(status::snapshot())
         };
-        let Some(snap) = fresh else {
-            self.snap.link = Link::Stopped;
-            return;
-        };
-        let (self_id, local_name, gateway) = {
-            let r = router::lock(&self.shared);
-            (
-                r.self_id.clone(),
-                r.local().map(|n| n.name.clone()).unwrap_or_default(),
-                snap.gateway
-                    .trim_start_matches("https://")
-                    .trim_start_matches("http://")
-                    .to_string(),
-            )
-        };
-        let fabric_job = |i: u64, state: JobState, error: &str| Job {
-            id: format!("{}-fabric-{i}", &self_id[..8.min(self_id.len())]),
-            model: snap.jobs.last_model.clone(),
-            engine: "fabric".into(),
-            requested_from: gateway.clone(),
-            ran_on: local_name.clone(),
-            node_id: self_id.clone(),
-            state,
-            at_ms: status::now_ms(),
-            error: error.into(),
-            // Finished already: it must never count as pending here.
-            local_origin: false,
-        };
-        let mut new_jobs = Vec::new();
-        if snap.jobs.done > self.seen_done {
-            for i in self.seen_done..snap.jobs.done {
-                new_jobs.push(fabric_job(i, JobState::Completed, ""));
-            }
+        match fresh {
+            Some(snap) => self.snap = snap,
+            None => self.snap.link = Link::Stopped,
         }
-        if snap.jobs.failed > self.seen_failed {
-            for i in self.seen_failed..snap.jobs.failed {
-                new_jobs.push(fabric_job(
-                    1_000_000 + i,
-                    JobState::Failed,
-                    "the fabric reported an error for this job",
-                ));
-            }
-        }
-        if !new_jobs.is_empty() {
-            let mut r = router::lock(&self.shared);
-            for j in new_jobs {
-                r.push_job(j);
-            }
-        }
-        self.seen_done = snap.jobs.done;
-        self.seen_failed = snap.jobs.failed;
-        self.snap = snap;
     }
 
     fn apply_settings(&mut self) {
@@ -416,23 +461,7 @@ impl GuiApp {
         if address.is_empty() {
             return;
         }
-        let mut r = router::lock(&self.shared);
-        if r.manual.iter().any(|a| a == &address) {
-            drop(r);
-            self.notify(format!("{address} is already on the list"), theme::WARN);
-            return;
-        }
-        r.manual.push(address.clone());
-        let id = format!("manual:{address}");
-        let (host, port) = Node::parse_address(&address);
-        let mut node = Node::new_peer(id.clone(), address.clone(), host, Source::Manual, Instant::now());
-        node.info_port = port;
-        // Offline until it answers a node-info poll, which is due at once.
-        node.last_seen = Instant::now() - router::PEER_TIMEOUT;
-        r.upsert_peer(node);
-        r.push_log(format!("added {address} by hand; probing its node-info surface"));
-        drop(r);
-        self.notify(format!("added {address} — probing"), theme::OK);
+        self.order(RouterCommand::AddNode { address });
     }
 }
 
@@ -440,20 +469,30 @@ impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         ctx.request_repaint_after(REPAINT);
+        self.tray_and_close(&ctx);
         self.poll();
+        // Hidden in the tray: nothing to draw, and the samplers do not need
+        // a window to keep the state current.
+        if self.hidden {
+            return;
+        }
         if let Some((_, _, at)) = &self.notice {
             if at.elapsed() > NOTICE_TTL {
                 self.notice = None;
             }
         }
-        let view: Router = router::lock(&self.shared).clone();
+        let view: Router = self.handle.view();
 
         self.top_bar(ui);
         self.status_bar(ui, &view);
         match self.tab {
             Tab::Overview => {
+                self.job_anchor.clear();
+                self.node_anchor.clear();
+                self.canvas = egui::Rect::NOTHING;
                 self.jobs_column(ui, &view);
                 self.node_list(ui, &view);
+                self.connection_lines(&ctx, &view);
             }
             Tab::Settings => self.settings_screen(ui, &view),
         }
@@ -498,11 +537,19 @@ impl GuiApp {
                     let active = self.tab == tab;
                     let text = RichText::new(label)
                         .size(13.5)
-                        .color(if active { theme::TEXT } else { theme::TEXT_MUTED })
+                        .color(if active {
+                            theme::TEXT
+                        } else {
+                            theme::TEXT_MUTED
+                        })
                         .strong();
                     let resp = ui.add(
                         egui::Button::new(text)
-                            .fill(if active { theme::CARD_RAISED } else { Color32::TRANSPARENT })
+                            .fill(if active {
+                                theme::CARD_RAISED
+                            } else {
+                                Color32::TRANSPARENT
+                            })
                             .stroke(Stroke::NONE),
                     );
                     if active {
@@ -521,9 +568,11 @@ impl GuiApp {
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let add = ui.add(
-                        egui::Button::new(RichText::new("+ Add node").color(Color32::WHITE).strong())
-                            .fill(theme::PRIMARY)
-                            .stroke(Stroke::NONE),
+                        egui::Button::new(
+                            RichText::new("+ Add node").color(Color32::WHITE).strong(),
+                        )
+                        .fill(theme::PRIMARY)
+                        .stroke(Stroke::NONE),
                     );
                     if add.clicked() {
                         self.add_node = Some(String::new());
@@ -574,11 +623,19 @@ impl GuiApp {
                     if let Some((text, color, _)) = &self.notice {
                         ui.label(RichText::new(text).color(*color).size(12.0));
                     } else {
-                        ui.label(theme::dim(if self.attached {
-                            "attached to the node running here"
-                        } else {
-                            "running the node in this window"
-                        }));
+                        ui.label(theme::dim(format!(
+                            "node {} · router {}",
+                            if self.attached {
+                                "attached"
+                            } else {
+                                "in this window"
+                            },
+                            if self.handle.attached() {
+                                "attached"
+                            } else {
+                                "in this window"
+                            }
+                        )));
                     }
                 });
             });
@@ -632,20 +689,25 @@ impl GuiApp {
                     });
                     return;
                 }
-                egui::ScrollArea::vertical()
+                let scroll = egui::ScrollArea::vertical()
                     .id_salt("jobs-scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for job in shown {
-                            job_card(ui, job);
+                            let rect = job_card(ui, job);
+                            // The line leaves the card near its top right,
+                            // where the eye starts reading it.
+                            self.job_anchor
+                                .insert(job.id.clone(), Pos2::new(rect.right(), rect.top() + 14.0));
                             ui.add_space(6.0);
                         }
                     });
+                self.canvas = self.canvas.union(scroll.inner_rect);
             });
     }
 }
 
-fn job_card(ui: &mut egui::Ui, job: &Job) {
+fn job_card(ui: &mut egui::Ui, job: &Job) -> egui::Rect {
     let (bar, state) = match job.state {
         JobState::Queued => (theme::WARN, "queued"),
         JobState::Running => (theme::OK, "running"),
@@ -662,19 +724,30 @@ fn job_card(ui: &mut egui::Ui, job: &Job) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("▣").color(theme::TEXT_MUTED).size(12.0));
             ui.label(
-                RichText::new(if job.model.is_empty() { "(model unknown)" } else { &job.model })
-                    .strong()
-                    .size(13.0),
+                RichText::new(if job.model.is_empty() {
+                    "(model unknown)"
+                } else {
+                    &job.model
+                })
+                .strong()
+                .size(13.0),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 theme::pill(ui, state, bar);
             });
         });
         if !job.requested_from.is_empty() {
-            ui.label(theme::muted(format!("Requested from {}", job.requested_from)));
+            ui.label(theme::muted(format!(
+                "Requested from {}",
+                job.requested_from
+            )));
         }
         if !job.ran_on.is_empty() {
-            let verb = if job.state == JobState::Running { "Running on" } else { "Ran on" };
+            let verb = if job.state == JobState::Running {
+                "Running on"
+            } else {
+                "Ran on"
+            };
             ui.label(theme::muted(format!("{verb} {}", job.ran_on)));
         }
         ui.label(theme::muted(format!(
@@ -694,6 +767,96 @@ fn job_card(ui: &mut egui::Ui, job: &Job) {
         theme::RADIUS_SM,
         bar,
     );
+    r
+}
+
+/// The curve from a job card to the ring of the node that served it, and
+/// its colour: PAIR's connection lines, which are what makes "where did it
+/// run" readable without reading.
+fn bezier(from: Pos2, to: Pos2) -> Vec<Pos2> {
+    let off = (to.x - from.x).abs() * 0.5;
+    let (p0, p1, p2, p3) = (
+        from,
+        Pos2::new(from.x + off, from.y),
+        Pos2::new(to.x - off, to.y),
+        to,
+    );
+    (0..=40)
+        .map(|i| {
+            let t = i as f32 / 40.0;
+            let u = 1.0 - t;
+            let x = u * u * u * p0.x
+                + 3.0 * u * u * t * p1.x
+                + 3.0 * u * t * t * p2.x
+                + t * t * t * p3.x;
+            let y = u * u * u * p0.y
+                + 3.0 * u * u * t * p1.y
+                + 3.0 * u * t * t * p2.y
+                + t * t * t * p3.y;
+            Pos2::new(x, y)
+        })
+        .collect()
+}
+
+impl GuiApp {
+    fn connection_lines(&mut self, ctx: &egui::Context, view: &Router) {
+        if self.canvas == egui::Rect::NOTHING || self.job_anchor.is_empty() {
+            return;
+        }
+        let painter = ctx
+            .layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("links"),
+            ))
+            .with_clip_rect(self.canvas);
+        let time = ctx.input(|i| i.time);
+        let mut any_running = false;
+        for job in view.jobs.iter().filter(|j| self.filter.shows(j.state)) {
+            let (Some(from), Some(to)) = (
+                self.job_anchor.get(&job.id),
+                self.node_anchor.get(&job.node_id),
+            ) else {
+                continue;
+            };
+            // A card scrolled out of view keeps its line pinned to the edge
+            // it left through, so a running job never reads as "nothing".
+            let from = Pos2::new(
+                from.x,
+                from.y.clamp(self.canvas.top(), self.canvas.bottom()),
+            );
+            let (color, alpha) = match job.state {
+                JobState::Running => (theme::OK, 0xff),
+                JobState::Queued => (theme::WARN, 0xcc),
+                JobState::Completed => (theme::TEXT_MUTED, 0x70),
+                JobState::Failed => (theme::ERR, 0xa0),
+            };
+            let pts = bezier(from, *to);
+            if job.state == JobState::Running {
+                any_running = true;
+                painter.add(egui::Shape::line(
+                    pts.clone(),
+                    Stroke::new(6.0, theme::with_alpha(color, 0x22)),
+                ));
+            }
+            painter.add(egui::Shape::line(
+                pts.clone(),
+                Stroke::new(2.0, theme::with_alpha(color, alpha)),
+            ));
+            if job.state == JobState::Running {
+                // One bead per second along the curve, glowing: the "jobs
+                // are running" signal that reads from across the room.
+                let t = (time % 1.0) as f32;
+                let i = ((pts.len() - 1) as f32 * t) as usize;
+                let p = pts[i.min(pts.len() - 1)];
+                painter.circle_filled(p, 6.0, theme::with_alpha(color, 0x30));
+                painter.circle_filled(p, 3.0, theme::with_alpha(color, 0x90));
+                painter.circle_filled(p, 1.2, theme::with_alpha(Color32::WHITE, 0xc0));
+            }
+        }
+        if any_running {
+            ctx.request_repaint();
+        }
+    }
 }
 
 // ------------------------------------------------------------------ nodes
@@ -709,7 +872,7 @@ impl GuiApp {
                 bottom: 8,
             });
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
-            egui::ScrollArea::vertical()
+            let scroll = egui::ScrollArea::vertical()
                 .id_salt("nodes-scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -729,6 +892,7 @@ impl GuiApp {
                         });
                     }
                 });
+            self.canvas = self.canvas.union(scroll.inner_rect);
         });
     }
 
@@ -766,7 +930,17 @@ impl GuiApp {
                         Stroke::new(1.0, theme::with_alpha(base_color, 0x50)),
                     );
                 }
-                chart::rings(ui.painter(), rect.center(), 26.0, &[(outer, c1), (inner, c2)]);
+                chart::rings(
+                    ui.painter(),
+                    rect.center(),
+                    26.0,
+                    &[(outer, c1), (inner, c2)],
+                );
+                // A connection line ends at the ring's left edge.
+                self.node_anchor.insert(
+                    node.id.clone(),
+                    Pos2::new(rect.center().x - 32.0, rect.center().y),
+                );
 
                 ui.add_space(6.0);
                 ui.vertical(|ui| {
@@ -775,7 +949,11 @@ impl GuiApp {
                             RichText::new(node.name.to_uppercase())
                                 .strong()
                                 .size(14.0)
-                                .color(if online { theme::TEXT } else { theme::TEXT_MUTED }),
+                                .color(if online {
+                                    theme::TEXT
+                                } else {
+                                    theme::TEXT_MUTED
+                                }),
                         );
                         if node.is_local() {
                             theme::pill(ui, "LOCAL", theme::OK);
@@ -804,11 +982,13 @@ impl GuiApp {
                 ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
                     let open = self.engines_open.get(&node.id).copied().unwrap_or(false);
                     if ui
-                        .add(egui::Button::new(RichText::new("⚙").size(14.0)).fill(if open {
-                            theme::PRIMARY_STRONG
-                        } else {
-                            theme::CARD_RAISED
-                        }))
+                        .add(
+                            egui::Button::new(RichText::new("⚙").size(14.0)).fill(if open {
+                                theme::PRIMARY_STRONG
+                            } else {
+                                theme::CARD_RAISED
+                            }),
+                        )
                         .on_hover_text("Engine settings")
                         .clicked()
                     {
@@ -822,7 +1002,8 @@ impl GuiApp {
             // ---- chart + legend
             ui.horizontal(|ui| {
                 let chart_w = (ui.available_width() - LEGEND_WIDTH - 12.0).max(200.0);
-                let (rect, _) = ui.allocate_exact_size(Vec2::new(chart_w, CHART_HEIGHT), Sense::hover());
+                let (rect, _) =
+                    ui.allocate_exact_size(Vec2::new(chart_w, CHART_HEIGHT), Sense::hover());
                 let solo = self.solo.get(&node.id).map(|s| s.as_str());
                 let mut lines = Vec::new();
                 if has_gpu && m.gpu_known {
@@ -902,7 +1083,11 @@ impl GuiApp {
             for e in &node.engines {
                 let managed = matches!(e.id.as_str(), "ollama" | "lmstudio");
                 ui.horizontal(|ui| {
-                    let color = if e.running { theme::OK } else { theme::TEXT_DIM };
+                    let color = if e.running {
+                        theme::OK
+                    } else {
+                        theme::TEXT_DIM
+                    };
                     let (r, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
                     ui.painter().circle_filled(r.center(), 4.0, color);
                     ui.label(RichText::new(&e.name).strong().size(12.5));
@@ -911,7 +1096,11 @@ impl GuiApp {
                         format!(
                             "{} model(s){}",
                             e.models.len(),
-                            if e.owned { " · started by this node" } else { " · adopted" }
+                            if e.owned {
+                                " · started by this node"
+                            } else {
+                                " · adopted"
+                            }
                         )
                     } else if e.installed {
                         "installed, not running".to_string()
@@ -922,12 +1111,15 @@ impl GuiApp {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if e.running {
                                 let can_stop = e.owned || e.id == "lmstudio";
-                                let stop = ui.add_enabled(can_stop, egui::Button::new("Stop").small());
+                                let stop =
+                                    ui.add_enabled(can_stop, egui::Button::new("Stop").small());
                                 if stop.clicked() {
                                     request = Some((e.id.clone(), Action::Stop));
                                 }
                                 if !can_stop {
-                                    stop.on_hover_text("started outside this node; stop it where it was started");
+                                    stop.on_hover_text(
+                                        "started outside this node; stop it where it was started",
+                                    );
                                 }
                             } else if e.installed {
                                 if ui.add(egui::Button::new("Start").small()).clicked() {
@@ -943,7 +1135,11 @@ impl GuiApp {
                 if e.running && !named.is_empty() {
                     ui.indent(&e.id, |ui| {
                         ui.label(theme::dim(
-                            named.iter().map(|m| m.as_str()).collect::<Vec<_>>().join("  ·  "),
+                            named
+                                .iter()
+                                .map(|m| m.as_str())
+                                .collect::<Vec<_>>()
+                                .join("  ·  "),
                         ));
                     });
                 }
@@ -954,11 +1150,18 @@ impl GuiApp {
                             let input = self.pull_input.entry(key).or_default();
                             ui.add(
                                 egui::TextEdit::singleline(input)
-                                    .hint_text(if e.id == "ollama" { "model to pull, e.g. qwen3:0.6b" } else { "model to download" })
+                                    .hint_text(if e.id == "ollama" {
+                                        "model to pull, e.g. qwen3:0.6b"
+                                    } else {
+                                        "model to download"
+                                    })
                                     .desired_width(260.0),
                             );
                             let can = !input.trim().is_empty();
-                            if ui.add_enabled(can, egui::Button::new("Pull").small()).clicked() {
+                            if ui
+                                .add_enabled(can, egui::Button::new("Pull").small())
+                                .clicked()
+                            {
                                 let m = input.trim().to_string();
                                 input.clear();
                                 request = Some((e.id.clone(), Action::Pull(m)));
@@ -968,7 +1171,9 @@ impl GuiApp {
                 }
             }
             if !controllable {
-                ui.label(theme::dim("Pair with this node to start, stop or install its engines."));
+                ui.label(theme::dim(
+                    "Pair with this node to start, stop or install its engines.",
+                ));
             }
             if !node.ops.is_empty() {
                 ui.add_space(4.0);
@@ -980,12 +1185,19 @@ impl GuiApp {
                     };
                     ui.horizontal(|ui| {
                         theme::pill(ui, word, color);
-                        ui.label(RichText::new(format!(
-                            "{} {}{}",
-                            op.action,
-                            op.engine,
-                            if op.model.is_empty() { String::new() } else { format!(" {}", op.model) }
-                        )).size(12.0));
+                        ui.label(
+                            RichText::new(format!(
+                                "{} {}{}",
+                                op.action,
+                                op.engine,
+                                if op.model.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" {}", op.model)
+                                }
+                            ))
+                            .size(12.0),
+                        );
                         if !op.message.is_empty() {
                             ui.label(theme::muted(&op.message));
                         }
@@ -996,7 +1208,11 @@ impl GuiApp {
                         ui.add(
                             egui::ProgressBar::new(frac)
                                 .desired_width(320.0)
-                                .text(format!("{} / {} MB", op.done / (1024 * 1024), op.total / (1024 * 1024))),
+                                .text(format!(
+                                    "{} / {} MB",
+                                    op.done / (1024 * 1024),
+                                    op.total / (1024 * 1024)
+                                )),
                         );
                     }
                 }
@@ -1007,57 +1223,40 @@ impl GuiApp {
         }
     }
 
-    /// Run an engine operation: here directly, on a paired node through
-    /// its node-info surface over mutual TLS.
-    fn engine_request(&mut self, node: &Node, engine: String, action: kmplify_node::router::engine::Action) {
-        if node.is_local() {
-            kmplify_node::router::engine::launch(self.shared.clone(), engine, action, "this window".into());
-            return;
-        }
-        let (client, url, name) = {
-            let r = router::lock(&self.shared);
-            (
-                r.tls_client.clone(),
-                format!("https://{}:{}/v1/engine", node.address, node.info_port),
-                r.local().map(|n| n.name.clone()).unwrap_or_default(),
-            )
+    /// Run an engine operation: an order to the router, which runs it here
+    /// or asks the paired node over mutual TLS.
+    fn engine_request(
+        &mut self,
+        node: &Node,
+        engine: String,
+        action: kmplify_node::router::engine::Action,
+    ) {
+        let model = match &action {
+            kmplify_node::router::engine::Action::Pull(m) => m.clone(),
+            _ => String::new(),
         };
-        let Some(client) = client else {
-            self.notify("no cluster certificate here; cannot control a remote engine", theme::ERR);
-            return;
-        };
-        let body = serde_json::json!({
-            "engine": engine,
-            "action": action.name(),
-            "model": match &action { kmplify_node::router::engine::Action::Pull(m) => m.clone(), _ => String::new() },
+        self.order(RouterCommand::Engine {
+            node: if node.is_local() {
+                String::new()
+            } else {
+                node.id.clone()
+            },
+            engine,
+            action: action.name().into(),
+            model,
         });
-        let shared = self.shared.clone();
-        let target = node.name.clone();
-        let _ = name;
-        tokio::spawn(async move {
-            let result = client
-                .post(&url)
-                .json(&body)
-                .timeout(Duration::from_secs(10))
-                .send()
-                .await;
-            let mut r = router::lock(&shared);
-            match result {
-                Ok(resp) if resp.status().is_success() => {
-                    r.push_log(format!("asked {target} to {} {}", body["action"], body["engine"]))
-                }
-                Ok(resp) => r.push_log(format!("{target} refused the engine request: {}", resp.status())),
-                Err(e) => r.push_log(format!("cannot reach {target} for engine control: {e}")),
-            }
-        });
-        self.notify(format!("asked {} to {} {}", node.name, action.name(), engine), theme::OK);
     }
 
     fn legend(&mut self, ui: &mut egui::Ui, node: &Node) {
         let m = &node.metrics;
         let solo = self.solo.get(&node.id).cloned();
         let mut clicked: Option<String> = None;
-        let entry = |ui: &mut egui::Ui, key: &str, color: Color32, label: &str, value: String, clicked: &mut Option<String>| {
+        let entry = |ui: &mut egui::Ui,
+                     key: &str,
+                     color: Color32,
+                     label: &str,
+                     value: String,
+                     clicked: &mut Option<String>| {
             let faded = solo.as_deref().is_some_and(|s| s != key);
             let resp = ui
                 .horizontal(|ui| {
@@ -1066,11 +1265,22 @@ impl GuiApp {
                         r.center(),
                         5.0,
                         theme::with_alpha(color, if faded { 0x40 } else { 0xbf }),
-                        Stroke::new(1.5, theme::with_alpha(color, if faded { 0x60 } else { 0xff })),
+                        Stroke::new(
+                            1.5,
+                            theme::with_alpha(color, if faded { 0x60 } else { 0xff }),
+                        ),
                     );
-                    let c = if faded { theme::TEXT_DIM } else { theme::TEXT_MUTED };
+                    let c = if faded {
+                        theme::TEXT_DIM
+                    } else {
+                        theme::TEXT_MUTED
+                    };
                     ui.label(RichText::new(label).color(c).size(12.0));
-                    ui.label(RichText::new(value).color(if faded { theme::TEXT_DIM } else { theme::TEXT }).size(12.0));
+                    ui.label(
+                        RichText::new(value)
+                            .color(if faded { theme::TEXT_DIM } else { theme::TEXT })
+                            .size(12.0),
+                    );
                 })
                 .response;
             if resp.interact(Sense::click()).clicked() {
@@ -1085,7 +1295,11 @@ impl GuiApp {
                 "gpu",
                 theme::GPU,
                 "Usage",
-                if m.gpu_known { format!("{:.0}%", m.gpu.latest()) } else { "n/a".into() },
+                if m.gpu_known {
+                    format!("{:.0}%", m.gpu.latest())
+                } else {
+                    "n/a".into()
+                },
                 &mut clicked,
             );
             entry(
@@ -1105,9 +1319,13 @@ impl GuiApp {
             ui.add_space(6.0);
         }
         ui.label(
-            RichText::new(if node.cpu_model.is_empty() { "CPU" } else { &node.cpu_model })
-                .strong()
-                .size(12.5),
+            RichText::new(if node.cpu_model.is_empty() {
+                "CPU"
+            } else {
+                &node.cpu_model
+            })
+            .strong()
+            .size(12.5),
         );
         entry(
             ui,
@@ -1162,15 +1380,19 @@ fn engine_badges(ui: &mut egui::Ui, node: &Node) {
             continue;
         }
         shown += 1;
-        let color = if e.running { theme::OK } else { theme::TEXT_DIM };
+        let color = if e.running {
+            theme::OK
+        } else {
+            theme::TEXT_DIM
+        };
         ui.horizontal(|ui| {
             let (r, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
             ui.painter().circle_filled(r.center(), 4.0, color);
-            ui.label(
-                RichText::new(&e.name)
-                    .size(12.0)
-                    .color(if e.running { theme::TEXT } else { theme::TEXT_DIM }),
-            );
+            ui.label(RichText::new(&e.name).size(12.0).color(if e.running {
+                theme::TEXT
+            } else {
+                theme::TEXT_DIM
+            }));
             if e.running && !e.models.is_empty() {
                 ui.label(theme::dim(format!("{}", e.models.len())));
             }
@@ -1216,6 +1438,8 @@ impl GuiApp {
                     ui.add_space(10.0);
                     self.network_card(ui, view);
                     ui.add_space(10.0);
+                    self.desktop_card(ui);
+                    ui.add_space(10.0);
 
                     theme::card().show(ui, |ui| {
                         ui.set_width(ui.available_width());
@@ -1225,7 +1449,10 @@ impl GuiApp {
                              sharing screen; all three write one file.",
                         ));
                         ui.add_space(6.0);
-                        ui.checkbox(&mut self.form.share_inference, "GPU inference (chat and embeddings)");
+                        ui.checkbox(
+                            &mut self.form.share_inference,
+                            "GPU inference (chat and embeddings)",
+                        );
                         ui.checkbox(&mut self.form.share_cpu, "Spare CPU threads and system RAM");
                         ui.checkbox(
                             &mut self.form.manual_approval,
@@ -1233,11 +1460,17 @@ impl GuiApp {
                         );
                         ui.horizontal(|ui| {
                             ui.label("Country (ISO alpha-2, for EU residency filters)");
-                            ui.add(egui::TextEdit::singleline(&mut self.form.country).desired_width(60.0));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.form.country)
+                                    .desired_width(60.0),
+                            );
                         });
                         ui.horizontal(|ui| {
                             ui.label("Engine (name or URL)");
-                            ui.add(egui::TextEdit::singleline(&mut self.form.engine).desired_width(320.0));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.form.engine)
+                                    .desired_width(320.0),
+                            );
                         });
                     });
                     ui.add_space(10.0);
@@ -1245,7 +1478,9 @@ impl GuiApp {
                     theme::card().show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.label(theme::heading("Ceilings — peers never take more than this"));
-                        ui.label(theme::muted("0 means no ceiling (the environment decides)."));
+                        ui.label(theme::muted(
+                            "0 means no ceiling (the environment decides).",
+                        ));
                         ui.add_space(6.0);
                         if vram_total > 0 {
                             ui.horizontal(|ui| {
@@ -1270,7 +1505,10 @@ impl GuiApp {
                         if cores > 0 {
                             ui.horizontal(|ui| {
                                 ui.label("CPU threads for peer sessions");
-                                ui.add(egui::Slider::new(&mut self.form.max_cpus, 0..=cores as u32));
+                                ui.add(egui::Slider::new(
+                                    &mut self.form.max_cpus,
+                                    0..=cores as u32,
+                                ));
                             });
                         }
                     });
@@ -1287,7 +1525,10 @@ impl GuiApp {
                                     .desired_width(480.0),
                             );
                         });
-                        ui.checkbox(&mut self.form.share_vectors, "Hold peers' vector collections");
+                        ui.checkbox(
+                            &mut self.form.share_vectors,
+                            "Hold peers' vector collections",
+                        );
                     });
                     ui.add_space(12.0);
 
@@ -1295,8 +1536,10 @@ impl GuiApp {
                         let dirty = self.form != self.saved_form;
                         let apply = ui.add_enabled(
                             dirty,
-                            egui::Button::new(RichText::new("Apply").color(Color32::WHITE).strong())
-                                .fill(theme::PRIMARY),
+                            egui::Button::new(
+                                RichText::new("Apply").color(Color32::WHITE).strong(),
+                            )
+                            .fill(theme::PRIMARY),
                         );
                         if apply.clicked() {
                             self.apply_settings();
@@ -1306,8 +1549,19 @@ impl GuiApp {
                         }
                         if !self.attached {
                             ui.separator();
-                            if ui.button(if self.snap.paused { "Resume sharing" } else { "Pause sharing" }).clicked() {
-                                let cmd = if self.snap.paused { Command::Resume } else { Command::Pause };
+                            if ui
+                                .button(if self.snap.paused {
+                                    "Resume sharing"
+                                } else {
+                                    "Pause sharing"
+                                })
+                                .clicked()
+                            {
+                                let cmd = if self.snap.paused {
+                                    Command::Resume
+                                } else {
+                                    Command::Pause
+                                };
                                 match control::submit(&cmd) {
                                     Ok(()) => self.notify(cmd.confirmation(), theme::OK),
                                     Err(e) => self.notify(e, theme::ERR),
@@ -1363,13 +1617,7 @@ impl GuiApp {
                 .checkbox(&mut ingress, "Serve requests from paired nodes")
                 .changed()
             {
-                let mut r = router::lock(&self.shared);
-                r.lan_ingress = ingress;
-                r.push_log(if ingress {
-                    "LAN ingress on: peers may use this node's engines"
-                } else {
-                    "LAN ingress off: this node only consumes the cluster"
-                });
+                self.order(RouterCommand::Ingress { on: ingress });
             }
             ui.label(theme::dim(
                 "What crosses the network: hostname, node id, hardware, which engines \
@@ -1399,41 +1647,71 @@ impl GuiApp {
                     });
                 }
                 if let Some(a) = forget {
-                    let mut r = router::lock(&self.shared);
-                    r.manual.retain(|x| x != &a);
-                    r.nodes.remove(&format!("manual:{a}"));
+                    self.order(RouterCommand::ForgetNode { address: a });
                 }
             }
         });
     }
 
     /// Pairing and membership: the card PAIR puts under Settings → Cluster.
-    fn cluster_card(&mut self, ui: &mut egui::Ui, view: &Router) {
-        if let Some(rx) = &mut self.join_rx {
-            if let Ok(result) = rx.try_recv() {
-                match result {
-                    Ok(msg) => {
-                        self.join_pin.clear();
-                        self.notify(msg, theme::OK);
+    /// Sign-in autostart and what closing the window does.
+    fn desktop_card(&mut self, ui: &mut egui::Ui) {
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(theme::heading("This window"));
+            let mut on = self.autostart;
+            if ui
+                .checkbox(&mut on, "Open KMPLIFY Node when I sign in")
+                .changed()
+            {
+                match autostart::set(on) {
+                    Ok(m) => {
+                        self.autostart = on;
+                        self.notify(m, theme::OK);
                     }
-                    Err(e) => self.notify(format!("pairing failed: {e}"), theme::ERR),
+                    Err(e) => self.notify(e, theme::ERR),
                 }
-                self.join_rx = None;
             }
-        }
+            #[cfg(any(windows, target_os = "macos"))]
+            let closing = if self.tray.is_some() {
+                "Closing the window keeps the node and the router running behind the tray icon; \
+                 its menu opens the window again or quits for real."
+            } else {
+                "No tray icon could be created, so closing the window quits."
+            };
+            #[cfg(not(any(windows, target_os = "macos")))]
+            let closing = "Closing the window stops what it started here. For a router that outlives \
+                           the window, run `kmplify-node run --router` as a service and let this window attach to it.";
+            ui.label(theme::muted(closing));
+            let attached = self.attached && self.handle.attached();
+            ui.label(theme::muted(if attached {
+                "Right now both the node and the router run in other processes; this window only watches them."
+            } else if self.attached {
+                "Right now the node runs elsewhere and the router runs in this window."
+            } else {
+                "Right now this window runs the node and the router."
+            }));
+        });
+    }
+
+    fn cluster_card(&mut self, ui: &mut egui::Ui, view: &Router) {
         let now = Instant::now();
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(theme::heading("Cluster"));
-            let Some(identity) = &view.identity else {
-                ui.label(RichText::new(
-                    "This node has no certificate, so it cannot pair. The log says why.",
-                ).color(theme::ERR).size(12.5));
+            if view.fingerprint.is_empty() {
+                ui.label(
+                    RichText::new(
+                        "This node has no certificate, so it cannot pair. The log says why.",
+                    )
+                    .color(theme::ERR)
+                    .size(12.5),
+                );
                 return;
-            };
+            }
             ui.label(theme::muted(format!(
                 "This node's certificate fingerprint: {}…",
-                kmplify_node::router::cluster::short_fp(&identity.fingerprint)
+                kmplify_node::router::cluster::short_fp(&view.fingerprint)
             )));
             if view.cluster.is_clustered() {
                 ui.label(theme::muted(format!(
@@ -1463,9 +1741,7 @@ impl GuiApp {
                     });
                 }
                 if let Some(id) = remove {
-                    let mut r = router::lock(&self.shared);
-                    r.remove_member(&id);
-                    r.push_log(format!("removed {} from the cluster", &id[..8.min(id.len())]));
+                    self.order(RouterCommand::RemoveMember { id });
                 }
             } else {
                 ui.label(theme::muted(
@@ -1501,20 +1777,23 @@ impl GuiApp {
                             inv.wrong_attempts
                         )));
                         if ui.small_button("cancel invitation").clicked() {
-                            router::lock(&self.shared).invite = None;
+                            self.order(RouterCommand::CancelInvite);
                         }
                     });
                 }
                 _ => {
                     if ui
                         .add(
-                            egui::Button::new(RichText::new("Invite a node").color(Color32::WHITE).strong())
-                                .fill(theme::PRIMARY),
+                            egui::Button::new(
+                                RichText::new("Invite a node")
+                                    .color(Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(theme::PRIMARY),
                         )
                         .clicked()
                     {
-                        let pin = router::lock(&self.shared).open_invite();
-                        self.notify(format!("invitation open: PIN {pin}"), theme::OK);
+                        self.order(RouterCommand::Invite);
                     }
                 }
             }
@@ -1533,31 +1812,20 @@ impl GuiApp {
                         .hint_text("PIN")
                         .desired_width(70.0),
                 );
-                let can = self.join_rx.is_none()
-                    && !self.join_addr.trim().is_empty()
-                    && self.join_pin.trim().len() == 6;
+                let can = !self.join_addr.trim().is_empty() && self.join_pin.trim().len() == 6;
                 if ui.add_enabled(can, egui::Button::new("Join")).clicked() {
-                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                    self.join_rx = Some(rx);
-                    let shared = self.shared.clone();
-                    let addr = self.join_addr.trim().to_string();
+                    let address = self.join_addr.trim().to_string();
                     let pin = self.join_pin.trim().to_string();
-                    let ctx = ui.ctx().clone();
-                    tokio::spawn(async move {
-                        let _ = tx.send(kmplify_node::router::cluster::join(shared, addr, pin).await);
-                        ctx.request_repaint();
-                    });
-                }
-                if self.join_rx.is_some() {
-                    ui.label(theme::muted("pairing…"));
+                    self.join_pin.clear();
+                    // The outcome lands in the router log on this card's
+                    // neighbour, and in the member list.
+                    self.order(RouterCommand::Join { address, pin });
                 }
             });
             if view.cluster.is_clustered() {
                 ui.add_space(4.0);
                 if ui.small_button("Leave cluster").clicked() {
-                    let mut r = router::lock(&self.shared);
-                    r.leave_cluster();
-                    r.push_log("left the cluster; every pin dropped");
+                    self.order(RouterCommand::Leave);
                 }
             }
         });
@@ -1739,7 +2007,11 @@ impl GuiApp {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         for (mine, text) in &self.chat.log {
-                            let frame = if *mine { theme::card() } else { theme::card_low() };
+                            let frame = if *mine {
+                                theme::card()
+                            } else {
+                                theme::card_low()
+                            };
                             frame.show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 ui.label(theme::dim(if *mine { "you" } else { "router" }));

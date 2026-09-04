@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=KMPLIFY Node
+GenericName=Personal inference router
+Comment=Lend this machine to the KMPLIFY Compute Fabric and route inference across the kmplify-nodes on this network
+Exec=kmplify-node gui
+Icon=kmplify-node
+Terminal=false
+Categories=Network;Utility;
+Keywords=inference;ollama;gpu;router;fabric;
+StartupWMClass=io.kmplify.node

@@ -129,7 +129,12 @@ pub fn installed_binary(id: &str) -> Option<PathBuf> {
                 candidates.push(p);
             }
             if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-                candidates.push(PathBuf::from(local).join("Programs").join("Ollama").join("ollama.exe"));
+                candidates.push(
+                    PathBuf::from(local)
+                        .join("Programs")
+                        .join("Ollama")
+                        .join("ollama.exe"),
+                );
             }
             candidates.push("/Applications/Ollama.app/Contents/Resources/ollama".into());
             candidates.push("/opt/homebrew/bin/ollama".into());
@@ -174,7 +179,9 @@ async fn run(shared: Shared, engine: String, action: Action, op: u64, who: Strin
         ("lmstudio", Action::Start) => start_lmstudio(&shared).await,
         ("lmstudio", Action::Stop) => stop_lmstudio().await,
         ("lmstudio", Action::Pull(m)) => pull_lmstudio(m).await,
-        _ => Err(format!("{engine} is found and used, not managed, by this node")),
+        _ => Err(format!(
+            "{engine} is found and used, not managed, by this node"
+        )),
     };
     let (state, message) = match &result {
         Ok(m) => (OpState::Done, m.clone()),
@@ -189,7 +196,11 @@ async fn run(shared: Shared, engine: String, action: Action, op: u64, who: Strin
         r.push_log(format!(
             "{} {engine}: {}",
             action.name(),
-            if state == OpState::Done { "done" } else { "failed" }
+            if state == OpState::Done {
+                "done"
+            } else {
+                "failed"
+            }
         ));
     }
     // The card should not wait ten seconds to show what just happened.
@@ -199,7 +210,12 @@ async fn run(shared: Shared, engine: String, action: Action, op: u64, who: Strin
 fn base_of(shared: &Shared, id: &str) -> String {
     lock(shared)
         .local()
-        .and_then(|n| n.engines.iter().find(|e| e.id == id).map(|e| e.base.clone()))
+        .and_then(|n| {
+            n.engines
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.base.clone())
+        })
         .or_else(|| crate::engines::known(id).map(|k| k.default_base.to_string()))
         .unwrap_or_default()
 }
@@ -289,7 +305,9 @@ async fn install_ollama(shared: &Shared, op: u64) -> Result<String, String> {
     let mut last_report = 0u64;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("download: {e}"))?;
-        out.write_all(&chunk).await.map_err(|e| format!("write: {e}"))?;
+        out.write_all(&chunk)
+            .await
+            .map_err(|e| format!("write: {e}"))?;
         done += chunk.len() as u64;
         // A progress write per chunk would lock the state thousands of
         // times a second; every few megabytes is what a bar can show.
@@ -324,14 +342,21 @@ async fn install_ollama(shared: &Shared, op: u64) -> Result<String, String> {
     }
     let _ = tokio::fs::remove_file(&archive).await;
     let bin = installed_binary("ollama").ok_or_else(|| {
-        format!("archive extracted to {} but no ollama binary was found in it", target.display())
+        format!(
+            "archive extracted to {} but no ollama binary was found in it",
+            target.display()
+        )
     })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755));
     }
-    Ok(format!("installed {} ({} MB)", bin.display(), done / (1024 * 1024)))
+    Ok(format!(
+        "installed {} ({} MB)",
+        bin.display(),
+        done / (1024 * 1024)
+    ))
 }
 
 async fn start_ollama(shared: &Shared, op: u64) -> Result<String, String> {
@@ -429,7 +454,11 @@ async fn pull_ollama(shared: &Shared, op: u64, model: &str) -> Result<String, St
             if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
                 return Err(format!("pull: {err}"));
             }
-            let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            let status = v
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
             let total = v.get("total").and_then(|t| t.as_u64());
             let completed = v.get("completed").and_then(|c| c.as_u64());
             if status != last_status || completed.is_some() {
@@ -477,7 +506,12 @@ async fn start_lmstudio(shared: &Shared) -> Result<String, String> {
     if answers(&base, "/v1/models").await {
         return Ok(format!("already serving at {base}; adopted"));
     }
-    let port = base.rsplit(':').next().unwrap_or("1234").trim_end_matches('/').to_string();
+    let port = base
+        .rsplit(':')
+        .next()
+        .unwrap_or("1234")
+        .trim_end_matches('/')
+        .to_string();
     lms(&["server", "start", "--port", &port]).await?;
     if wait_ready(&base, "/v1/models").await {
         Ok(format!("serving at {base}"))
@@ -522,7 +556,10 @@ mod tests {
         assert_eq!(Action::parse("install", ""), Some(Action::Install));
         assert_eq!(Action::parse(" Start ", ""), Some(Action::Start));
         assert_eq!(Action::parse("stop", ""), Some(Action::Stop));
-        assert_eq!(Action::parse("pull", " qwen3:0.6b "), Some(Action::Pull("qwen3:0.6b".into())));
+        assert_eq!(
+            Action::parse("pull", " qwen3:0.6b "),
+            Some(Action::Pull("qwen3:0.6b".into()))
+        );
         assert_eq!(Action::parse("pull", ""), None);
         assert_eq!(Action::parse("uninstall", ""), None);
     }

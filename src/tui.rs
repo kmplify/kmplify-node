@@ -194,9 +194,6 @@ enum BgMsg {
     Acted(Result<String, String>),
     /// What a rewards companion reports, or why it could not be asked.
     Rewards(Result<kmplify_node::rewards::Report, String>),
-    /// The outcome of a pairing attempt on the cluster screen.
-    #[cfg_attr(not(feature = "router"), allow(dead_code))]
-    Router(Result<String, String>),
 }
 
 /// A text setting being typed into.
@@ -637,7 +634,7 @@ pub async fn main(
         help: false,
         quit: false,
         #[cfg(feature = "router")]
-        router: router.then(|| router_screens::start(&app_dir, &gpus, accel)),
+        router: router.then(|| router_screens::start(&app_dir, &gpus, accel, standalone)),
     };
     #[cfg(not(feature = "router"))]
     if router {
@@ -924,7 +921,9 @@ fn footer_line(app: &App) -> Paragraph<'static> {
             " {quit}   1 home … 5 sharing  6 peers   a approve  n deny  b block  u clear  i invite  h hold  v revoke  ? keys"
         )
     } else if app.view == View::Network {
-        format!(" {quit}   1 home … 8 network  9 cluster   ↑/↓ select  a add a node by address  ? keys")
+        format!(
+            " {quit}   1 home … 8 network  9 cluster   ↑/↓ select  a add a node by address  ? keys"
+        )
     } else if app.view == View::Cluster {
         format!(
             " {quit}   1 home … 8 network  9 cluster   i invite  n cancel  o join  d remove  L leave  ? keys"
@@ -2438,10 +2437,6 @@ impl App {
             }
             BgMsg::Acted(Err(e)) => self.say(format!("gateway refused: {e}")),
             BgMsg::Rewards(r) => self.rewards = Some(r),
-            #[cfg(feature = "router")]
-            BgMsg::Router(result) => router_screens::on_router_msg(self, result),
-            #[cfg(not(feature = "router"))]
-            BgMsg::Router(_) => {}
         }
     }
 }

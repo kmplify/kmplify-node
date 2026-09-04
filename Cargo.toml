@@ -112,6 +112,13 @@ eframe = { version = "0.36", optional = true, default-features = false, features
     "x11",
 ] }
 
+# The tray icon behind which the window hides (src/gui/tray.rs). Windows
+# and macOS only: on Linux the crate needs GTK and an appindicator library
+# at build time and the desktops disagree about trays anyway, so there the
+# window closes and a `run --router` service is how the router outlives it.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+tray-icon = { version = "0.24", optional = true, default-features = false }
+
 [profile.release]
 codegen-units = 16
 lto = "thin"
@@ -150,7 +157,38 @@ router = [
 ]
 # `kmplify-node gui`: the desktop window for the router, on Linux, macOS
 # and Windows. See docs/ROUTER.md.
-gui = ["router", "dep:eframe"]
+gui = ["router", "dep:eframe", "dep:tray-icon"]
 
 [dev-dependencies]
 wat = "1.243.0"
+
+# `cargo deb` (cargo install cargo-deb): the Debian/Ubuntu package with the
+# window, the desktop entry, the icon and the systemd unit. The unit is
+# installed but not enabled: it runs as the `kmplify` user, which the
+# operator creates on purpose (docs/HEADLESS-NODE.md), and a node should
+# not start lending before its settings exist.
+[package.metadata.deb]
+name = "kmplify-node"
+maintainer = "KMPLIFY"
+copyright = "KMPLIFY"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+Provider agent for the KMPLIFY Compute Fabric: lends a machine's GPU, CPU and \
+locally served models to a fabric over one outbound connection, and turns the \
+kmplify-nodes on one local network into a personal inference cluster with a \
+desktop window (kmplify-node gui) or a terminal dashboard (kmplify-node tui)."""
+section = "net"
+priority = "optional"
+depends = "$auto, libgl1"
+recommends = "docker.io | docker-ce"
+features = ["gui"]
+assets = [
+    ["target/release/kmplify-node", "usr/bin/", "755"],
+    ["packaging/kmplify-node.desktop", "usr/share/applications/", "644"],
+    ["packaging/icons/kmplify-node.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
+    ["packaging/kmplify-node.service", "lib/systemd/system/", "644"],
+    ["packaging/kmplify-node.env.example", "usr/share/doc/kmplify-node/", "644"],
+    ["README.md", "usr/share/doc/kmplify-node/", "644"],
+    ["NOTICE", "usr/share/doc/kmplify-node/", "644"],
+    ["docs/*.md", "usr/share/doc/kmplify-node/docs/", "644"],
+]

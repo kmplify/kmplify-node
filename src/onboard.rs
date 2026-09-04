@@ -786,7 +786,9 @@ async fn walk(io: &Io, cfg: &WorkerConfig, dir: &std::path::Path) -> Result<i32,
             "   {}",
             io.dim("starting — Ctrl-C stops it and tears down anything peers were running")
         );
-        return Ok(super::serve(effective, dir.to_path_buf()).await);
+        // Headless lending, as `kmplify-node run` would: the LAN router is a
+        // `--router` (or `gui` / `tui --router`) decision, not a wizard one.
+        return Ok(super::serve(effective, dir.to_path_buf(), false, pf.gpus.clone()).await);
     }
     println!();
     println!("   when you are ready:");

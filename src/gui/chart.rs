@@ -32,7 +32,10 @@ pub fn area_lines(ui: &mut egui::Ui, rect: Rect, lines: &[Line], solo: Option<&s
     for q in [0.25, 0.5, 0.75] {
         let y = rect.bottom() - rect.height() * q;
         painter.line_segment(
-            [Pos2::new(rect.left() + 1.0, y), Pos2::new(rect.right() - 1.0, y)],
+            [
+                Pos2::new(rect.left() + 1.0, y),
+                Pos2::new(rect.right() - 1.0, y),
+            ],
             Stroke::new(1.0, theme::with_alpha(theme::BORDER, 0x90)),
         );
     }
@@ -127,16 +130,30 @@ fn smooth(pts: &[Pos2]) -> Vec<Pos2> {
 /// A ring with no reading draws its track only, which is the honest
 /// picture of "nobody can tell you", not an empty ring that says idle.
 pub fn rings(painter: &egui::Painter, center: Pos2, radius: f32, rings: &[(Option<f32>, Color32)]) {
-    painter.circle_filled(center, radius + 3.0, theme::with_alpha(Color32::BLACK, 0x55));
+    painter.circle_filled(
+        center,
+        radius + 3.0,
+        theme::with_alpha(Color32::BLACK, 0x55),
+    );
     let width = (radius / (rings.len() as f32 + 1.0)).clamp(3.0, 7.0);
     for (i, (value, color)) in rings.iter().enumerate() {
         let r = radius - i as f32 * (width + 1.5) - width / 2.0;
         if r <= 0.0 {
             break;
         }
-        painter.circle_stroke(center, r, Stroke::new(width, theme::with_alpha(*color, 0x30)));
+        painter.circle_stroke(
+            center,
+            r,
+            Stroke::new(width, theme::with_alpha(*color, 0x30)),
+        );
         if let Some(v) = value {
-            arc(painter, center, r, v.clamp(0.0, 1.0), Stroke::new(width, *color));
+            arc(
+                painter,
+                center,
+                r,
+                v.clamp(0.0, 1.0),
+                Stroke::new(width, *color),
+            );
         }
     }
 }

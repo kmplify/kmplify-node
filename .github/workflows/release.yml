@@ -6,6 +6,13 @@
 # fetches, and pushes the multi-arch inference-only runtime image to
 # ghcr.io/kmplify/kmplify-node.
 #
+# Alongside the bare binaries, the desktop packages: a Debian/Ubuntu .deb
+# with the window, the desktop entry and the icon (glibc, since the window
+# toolkit loads the display libraries at runtime); a macOS .dmg per
+# architecture with "KMPLIFY Node.app"; a Windows installer. The macOS and
+# Windows binaries are built with the `gui` feature, so `kmplify-node gui`
+# works from the bare download too; the musl binaries stay headless.
+#
 # The release is created as a draft and published only when every artifact is
 # attached, so an installer running mid-release can never see a half-uploaded
 # asset list.
@@ -39,6 +46,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
       release: ${{ steps.v.outputs.release }}
     steps:
       - uses: actions/checkout@v4
@@ -49,13 +57,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             tag="${GITHUB_REF#refs/tags/}"
             echo "tag=$tag" >> "$GITHUB_OUTPUT"
             echo "release=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
           tag="v${version}"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           if git rev-parse -q --verify "refs/tags/$tag" >/dev/null \
@@ -79,16 +88,35 @@ jobs:
           # runs, the binary runs, which is the whole 24/7 fleet story.
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
+            features: ""
+            package: none
           # Native ARM runner rather than cross-compiling: free for public
           # repos, and a native build cannot lie about linker behaviour.
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
+            features: ""
+            package: none
+          # The desktop packages: glibc builds with the window.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            features: gui
+            package: deb
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            features: gui
+            package: deb
           - target: aarch64-apple-darwin
             runner: macos-latest
+            features: gui
+            package: dmg
           - target: x86_64-apple-darwin
             runner: macos-latest
+            features: gui
+            package: dmg
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
+            features: gui
+            package: inno
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -101,9 +129,20 @@ jobs:
       - name: musl linker
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Linux display libraries (build-time headers for the window toolkit)
+        if: matrix.package == 'deb'
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev libgl1
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ matrix.features }}" ]]; then
+            cargo build --release --target ${{ matrix.target }} --features ${{ matrix.features }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
       - name: Name the artifact after its target
+        if: matrix.package != 'deb'
         shell: bash
         run: |
           set -euo pipefail
@@ -112,6 +151,33 @@ jobs:
             *windows*) cp "target/${{ matrix.target }}/release/kmplify-node.exe" "out/kmplify-node-${{ matrix.target }}.exe" ;;
             *)         cp "target/${{ matrix.target }}/release/kmplify-node"     "out/kmplify-node-${{ matrix.target }}" ;;
           esac
+      # cargo-deb builds the release binary itself with the features the
+      # manifest's [package.metadata.deb] names, and lays the assets out.
+      - name: Debian package
+        if: matrix.package == 'deb'
+        run: |
+          set -euo pipefail
+          cargo install cargo-deb --locked
+          cargo deb --target ${{ matrix.target }} --no-build --output out/ || {
+            # --no-build wants the binary under target/<triple>/release, which
+            # the Build step made; a missing one means fall back to a build.
+            cargo deb --target ${{ matrix.target }} --output out/
+          }
+          ls -l out/
+      - name: macOS app bundle and disk image
+        if: matrix.package == 'dmg'
+        run: |
+          set -euo pipefail
+          scripts/bundle-macos.sh "target/${{ matrix.target }}/release/kmplify-node" "${{ needs.resolve.outputs.tag }}" "out/kmplify-node-${{ needs.resolve.outputs.tag }}-${{ matrix.target }}.dmg"
+      # Inno Setup ships on the hosted Windows runners.
+      - name: Windows installer
+        if: matrix.package == 'inno'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = (Resolve-Path "target/${{ matrix.target }}/release").Path
+          iscc "/DAppVersion=${{ needs.resolve.outputs.version }}" "/DSourceDir=$src" "/Oout" packaging\windows\kmplify-node.iss
+          Get-ChildItem out
       - uses: actions/upload-artifact@v4
         with:
           name: bin-${{ matrix.target }}
@@ -168,7 +234,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          cp artifacts/kmplify-node-* release/
+          cp artifacts/kmplify-node* release/
           # What install.sh --service fetches, versioned with the binaries so
           # unit and binary can never skew.
           cp packaging/kmplify-node.service release/

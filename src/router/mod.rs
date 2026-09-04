@@ -33,7 +33,10 @@ pub mod listen;
 pub mod node_info;
 pub mod proxy;
 pub mod schedule;
+pub mod snapshot;
 pub mod telemetry;
+
+pub use snapshot::RouterHandle;
 
 /// Samples kept per metric: one a second, so a minute of history, which is
 /// what a card's chart shows and what the desktop app's charts show too.
@@ -61,10 +64,12 @@ pub const PROXY_OPENAI_PORT: u16 = 11441;
 fn ports() -> (u16, u16, u16) {
     static P: std::sync::OnceLock<(u16, u16, u16)> = std::sync::OnceLock::new();
     *P.get_or_init(|| {
-        let parsed: Option<Vec<u16>> = std::env::var("KMPLIFY_ROUTER_PORTS")
-            .ok()
-            .map(|s| s.split(',').map(|p| p.trim().parse::<u16>()).collect::<Result<_, _>>().ok())
-            .flatten();
+        let parsed: Option<Vec<u16>> = std::env::var("KMPLIFY_ROUTER_PORTS").ok().and_then(|s| {
+            s.split(',')
+                .map(|p| p.trim().parse::<u16>())
+                .collect::<Result<_, _>>()
+                .ok()
+        });
         match parsed.as_deref() {
             Some([a, b, c]) => (*a, *b, *c),
             _ => (NODE_INFO_PORT, PROXY_OLLAMA_PORT, PROXY_OPENAI_PORT),
@@ -102,12 +107,29 @@ pub struct Series {
 impl Default for Series {
     fn default() -> Self {
         Self {
-            buf: std::iter::repeat(0.0).take(HISTORY).collect(),
+            buf: std::iter::repeat_n(0.0, HISTORY).collect(),
         }
     }
 }
 
 impl Series {
+    /// A series from published points, padded at the front so it is still
+    /// a minute wide.
+    pub fn from_points(points: Vec<f32>) -> Self {
+        let mut buf: VecDeque<f32> = points
+            .into_iter()
+            .rev()
+            .take(HISTORY)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        while buf.len() < HISTORY {
+            buf.push_front(0.0);
+        }
+        Self { buf }
+    }
+
     pub fn push(&mut self, v: f32) {
         if self.buf.len() >= HISTORY {
             self.buf.pop_front();
@@ -132,7 +154,7 @@ impl Series {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct GpuInfo {
     pub name: String,
     pub total_mb: u64,
@@ -182,7 +204,7 @@ impl Metrics {
 }
 
 /// An inference engine on a node, as the router understands it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Engine {
     /// Stable id (`ollama`, `lmstudio`, …), the same ids `engines::KNOWN` uses.
     pub id: String,
@@ -286,7 +308,13 @@ impl Node {
 
     /// The card a peer sees before any HTTP round trip: what the
     /// announcement carried, and polling due immediately.
-    pub fn new_peer(id: String, name: String, address: String, source: Source, now: Instant) -> Self {
+    pub fn new_peer(
+        id: String,
+        name: String,
+        address: String,
+        source: Source,
+        now: Instant,
+    ) -> Self {
         Self {
             id,
             name,
@@ -314,10 +342,12 @@ impl Node {
     pub fn parse_address(typed: &str) -> (String, u16) {
         let t = typed.trim().trim_end_matches('/');
         match t.rsplit_once(':') {
-            Some((host, port)) if !t.starts_with('[') && !host.contains(':') => match port.parse() {
-                Ok(p) => (host.to_string(), p),
-                Err(_) => (t.to_string(), node_info_port()),
-            },
+            Some((host, port)) if !t.starts_with('[') && !host.contains(':') => {
+                match port.parse() {
+                    Ok(p) => (host.to_string(), p),
+                    Err(_) => (t.to_string(), node_info_port()),
+                }
+            }
             _ => (t.to_string(), node_info_port()),
         }
     }
@@ -326,9 +356,8 @@ impl Node {
     /// `:latest` is normalised so `qwen3` and `qwen3:latest` are one model.
     pub fn serves(&self, model: &str, api: proxy::Api) -> Option<&Engine> {
         let want = normalize_model(model);
-        self.running_engines().find(|e| {
-            api.accepts(&e.id) && e.models.iter().any(|m| normalize_model(m) == want)
-        })
+        self.running_engines()
+            .find(|e| api.accepts(&e.id) && e.models.iter().any(|m| normalize_model(m) == want))
     }
 
     pub fn online(&self, now: Instant) -> bool {
@@ -446,6 +475,9 @@ pub struct Router {
     /// This node's certificate; None when it could not be minted, in which
     /// case the peer surfaces stay plaintext-only and pairing is refused.
     pub identity: Option<Arc<cluster::Identity>>,
+    /// The certificate's fingerprint, also for a view rebuilt from a
+    /// published snapshot, which carries no certificate.
+    pub fingerprint: String,
     pub cluster: cluster::ClusterFile,
     /// The live pin set every TLS verifier consults.
     pub pins: cluster::Pins,
@@ -517,7 +549,11 @@ impl Router {
             .iter()
             .filter(|j| j.is_pending() && j.node_id == node_id && j.requested_from_here())
             .count() as u32;
-        let reported = self.nodes.get(node_id).map(|n| n.reported_pending).unwrap_or(0);
+        let reported = self
+            .nodes
+            .get(node_id)
+            .map(|n| n.reported_pending)
+            .unwrap_or(0);
         if node_id == self.self_id {
             // This machine's own count is live; the reported figure is what
             // it tells peers, derived from the same jobs.
@@ -606,7 +642,8 @@ impl Router {
                 // node was actually reached at.
                 if existing.address.is_empty()
                     || (existing.poll_failures > 0
-                        && (existing.address != peer.address || existing.info_port != peer.info_port))
+                        && (existing.address != peer.address
+                            || existing.info_port != peer.info_port))
                 {
                     existing.address = peer.address;
                     existing.info_port = peer.info_port;
@@ -620,7 +657,10 @@ impl Router {
                     existing.cpu_cores = peer.cpu_cores;
                     existing.ram_total_mb = peer.ram_total_mb;
                 }
-                let announced_more = existing.engines.iter().all(|e| e.models.iter().all(String::is_empty));
+                let announced_more = existing
+                    .engines
+                    .iter()
+                    .all(|e| e.models.iter().all(String::is_empty));
                 if announced_more {
                     existing.engines = peer.engines;
                 }
@@ -701,11 +741,7 @@ pub fn self_id(node_dir: &Path) -> String {
 }
 
 /// Build the shared state with this machine's card in it.
-pub fn new_shared(
-    node_dir: &Path,
-    gpus: &[crate::gpu::Gpu],
-    address: String,
-) -> Shared {
+pub fn new_shared(node_dir: &Path, gpus: &[crate::gpu::Gpu], address: String) -> Shared {
     let id = self_id(node_dir);
     // The static CPU facts are published by start(); reading the snapshot
     // before it has run gives an empty model and 0 cores (the wizard had
@@ -713,7 +749,13 @@ pub fn new_shared(
     // costs nothing.
     crate::hostcpu::start();
     let cpu = crate::hostcpu::snapshot();
-    let mut local = Node::new_peer(id.clone(), hostname(), address, Source::Local, Instant::now());
+    let mut local = Node::new_peer(
+        id.clone(),
+        hostname(),
+        address,
+        Source::Local,
+        Instant::now(),
+    );
     local.gpus = gpus
         .iter()
         .map(|g| GpuInfo {
@@ -753,6 +795,7 @@ pub fn new_shared(
                     router.push_log(format!("cluster TLS unavailable: {e}"));
                 }
             }
+            router.fingerprint = identity.fingerprint.clone();
             router.identity = Some(identity);
         }
         Err(e) => router.push_log(format!("no node certificate, pairing is off: {e}")),
@@ -778,7 +821,13 @@ pub fn new_shared_for_tests(self_id: &str) -> Shared {
     };
     router.nodes.insert(
         self_id.to_string(),
-        Node::new_peer(self_id.to_string(), "me".into(), "127.0.0.1".into(), Source::Local, now),
+        Node::new_peer(
+            self_id.to_string(),
+            "me".into(),
+            "127.0.0.1".into(),
+            Source::Local,
+            now,
+        ),
     );
     Arc::new(Mutex::new(router))
 }
@@ -801,14 +850,27 @@ pub fn lan_address() -> String {
 /// and none holds the lock across an await, so one stalling probe cannot
 /// freeze a card.
 pub fn spawn(shared: Shared, accel: crate::gpu::Backend) {
-    engine::init(&lock(&shared).node_dir);
+    let node_dir = lock(&shared).node_dir.clone();
+    engine::init(&node_dir);
+    snapshot::set_active(&shared);
+    tokio::spawn(snapshot::publish(shared.clone(), node_dir.clone()));
+    tokio::spawn(crate::control::watch_router(node_dir));
+    tokio::spawn(telemetry::mirror_fabric_jobs(shared.clone()));
     tokio::spawn(telemetry::sample_local(shared.clone(), accel));
     tokio::spawn(telemetry::scan_engines(shared.clone()));
     tokio::spawn(telemetry::expire_peers(shared.clone()));
     tokio::spawn(node_info::serve(shared.clone()));
     tokio::spawn(node_info::poll_peers(shared.clone()));
-    tokio::spawn(proxy::serve(shared.clone(), proxy::Api::Ollama, proxy_ollama_port()));
-    tokio::spawn(proxy::serve(shared.clone(), proxy::Api::OpenAi, proxy_openai_port()));
+    tokio::spawn(proxy::serve(
+        shared.clone(),
+        proxy::Api::Ollama,
+        proxy_ollama_port(),
+    ));
+    tokio::spawn(proxy::serve(
+        shared.clone(),
+        proxy::Api::OpenAi,
+        proxy_openai_port(),
+    ));
     discovery::spawn(shared);
 }
 
@@ -859,9 +921,12 @@ mod tests {
             self_id: "me".into(),
             ..Default::default()
         };
-        r.nodes.insert("z".into(), node("z", "alpha", Source::Discovered, now));
-        r.nodes.insert("me".into(), node("me", "zulu", Source::Local, now));
-        r.nodes.insert("b".into(), node("b", "Bravo", Source::Manual, now));
+        r.nodes
+            .insert("z".into(), node("z", "alpha", Source::Discovered, now));
+        r.nodes
+            .insert("me".into(), node("me", "zulu", Source::Local, now));
+        r.nodes
+            .insert("b".into(), node("b", "Bravo", Source::Manual, now));
         let names: Vec<&str> = r.ordered().iter().map(|n| n.name.as_str()).collect();
         assert_eq!(names, ["zulu", "alpha", "Bravo"]);
     }
@@ -874,9 +939,12 @@ mod tests {
             self_id: "me".into(),
             ..Default::default()
         };
-        r.nodes.insert("me".into(), node("me", "me", Source::Local, old));
-        r.nodes.insert("d".into(), node("d", "d", Source::Discovered, old));
-        r.nodes.insert("m".into(), node("m", "m", Source::Manual, old));
+        r.nodes
+            .insert("me".into(), node("me", "me", Source::Local, old));
+        r.nodes
+            .insert("d".into(), node("d", "d", Source::Discovered, old));
+        r.nodes
+            .insert("m".into(), node("m", "m", Source::Manual, old));
         r.expire(now);
         assert!(r.nodes.contains_key("me"), "the local node never expires");
         assert!(!r.nodes.contains_key("d"));
@@ -894,10 +962,16 @@ mod tests {
         let mut again = node("p", "peer", Source::Discovered, now);
         again.address = "172.23.240.1".into();
         r.upsert_peer(again.clone());
-        assert_eq!(r.nodes["p"].address, "192.168.2.171", "polls are fine: keep the working address");
+        assert_eq!(
+            r.nodes["p"].address, "192.168.2.171",
+            "polls are fine: keep the working address"
+        );
         r.nodes.get_mut("p").unwrap().poll_failures = 2;
         r.upsert_peer(again);
-        assert_eq!(r.nodes["p"].address, "172.23.240.1", "failing: try what was announced");
+        assert_eq!(
+            r.nodes["p"].address, "172.23.240.1",
+            "failing: try what was announced"
+        );
 
         // The announced port travels with the address: a node on another
         // port than ours is polled where it actually answers.
@@ -943,7 +1017,10 @@ mod tests {
         assert_eq!(r.jobs.len(), 2);
         let a = r.jobs.iter().find(|j| j.id == "a").unwrap();
         assert_eq!(a.state, JobState::Completed);
-        assert!(a.local_origin, "a merge never demotes a local job to a copy");
+        assert!(
+            a.local_origin,
+            "a merge never demotes a local job to a copy"
+        );
     }
 
     #[test]
@@ -953,7 +1030,8 @@ mod tests {
             self_id: "me".into(),
             ..Default::default()
         };
-        r.nodes.insert("me".into(), node("me", "me", Source::Local, now));
+        r.nodes
+            .insert("me".into(), node("me", "me", Source::Local, now));
         let mut peer = node("p", "p", Source::Discovered, now);
         peer.reported_pending = 3;
         r.nodes.insert("p".into(), peer);
@@ -961,18 +1039,35 @@ mod tests {
         r.push_job(job("2", "me", JobState::Completed, true));
         r.push_job(job("3", "p", JobState::Running, true));
         assert_eq!(r.pending_for("me"), 1);
-        assert_eq!(r.pending_for("p"), 3, "the peer's own count wins while it is larger");
+        assert_eq!(
+            r.pending_for("p"),
+            3,
+            "the peer's own count wins while it is larger"
+        );
         for i in 4..9 {
             r.push_job(job(&i.to_string(), "p", JobState::Running, true));
         }
-        assert_eq!(r.pending_for("p"), 6, "a burst dispatched here is reserved before the peer reports it");
+        assert_eq!(
+            r.pending_for("p"),
+            6,
+            "a burst dispatched here is reserved before the peer reports it"
+        );
     }
 
     #[test]
     fn a_typed_address_may_carry_its_info_port() {
-        assert_eq!(Node::parse_address("10.0.0.5"), ("10.0.0.5".into(), NODE_INFO_PORT));
-        assert_eq!(Node::parse_address("10.0.0.5:24418/"), ("10.0.0.5".into(), 24418));
-        assert_eq!(Node::parse_address("spark.local:x"), ("spark.local:x".into(), NODE_INFO_PORT));
+        assert_eq!(
+            Node::parse_address("10.0.0.5"),
+            ("10.0.0.5".into(), NODE_INFO_PORT)
+        );
+        assert_eq!(
+            Node::parse_address("10.0.0.5:24418/"),
+            ("10.0.0.5".into(), 24418)
+        );
+        assert_eq!(
+            Node::parse_address("spark.local:x"),
+            ("spark.local:x".into(), NODE_INFO_PORT)
+        );
     }
 
     #[test]
@@ -990,9 +1085,15 @@ mod tests {
         });
         assert!(n.serves("qwen3", proxy::Api::Ollama).is_some());
         assert!(n.serves("qwen3:latest", proxy::Api::OpenAi).is_some());
-        assert!(n.serves("bge-m3", proxy::Api::Ollama).is_none(), "a different tag is a different model");
+        assert!(
+            n.serves("bge-m3", proxy::Api::Ollama).is_none(),
+            "a different tag is a different model"
+        );
         n.engines[0].running = false;
-        assert!(n.serves("qwen3", proxy::Api::Ollama).is_none(), "a model on a stopped engine does not count");
+        assert!(
+            n.serves("qwen3", proxy::Api::Ollama).is_none(),
+            "a model on a stopped engine does not count"
+        );
     }
 
     #[test]

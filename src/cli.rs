@@ -70,8 +70,9 @@ pub struct Cli {
     pub attach: bool,
     /// `tui`: run the node in this process, even if another is running.
     pub standalone: bool,
-    /// `tui`: also run the LAN router (discovery, node-info, the routing
-    /// proxies) and show its screens. The window always does.
+    /// `run`/`tui`: also run the LAN router (discovery, node-info, the
+    /// routing proxies). The window always has the router: it attaches to
+    /// one already running here, or runs its own.
     pub router: bool,
     /// Environment overrides collected from flags, applied before anything
     /// reads the environment.
@@ -257,7 +258,7 @@ pub fn usage() -> String {
          \x20 --timeout SECS         per-probe ceiling in check (default 5)\n\
          \x20 --attach               tui/gui: require a running node, never start one\n\
          \x20 --standalone           tui/gui: run the node in this process\n\
-         \x20 --router               tui: also run the LAN router and show its screens (8, 9)\n\
+         \x20 --router               run/tui: also run the LAN router (gui and tui attach to it)\n\
          \x20 -h, --help             this text\n\
          \x20 -V, --version          version and build stamp\n\
          \n\
@@ -429,8 +430,10 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
     if (cli.attach || cli.standalone) && !matches!(cli.cmd, Cmd::Tui | Cmd::Gui) {
         return Err("--attach and --standalone apply to `tui` and `gui`".into());
     }
-    if cli.router && !matches!(cli.cmd, Cmd::Tui | Cmd::Gui) {
-        return Err("--router applies to `tui` (the window always runs the router)".into());
+    if cli.router && !matches!(cli.cmd, Cmd::Run | Cmd::Tui | Cmd::Gui) {
+        return Err(
+            "--router applies to `run` and `tui` (the window always runs the router)".into(),
+        );
     }
     let touches_settings = !cli.assignments.is_empty() || !cli.clear.is_empty() || cli.clear_all;
     if (touches_settings || cli.list) && cli.cmd != Cmd::Set {

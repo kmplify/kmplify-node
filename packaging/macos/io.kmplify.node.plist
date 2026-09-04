@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for a headless router on a Mac that has no window open:
+  the node lends to the fabric and routes for the LAN from login on,
+  and `kmplify-node gui` or `kmplify-node tui --router` attach to it.
+
+    cp io.kmplify.node.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.kmplify.node.plist
+
+  The window's own "open when I sign in" switch writes a plist of the same
+  label that starts the window instead; use one or the other.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.kmplify.node</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/kmplify-node</string>
+        <string>run</string>
+        <string>--router</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/tmp/kmplify-node.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/kmplify-node.log</string>
+</dict>
+</plist>

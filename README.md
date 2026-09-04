@@ -34,6 +34,12 @@ decision anyone should make about a binary they cannot read.
   that you have the hardware.
 - **Enforces your ceilings**: CPU, VRAM, RAM and disk caps you set are applied
   on this side, not requested politely from the other.
+- **Routes across your own network, optionally.** The kmplify-nodes on one
+  LAN find each other, pair with a PIN, and one endpoint on any of them
+  routes each request to whichever machine can serve it best. A desktop
+  window (`kmplify-node gui`) or two extra terminal screens (`tui --router`)
+  show the whole cluster. Adapted from NVIDIA's Personal AI Router; see
+  [the LAN router](#the-lan-router-and-the-desktop-window) below.
 - **Optionally runs signed Wasm functions** in an in-process WASI sandbox
   (stdin/stdout only, no files, no network), only for a catalog key you chose
   to trust, and **optionally lends vector storage** for replicated RAG
@@ -92,10 +98,12 @@ report you can file.
 
 ## What it does not do
 
-It never listens on a port. It opens one outbound WebSocket and everything,
-including the HTTP relay to a hosted session, travels back over it. Joining a
-fabric does not expose your machine to the internet, and you do not need to
-forward a port, open a firewall or own a domain.
+The fabric worker never listens on a port. It opens one outbound WebSocket
+and everything, including the HTTP relay to a hosted session, travels back
+over it. Joining a fabric does not expose your machine to the internet, and
+you do not need to forward a port, open a firewall or own a domain. (The
+LAN router is the one opt-in exception, and it listens on the local network
+only; what it opens and for whom is spelled out in its own section.)
 
 It has no account. A node registers anonymously and gets an opaque id and
 token; there is no email, no PII, and nothing tying the machine to a person
@@ -132,14 +140,34 @@ host, where it can drive Docker and see the GPU):
 docker run -d --name kmplify-node --network host -v kmplify-node-data:/data ghcr.io/kmplify/kmplify-node
 ```
 
-Or from source:
+Or from source (add `--features gui` for the desktop window):
 
 ```bash
 cargo install --git https://github.com/kmplify/kmplify-node
 ```
 
-Prebuilt binaries, their SHA256SUMS, the systemd unit and the env template
-are attached to every [GitHub release](https://github.com/kmplify/kmplify-node/releases).
+On Windows, where `install.sh` does not run, there is an installer
+(`kmplify-node-<version>-setup.exe`: the binary, a Start menu entry that
+opens the window, optional PATH and sign-in autostart), or the bare
+`kmplify-node-x86_64-pc-windows-msvc.exe`, or the source build above with
+Rust 1.95 or newer.
+
+Desktop packages for the window, from the same release:
+
+| Platform | Package | What it contains |
+|---|---|---|
+| Debian, Ubuntu and derivatives | `kmplify-node_<version>_amd64.deb` / `_arm64.deb` | the binary with the window, a desktop entry and icon, the systemd unit (installed, not enabled) |
+| macOS | `kmplify-node-<version>-<arch>.dmg` | `KMPLIFY Node.app`; the binary inside it is the full CLI, so `ln -s "/Applications/KMPLIFY Node.app/Contents/MacOS/kmplify-node" /usr/local/bin/` gives you the commands too |
+| Windows | `kmplify-node-<version>-setup.exe` | as above |
+
+The macOS bundle is signed ad hoc and not notarised: the first open is a
+right-click, Open. The bare macOS and Windows binaries are built with the
+window as well; the static Linux binaries are headless, which is what a
+server wants, and the `.deb` is the one with the window.
+
+Prebuilt binaries, their SHA256SUMS, the packages, the systemd unit and the
+env template are attached to every
+[GitHub release](https://github.com/kmplify/kmplify-node/releases).
 
 ## Run
 
@@ -174,6 +202,21 @@ Then watch and steer it from a terminal:
 ```bash
 kmplify-node tui
 ```
+
+Or, on a machine with a desktop, open the window instead, which shows the
+same node plus every other kmplify-node on your network:
+
+```bash
+kmplify-node gui
+```
+
+The window and the dashboard are two views of one node, and you can switch
+between them at any time: each one **attaches** to the node (and to the LAN
+router) already running here, and only starts them itself when nothing is
+running. So `kmplify-node run --router` as a service, `gui` on the desk and
+`tui --router` over SSH all show and steer the same thing, and closing any
+of the views stops nothing that was running before it opened. Details in
+[the router section](#the-lan-router-and-the-desktop-window).
 
 ### Your engine, found rather than typed
 
@@ -215,16 +258,17 @@ Everything below is the detail behind those commands.
 
 ## The CLI
 
-One binary, seven commands. Everything an operator does to a node — preflight
+One binary, every command. Everything an operator does to a node — preflight
 it, run it, watch it, change what it lends, decide who may use it — is here,
 so a machine with no desktop is no harder to run than one with a window.
 
 | Command | What it does |
 |---|---|
 | `kmplify-node init` | First-run wizard: find your engine, answer six questions, preflight, start. |
-| `kmplify-node` / `run` | Join the fabric and serve. Logs to stdout, stops cleanly on SIGTERM. |
+| `kmplify-node` / `run` | Join the fabric and serve. Logs to stdout, stops cleanly on SIGTERM. `--router` also runs the LAN router. |
 | `kmplify-node engines` | Scan localhost for inference engines; say which one is active. `--json`. |
-| `kmplify-node tui` | Terminal dashboard: watch **and control** the node. |
+| `kmplify-node tui` | Terminal dashboard: watch **and control** the node. `--router` adds the network and cluster screens. |
+| `kmplify-node gui` | The desktop window: this node, the LAN's other nodes, routing, pairing, engines. Builds with `--features gui`. |
 | `kmplify-node check` | Preflight this host. Connects to nothing. `--json`, `--timeout SECS`. |
 | `kmplify-node status` | Is it serving right now, and how hard is the machine working. `--json`. |
 | `kmplify-node set` | Change what this machine lends, durably and without a restart. |
@@ -464,21 +508,143 @@ The full contract, including what the node will never do, is in
 [docs/REWARDS.md](docs/REWARDS.md). Payout rails are testnet-only today: a
 balance that cannot be spent is labelled `TESTNET` everywhere it appears.
 
-## The desktop window and the LAN router
+## The LAN router and the desktop window
 
-The same machine can also be the hub of a personal inference cluster: the
-kmplify-nodes on one local network find each other, every window shows every
-node's engines and live meters, and (from the next phase) one endpoint routes
-each request to whichever machine can serve it. It is opt-in, local-first
-and off by default; the design is adapted from NVIDIA's Personal AI Router
-(Apache-2.0). Build with the `gui` feature and run:
+A household or a small office rarely has one machine with a GPU; it has a
+gaming PC, a Mac, a NAS with a spare card, a laptop. The router turns the
+kmplify-nodes on one local network into a **personal inference cluster**:
+every machine finds the others, an application on any of them talks to one
+endpoint, and each request goes to whichever machine can serve that model
+best. Prompts and answers travel between machines you own and never leave
+the network. The design is adapted from NVIDIA's Personal AI Router
+(Apache-2.0, see [NOTICE](NOTICE)), reimplemented in Rust inside this one
+binary for Linux, macOS and Windows; the full design, the wire formats and
+what was verified are in [docs/ROUTER.md](docs/ROUTER.md).
+
+It is opt-in per machine and off by default, because it is the one part of
+this program that listens on the network.
+
+### Three ways to run it, one router
 
 ```bash
 kmplify-node gui
 ```
 
-What it does, what it puts on the network and what is still to come is in
-[docs/ROUTER.md](docs/ROUTER.md).
+```bash
+kmplify-node tui --router
+```
+
+```bash
+kmplify-node run --router
+```
+
+The router runs in exactly one process on a machine. The first of these to
+start it owns it; every later one **attaches**: it draws the state that
+process publishes (`router.json` in the node directory, once a second) and
+leaves its orders as files (`control/router/`), the same two mechanisms the
+fabric node already uses for `status.json` and `control/`. So the window can
+be closed and the terminal dashboard opened, or the other way round, and
+the cluster, the proxies and the peer polls carry on. The status bar (window)
+and the router panel (dashboard) say which it is: "router in this window" or
+"attached to the router running here". `--standalone` insists on running
+both node and router in this process.
+
+On Windows and macOS the window has a tray icon: closing the window while it
+hosts the node or the router hides it there, and the tray menu opens it
+again or quits for real. The settings screen has the "open when I sign in"
+switch (a per-user Run entry, LaunchAgent or XDG autostart file, and nothing
+system-wide). On Linux the window closes like any window; a router that
+should outlive it is `kmplify-node run --router` as a service, with the
+window or the dashboard attaching to it.
+
+### What you see
+
+**Overview**: a card per node with its GPU, engines and model counts, a
+radial gauge and a minute of history for GPU load, VRAM, CPU and RAM, and a
+jobs column on the left with a line from each running job to the node
+serving it. **Settings**: the cluster card (pair, invite, remove, leave), the
+network card (LAN ingress, nodes added by address, the router's log), this
+window's autostart, and the same sharing switches `kmplify-node set` writes.
+**Endpoints**: what to paste into an application. **Chat**: a message typed
+there is routed exactly like an application's request. Each node card's
+engine panel installs, starts, stops and pulls models for Ollama and LM
+Studio, on this machine or on a paired one.
+
+The terminal dashboard gets the same as two screens: `8` network (every node
+with state, address, GPU, engines, load and pending work; the routed jobs;
+the endpoints) and `9` cluster (fingerprint, members, `i` invite, `o` join,
+`d` remove, `L` leave).
+
+### Discovery, pairing, trust
+
+Nodes announce one `_kmplify-node._tcp` record on the local link (multicast
+DNS, with the router's own responder because Windows ships none) carrying
+capacity, never content: id, name, GPU, VRAM, cores, RAM, engines, version,
+cluster id. A node the network cannot see (another subnet, a VPN) is added
+by address.
+
+Seeing a node is not trusting it. Every node has a self-signed certificate;
+**pairing** is a six-digit PIN shown on one machine and typed on the other,
+authenticating a SPAKE2 key exchange so an active attacker gets one online
+guess per attempt and nothing to brute-force offline. Each side pins the
+other's certificate fingerprint in `cluster.json`, and from then on every
+request between them travels over **mutual TLS** pinned to those
+fingerprints. There is no certificate authority, no account and no cloud
+step in any of this.
+
+| Port | Listener | Who may use it |
+|---|---|---|
+| `14418` | node-info: hardware, meters, engines with model names, pending work, recent jobs; pairing; engine control | plain HTTP from the subnet **only while the node is in no cluster**; afterwards loopback and paired nodes over mutual TLS. Pairing itself is plaintext, authenticated by the PIN. |
+| `11440` | Ollama-compatible routing proxy (`/api/*`, plus the `/v1/*` Ollama serves) | this machine (routed anywhere in the cluster); paired nodes over mutual TLS while *LAN ingress* is on (served by this node's own engine, never routed on); anything else `403` |
+| `11441` | OpenAI-compatible routing proxy (`/v1/*`, every engine) | same |
+
+The router never takes over an engine's own port: Ollama stays on `11434`,
+LM Studio on `1234`, and an application opts into the cluster by pointing
+at `11440` or `11441`. Switch LAN ingress off and a machine becomes a pure
+consumer of the cluster that serves nothing to it.
+
+### Routing
+
+`GET /api/tags` and `GET /v1/models` fan out to every online node and merge
+by model name, listing every owner. Any other request names a model; the
+candidates are the online paired nodes whose running engine has it, ordered
+by pending work plus GPU pressure (smoothed, with hysteresis), and tried in
+order. A `404` (stale inventory) or a `5xx` moves to the next owner; a
+`400` is returned as is; the response streams back untouched. Each request
+is a job card, opened at dispatch and closed when the response body ends,
+replicated to every node so every window shows work running anywhere.
+
+### The router and the fabric
+
+The two are independent and combine in one line. The fabric node lends
+whatever engine `engine=` points at; point it at the router and the fabric
+gets the whole cluster:
+
+```bash
+kmplify-node set engine=http://127.0.0.1:11440
+```
+
+The node re-advertises the union of the cluster's models, and a fabric job
+that lands here is routed to the best machine on the LAN like any local
+request, over loopback, so the router's caller gate never sees a fabric
+consumer. Nothing on the wire to the gateway changes (the gateway's hello
+handler tolerates every field the node sends), and the gateway's own test
+suite includes a cross-repository check that this node's image pins and the
+gateway's catalog agree. The relevant protocol sections are mirrored in
+[PROTOCOL.md](PROTOCOL.md).
+
+### Environment
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `KMPLIFY_ROUTER_PORTS` | `14418,11440,11441` | node-info, Ollama-compatible proxy, OpenAI-compatible proxy; also what lets two nodes share one machine for testing |
+| `KMPLIFY_NODE_NAME` | the hostname | the name this node announces and shows |
+
+Files in the node directory: `router/node.crt.der` and `node.key.der` (this
+node's certificate), `router/cluster.json` (cluster id, members with pinned
+fingerprints and last known addresses), `router/engines/` (an Ollama the
+router installed itself), `router.json` (the published state) and
+`control/router/` (orders for it).
 
 ## The terminal dashboard
 
@@ -504,6 +670,7 @@ starts a node itself and quitting stops it. `--attach` insists on the first,
 | `5` sharing | what this machine lends, and how much of it |
 | `6` peers | who may use it: waiting consumers, active ones, invitations |
 | `7` activity | CPU, GPU, VRAM and RAM live, with history and a bar per core |
+| `8` network · `9` cluster | with `--router`: the LAN's nodes, routed jobs and endpoints; pairing and members |
 
 | Key | Action |
 |---|---|
@@ -629,6 +796,7 @@ falling back to a default the operator did not choose.
 | `PROVIDER_APPROVAL_MODE` | `auto` | `manual` holds each session for your approval. |
 | `COLIBRI_BASE` | *empty* | Optional second upstream for MoE streaming. |
 | `KMPLIFY_NODE_DIR` | `$XDG_CONFIG_HOME/kmplify-node` | Where the node identity is stored. |
+| `KMPLIFY_ROUTER_PORTS` · `KMPLIFY_NODE_NAME` | `14418,11440,11441` · hostname | The LAN router's ports and announced name. See [the router section](#the-lan-router-and-the-desktop-window). |
 | `KMPLIFY_GPU_BACKEND` | autodetect | Force the accelerator: `cuda`, `rocm`, `oneapi`, `metal`, `cpu`. |
 | `KMPLIFY_CUDA` | autodetect | Older CUDA-only override (`1`/`0`). Still honoured. |
 | `KMPLIFY_FABRIC_EXTRA_IMAGE_PINS` | *empty* | Extra `template=repository` image pins. See below. |

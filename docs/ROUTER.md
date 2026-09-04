@@ -25,12 +25,24 @@ kmplify-node gui
 `gui` behaves like `tui`: it **attaches** to the fabric node already running
 here, or **starts** one and stops it when the window closes. `--attach` and
 `--standalone` force either. The window's fabric side (link state, delivered
-jobs, the sharing settings) is that node; the router side (discovery, meters,
-routing) lives in the window's own process.
+jobs, the sharing settings) is that node.
+
+The router side (discovery, meters, routing, the cluster) is a service of
+the node in the same sense: it runs in exactly one process on the machine,
+and every view attaches to it. `kmplify-node run --router` runs it
+headless; `kmplify-node gui` and `kmplify-node tui --router` start it only
+when no process runs it yet, and otherwise draw from `router.json` (written
+once a second by the owning process) and leave their orders as files in
+`control/router/` (`router::snapshot`, `control::RouterCommand`). The
+operator can therefore switch between the console view and the window at
+any time, and the router is not a property of whichever screen is open.
+`--standalone` forces both node and router into the current process.
 
 The `gui` feature is off by default. A headless service binary has no use for
-a window toolkit, and the feature pulls one in. `router` alone (mDNS, no
-window) is a separate feature for a future headless router mode.
+a window toolkit, and the feature pulls one in. `router` alone (no window)
+is what `run --router` and `tui --router` need, and the release binaries
+for macOS and Windows carry `gui`; the static Linux ones are headless and
+the `.deb` has the window.
 
 ## What this changes about the crate's promises
 
@@ -134,7 +146,8 @@ fabric worker paused is a purely on-premises cluster.
 | `nvpair-errors` | log ring + peer sync | local done · 3 |
 | `nvpair-ui-broker` (supervision, JSON-RPC relay) | not needed: one process, one `Router` behind a mutex | — |
 | `nvpair-tui` | `kmplify-node tui --router`: screens 8 network and 9 cluster | done |
-| Electron `desktop/` | `src/gui` (egui, native) | Overview, Jobs, Settings, Endpoints, Add node, Chat done · 3 (Model hub, Welcome, Tray) |
+| Electron `desktop/` | `src/gui` (egui, native) | Overview with connection lines, Jobs, Settings, Endpoints, Add node, Chat, engine panel, tray, autostart: done. PAIR's Model hub is the engine panel's pull; its Welcome screen is `kmplify-node init` |
+| Electron packaging (dmg, exe, AppImage) | `cargo deb`, `scripts/bundle-macos.sh`, `packaging/windows/kmplify-node.iss`, all driven by `release.yml` | done |
 
 Ports, chosen apart from the engines' defaults and from PAIR's `143xx` band
 so both can run on one machine:
@@ -337,9 +350,70 @@ chosen and kept:
   this process's own — which is what let two nodes on one machine, on
   different ports, reach each other in both directions.
 
-Still to do:
+### One router, any number of views (`router::snapshot`)
 
-- Packaging: `.deb`, `.dmg`, Windows installer, autostart, tray.
+The router runs in one process per machine and publishes `router.json`
+(the whole `Router` less its live handles: nodes with their history,
+jobs, cluster, invitation, log) once a second, owner-readable. A view
+opened while another process runs it attaches through `RouterHandle`:
+`view()` reads the file (cached for a second), `command()` writes a
+`RouterCommand` file into `control/router/`, which the owning process
+drains every half second and applies through the same `apply` the local
+handle uses. Orders are the same nine verbs in both modes: invite, cancel,
+join, add and forget a node, remove a member, leave, LAN ingress, and an
+engine action on any node. The directory is separate from `control/` on
+purpose: the node process drains that one, and the router may live in a
+different process (a window attached to a headless node), so an order left
+there would be eaten by the wrong reader.
+
+Fabric jobs become router job cards in the owning process too
+(`telemetry::mirror_fabric_jobs`), from the node's counters, and only when
+that process is the node, so an attached window does not double-count.
+
+Verified here with the installed node running headless in one terminal,
+the window started second (router in the window), and `tui --router`
+started third: the dashboard's footer said attached to both; `i` on its
+cluster screen opened an invitation that the window's router logged and
+showed; `n` cancelled it; a chat through the proxy appeared as a job in
+both views with the connection line drawn in the window; and with
+`engine=http://127.0.0.1:11440` a fabric job pinned to this node by
+invitation ran through the router (the node's counter and the router's
+job list both moved), after which the setting was put back.
+
+### Packaging
+
+- **Debian/Ubuntu**: `[package.metadata.deb]` in `Cargo.toml` for
+  `cargo deb`: the binary with the window, `packaging/kmplify-node.desktop`,
+  the icon, the systemd unit (installed, not enabled: it runs as the
+  `kmplify` user the operator creates), the docs. Built for amd64 and arm64.
+- **macOS**: `scripts/bundle-macos.sh` wraps the binary into
+  `KMPLIFY Node.app` (a two-line launcher runs it with `gui`; the binary
+  inside stays the full CLI), renders the `.icns` from
+  `packaging/icons/kmplify-node-1024.png`, signs ad hoc and writes the
+  `.dmg`. `packaging/macos/io.kmplify.node.plist` is a LaunchAgent for a
+  headless `run --router` at login.
+- **Windows**: `packaging/windows/kmplify-node.iss` for Inno Setup (on the
+  hosted runners): per-user by default, Start menu entries for the window
+  and the dashboard, optional PATH, desktop shortcut and sign-in autostart
+  (an HKCU Run value), and the uninstaller stops a window hidden in the
+  tray first.
+- **Icon**: one geometry (`src/gui/icon.rs`) rasterised at runtime for the
+  window and tray icons, and the same geometry rendered to
+  `packaging/icons/` (PNG, ICO) for the packages.
+- **Tray and autostart** (`src/gui/tray.rs`, `src/gui/autostart.rs`): on
+  Windows and macOS the window hides behind a tray icon while it hosts the
+  node or the router, and the tray menu reopens or quits it; the settings
+  screen's "open when I sign in" writes and removes the per-user autostart
+  entry on all three platforms. Linux has no tray here (the crate needs
+  GTK and an appindicator library, and the desktops disagree), so the
+  window closes and a `run --router` service is the way to keep the router
+  up.
+- `release.yml` builds all of it per tag; `ci.yml` builds and tests the
+  `gui` feature on the three desktops.
+
+Not exercised on this machine: the `.deb` and `.dmg` themselves (no
+Debian or macOS here), the Inno Setup compile (no `iscc` installed
+locally), and mDNS discovery between two physical machines.
 
 ## Compliance notes
 

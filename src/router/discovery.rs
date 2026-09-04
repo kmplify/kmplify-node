@@ -57,7 +57,9 @@ pub fn decode_engines(s: &str) -> Vec<Engine> {
                 name: known
                     .map(|k| k.name.to_string())
                     .unwrap_or_else(|| id.to_string()),
-                base: known.map(|k| k.default_base.to_string()).unwrap_or_default(),
+                base: known
+                    .map(|k| k.default_base.to_string())
+                    .unwrap_or_default(),
                 // The count travels; the names come with the node-info
                 // fetch. Placeholders keep `model_count()` truthful.
                 models: vec![String::new(); n.trim().parse().unwrap_or(0)],
@@ -71,11 +73,7 @@ pub fn decode_engines(s: &str) -> Vec<Engine> {
 
 /// A peer card from a resolved record. `None` when the record is not one of
 /// ours (no id) — a stranger's service that happens to share the type.
-pub fn node_from_txt(
-    txt: &HashMap<String, String>,
-    address: String,
-    now: Instant,
-) -> Option<Node> {
+pub fn node_from_txt(txt: &HashMap<String, String>, address: String, now: Instant) -> Option<Node> {
     let id = txt.get(K_ID)?.trim().to_string();
     if id.is_empty() {
         return None;
@@ -351,9 +349,20 @@ mod tests {
             "fe80::1".to_string(),
         ];
         assert_eq!(pick_address(&announced, "192.168.2.50"), "192.168.2.171");
-        assert_eq!(pick_address(&announced, "10.0.0.5"), "172.23.240.1", "no subnet match: any routable IPv4");
-        assert_eq!(pick_address(&["169.254.1.1".to_string()], "192.168.2.50"), "169.254.1.1", "link-local only when nothing else");
-        assert_eq!(pick_address(&["fe80::1".to_string()], "192.168.2.50"), "fe80::1");
+        assert_eq!(
+            pick_address(&announced, "10.0.0.5"),
+            "172.23.240.1",
+            "no subnet match: any routable IPv4"
+        );
+        assert_eq!(
+            pick_address(&["169.254.1.1".to_string()], "192.168.2.50"),
+            "169.254.1.1",
+            "link-local only when nothing else"
+        );
+        assert_eq!(
+            pick_address(&["fe80::1".to_string()], "192.168.2.50"),
+            "fe80::1"
+        );
         assert_eq!(pick_address(&[], "192.168.2.50"), "");
     }
 

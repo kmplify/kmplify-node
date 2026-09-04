@@ -126,7 +126,9 @@ pub fn pill(ui: &mut egui::Ui, text: &str, color: Color32) {
 }
 
 pub fn muted(text: impl Into<String>) -> egui::RichText {
-    egui::RichText::new(text.into()).color(TEXT_MUTED).size(12.0)
+    egui::RichText::new(text.into())
+        .color(TEXT_MUTED)
+        .size(12.0)
 }
 
 pub fn dim(text: impl Into<String>) -> egui::RichText {
@@ -134,5 +136,8 @@ pub fn dim(text: impl Into<String>) -> egui::RichText {
 }
 
 pub fn heading(text: impl Into<String>) -> egui::RichText {
-    egui::RichText::new(text.into()).size(15.0).strong().color(TEXT)
+    egui::RichText::new(text.into())
+        .size(15.0)
+        .strong()
+        .color(TEXT)
 }

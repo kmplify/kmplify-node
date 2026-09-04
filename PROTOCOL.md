@@ -377,6 +377,102 @@ than a socket that accepts and stays mute (30s open timeout). A pre-v2.2 node
 simply ignores `ws_open`, so the consumer's socket times out and closes — an
 older provider degrades to today's behaviour instead of breaking.
 
+## Protocol v3.0: signed functions and replicated vector collections
+
+Two lanes beyond inference and container sessions. Both are opt-in on the
+node, fail closed, and ride the same outbound socket and `job` frame family
+as everything else, so a pre-v3 gateway or node simply never sees them.
+This section mirrors the gateway's copy in the kmplify-compute-fabric
+repository; the two are kept level on purpose.
+
+### Capability advertising
+
+The hello may carry:
+
+```json
+"functions": { "enabled": true, "runtime": "wasmtime", "max_memory_mb": 256,
+               "max_ms": 30000, "pubkey": "<hex ed25519>" },
+"vectors":   { "enabled": true, "max_mb": 1024, "used_mb": 12 },
+"collections": ["<32-hex collection id>", "..."]
+```
+
+`functions.pubkey` is the catalog key the node TRUSTS (`PROVIDER_FUNCTIONS_PUBKEY`);
+the gateway only schedules functions onto nodes whose trusted key is its
+own. `functions.enabled` is false when the build has no Wasm runtime even if
+the operator opted in, so a gateway never routes to a node that would refuse.
+`collections` lists the vector collections replicated on the node; the
+gateway answers `{"type":"vector_drop","collection":id}` for any it no
+longer knows (same reconciliation as sessions). `pong` may carry
+`vectors_used_mb` so placement sees live occupancy.
+
+### Functions
+
+Gateway → node: `{"type":"job","id","kind":"function","payload":{...}}` with
+
+```json
+"function": { "id": "echo", "sha256": "<hex>", "signature": "<hex>",
+              "memory_mb": 16, "timeout_ms": 5000,
+              "module_url": "https://<gateway>/v1/functions/echo/module" },
+"input_b64": "...", "args": ["..."]
+```
+
+The signature is Ed25519 over the canonical manifest
+`{"id":…,"memory_mb":…,"sha256":…,"timeout_ms":…}` (sorted keys, no
+whitespace). The node verifies it under its trusted key, downloads the bytes
+only from its own gateway, re-hashes them, caches by hash, clamps the limits
+to its operator ceilings, and runs the module as a WASI preview 1 command
+with stdin = input, argv = args, no filesystem, no network, no environment,
+bounded by memory, fuel and wall-clock. Reply:
+
+`{"type":"done","id","data":{"exit_code":0,"stdout_b64":"...","stderr_tail":"...","duration_ms":12}}`
+or `{"type":"error","id","message":"refused: …"}` naming the rule.
+
+Consumer API: `GET /v1/functions` (catalog + the gateway's public key),
+`GET /v1/functions/{id}/module` (bytes, public, not trusted on their own),
+`POST /v1/functions/{id}/invoke` `{"input": <string|JSON>, "args": []}` →
+`{function, node, exit_code, output, stderr, duration_ms}`. Inputs are
+capped at 1 MB. Placement: trusted key, enough memory, admission, EU filter,
+then least active jobs and nearest.
+
+### Vector collections
+
+Registry (gateway): `collection_id` (uuid4 hex), owner (the consumer
+credential refined by its sub-identity), `dim`, `metric` (cosine|dot|euclid),
+`replication` (1..3), `eu_only`, and the replica node ids. The gateway
+stores NO vectors and NO payloads.
+
+Jobs, gateway → replica node, all answered with `done`/`error`:
+
+| kind | payload |
+| --- | --- |
+| `vector_upsert` | `{collection, dim, metric, points:[{id, vector:[f32…], payload_b64?}]}` |
+| `vector_query` | `{collection, metric, vector, top_k}` → `{matches:[{id, score, payload_b64?}]}` |
+| `vector_delete` | `{collection, ids:[…]}` |
+| `vector_drop` | `{collection}` |
+
+Upserts fan out to every live replica (the answer reports `replicas_ok` of
+`replicas_total`, so a degraded write is visible); queries go to the
+nearest live replica and fall through on failure; drops notify every live
+replica and delete the registry row immediately. Payloads are opaque to the
+fabric and capped at 16 KB; the consumer encrypts them.
+
+Consumer API under `/v1/vectors/collections` (identified consumers only):
+`POST` create `{dim, metric, replication, name}`; `GET` list; `GET /{id}`;
+`DELETE /{id}`; `POST /{id}/points` `{points}`; `POST /{id}/query`
+`{vector, top_k}`; `DELETE /{id}/points` `{ids}`. Creation under
+`X-KMPLIFY-Region: eu` places replicas on EU/EEA nodes only and records it.
+
+## The LAN router and the fabric
+
+The router (docs/ROUTER.md) is not part of this protocol: it never talks to
+a gateway, and a gateway never sees a cluster. The two meet at one point,
+on the node: the router's Ollama-compatible proxy is an engine like any
+other, so a node whose engine is set to it (`kmplify-node set
+engine=http://127.0.0.1:11440`) advertises the whole cluster's models in its
+hello and answers fabric jobs by routing them across its paired machines.
+The gateway sees one node with more models; nothing in the hello, the job
+frames or the consumer API changes.
+
 ## Protocol v3.4 — template model prefetch
 
 A `workload_start` frame may carry a **model manifest**: files this node

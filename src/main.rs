@@ -49,11 +49,11 @@
 //! on a machine whose owner believed they had set one.
 
 mod cli;
+#[cfg(feature = "gui")]
+mod gui;
 mod onboard;
 #[cfg(feature = "tui")]
 mod tui;
-#[cfg(feature = "gui")]
-mod gui;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1479,9 +1479,33 @@ impl Node {
 }
 
 /// Join the fabric and serve until told to stop. Returns the exit code.
-async fn serve(cfg: WorkerConfig, dir: PathBuf) -> i32 {
+async fn serve(cfg: WorkerConfig, dir: PathBuf, router: bool, gpus: Vec<gpu::Gpu>) -> i32 {
     println!("[kmplify-node] joining {}", cfg.gateway_url);
-    let node = start_node(cfg, dir).await;
+    let accel = cfg.accel();
+    let node = start_node(cfg, dir.clone()).await;
+    // The LAN router as a service of the node: discovery, node-info, the
+    // routing proxies, published to router.json for any window or
+    // dashboard that attaches. See docs/ROUTER.md.
+    if router {
+        #[cfg(feature = "router")]
+        {
+            let shared =
+                kmplify_node::router::new_shared(&dir, &gpus, kmplify_node::router::lan_address());
+            kmplify_node::router::spawn(shared, accel);
+            println!(
+                "[kmplify-node] LAN router on :{} (node-info), :{} and :{} (proxies)",
+                kmplify_node::router::node_info_port(),
+                kmplify_node::router::proxy_ollama_port(),
+                kmplify_node::router::proxy_openai_port()
+            );
+        }
+        #[cfg(not(feature = "router"))]
+        {
+            let _ = (&gpus, accel);
+            eprintln!("[kmplify-node] this build has no LAN router (built without the `router` feature); running without it");
+        }
+    }
+    let _ = (&gpus, accel);
     let snap = status::snapshot();
     if !snap.node_id.is_empty() {
         println!(
@@ -1672,7 +1696,7 @@ async fn main() {
         cli::Cmd::Engines => run_engines(&cfg, cli.json).await,
         cli::Cmd::Rewards => run_rewards(&dir, &cfg, &stored).await,
         cli::Cmd::Set => unreachable!("handled above"),
-        cli::Cmd::Run => serve(cfg, dir).await,
+        cli::Cmd::Run => serve(cfg, dir, cli.router, gpus).await,
         cli::Cmd::Tui => run_tui(cfg, dir, &cli, gpus).await,
         cli::Cmd::Gui => run_gui(cfg, dir, &cli, gpus).await,
         cli::Cmd::Status | cli::Cmd::Help | cli::Cmd::Version => unreachable!("handled above"),

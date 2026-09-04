@@ -119,7 +119,10 @@ pub async fn serve(shared: Shared, port: u16, app: axum::Router, label: &'static
                     .unwrap_or_default();
                 let info = PeerInfo {
                     addr: remote,
-                    tls: Some(TlsPeer { node_id, fingerprint }),
+                    tls: Some(TlsPeer {
+                        node_id,
+                        fingerprint,
+                    }),
                 };
                 serve_one(make_service, info, tls).await;
             } else {
@@ -134,7 +137,10 @@ pub async fn serve(shared: Shared, port: u16, app: axum::Router, label: &'static
 }
 
 async fn serve_one<IO>(
-    make_service: axum::extract::connect_info::IntoMakeServiceWithConnectInfo<axum::Router, PeerInfo>,
+    make_service: axum::extract::connect_info::IntoMakeServiceWithConnectInfo<
+        axum::Router,
+        PeerInfo,
+    >,
     info: PeerInfo,
     io: IO,
 ) where
@@ -158,15 +164,27 @@ mod tests {
         assert!(!plain.is_loopback());
         let pinned_unknown = PeerInfo {
             addr,
-            tls: Some(TlsPeer { node_id: String::new(), fingerprint: "f".into() }),
+            tls: Some(TlsPeer {
+                node_id: String::new(),
+                fingerprint: "f".into(),
+            }),
         };
-        assert!(!pinned_unknown.is_member(), "pinned but not yet listed is not a member");
+        assert!(
+            !pinned_unknown.is_member(),
+            "pinned but not yet listed is not a member"
+        );
         let member = PeerInfo {
             addr,
-            tls: Some(TlsPeer { node_id: "n".into(), fingerprint: "f".into() }),
+            tls: Some(TlsPeer {
+                node_id: "n".into(),
+                fingerprint: "f".into(),
+            }),
         };
         assert!(member.is_member());
-        let local = PeerInfo { addr: "127.0.0.1:1".parse().unwrap(), tls: None };
+        let local = PeerInfo {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            tls: None,
+        };
         assert!(local.is_loopback());
     }
 }
