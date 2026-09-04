@@ -80,32 +80,37 @@ const ENGINE_SCAN: Duration = Duration::from_secs(10);
 
 pub async fn scan_engines(shared: Shared) {
     loop {
-        let found = engines::scan().await;
-        let list = roster_from(&found);
-        {
-            let mut r = lock(&shared);
-            let mut changed = false;
-            if let Some(me) = r.local_mut() {
-                changed = me.engines != list;
-                me.engines = list;
-            }
-            if changed {
-                let summary: Vec<String> = r
-                    .local()
-                    .map(|n| {
-                        n.running_engines()
-                            .map(|e| format!("{} ({} models)", e.name, e.models.len()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                r.push_log(if summary.is_empty() {
-                    "no inference engine is answering on this machine".to_string()
-                } else {
-                    format!("engines: {}", summary.join(", "))
-                });
-            }
-        }
+        refresh_roster(&shared).await;
         tokio::time::sleep(ENGINE_SCAN).await;
+    }
+}
+
+/// One scan, folded into the local card; logged when something changed.
+/// Also called right after an engine operation, so the card does not wait
+/// out the interval to show what just happened.
+pub async fn refresh_roster(shared: &Shared) {
+    let found = engines::scan().await;
+    let list = roster_from(&found);
+    let mut r = lock(shared);
+    let mut changed = false;
+    if let Some(me) = r.local_mut() {
+        changed = me.engines != list;
+        me.engines = list;
+    }
+    if changed {
+        let summary: Vec<String> = r
+            .local()
+            .map(|n| {
+                n.running_engines()
+                    .map(|e| format!("{} ({} models)", e.name, e.models.len()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        r.push_log(if summary.is_empty() {
+            "no inference engine is answering on this machine".to_string()
+        } else {
+            format!("engines: {}", summary.join(", "))
+        });
     }
 }
 
@@ -126,6 +131,8 @@ pub fn roster_from(found: &[engines::Found]) -> Vec<Engine> {
                     .unwrap_or_else(|| k.default_base.to_string()),
                 models: live.map(|f| f.models.clone()).unwrap_or_default(),
                 running: live.is_some(),
+                installed: live.is_some() || super::engine::installed_binary(k.id).is_some(),
+                owned: super::engine::is_owned(k.id),
             }
         })
         .collect();
@@ -137,6 +144,8 @@ pub fn roster_from(found: &[engines::Found]) -> Vec<Engine> {
                 base: f.base.clone(),
                 models: f.models.clone(),
                 running: true,
+                installed: true,
+                owned: false,
             });
         }
     }

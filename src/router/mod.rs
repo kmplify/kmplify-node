@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 
 pub mod cluster;
 pub mod discovery;
+pub mod engine;
 pub mod listen;
 pub mod node_info;
 pub mod proxy;
@@ -192,7 +193,40 @@ pub struct Engine {
     /// serving is listed dimmed, not hidden: the card should say what this
     /// machine *could* run, not just what it happens to be running.
     pub running: bool,
+    /// A binary for it was found: on PATH, in a known install location,
+    /// or in the router's own engines directory.
+    pub installed: bool,
+    /// This process started it, so it can also stop it. An instance found
+    /// already serving is *adopted*: used, never stopped, never moved.
+    pub owned: bool,
 }
+
+/// One engine operation in flight or finished, for the card: install,
+/// start, stop, pull. Carried in node-info reports so a paired node's card
+/// shows its progress too.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct EngineOp {
+    pub id: u64,
+    pub engine: String,
+    pub action: String,
+    pub model: String,
+    pub state: OpState,
+    pub message: String,
+    /// Progress in bytes where the step has a size (download, pull).
+    pub done: u64,
+    pub total: u64,
+    pub at_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OpState {
+    Running,
+    Done,
+    Failed,
+}
+
+pub const MAX_OPS: usize = 20;
 
 /// How a node entered the directory. Discovered and manual nodes are the
 /// same kind of peer once they answer; the distinction is kept so the
@@ -217,6 +251,8 @@ pub struct Node {
     pub cpu_cores: usize,
     pub ram_total_mb: u64,
     pub engines: Vec<Engine>,
+    /// Engine operations on that node, newest first.
+    pub ops: Vec<EngineOp>,
     pub metrics: Metrics,
     pub version: String,
     pub last_seen: Instant,
@@ -257,6 +293,7 @@ impl Node {
             cpu_cores: 0,
             ram_total_mb: 0,
             engines: vec![],
+            ops: vec![],
             metrics: Metrics::default(),
             version: String::new(),
             last_seen: now,
@@ -515,6 +552,39 @@ impl Router {
         }
     }
 
+    /// Record a new engine operation on this machine and return its id.
+    pub fn op_start(&mut self, engine: &str, action: &str, model: &str) -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(1);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let op = EngineOp {
+            id,
+            engine: engine.into(),
+            action: action.into(),
+            model: model.into(),
+            state: OpState::Running,
+            message: String::new(),
+            done: 0,
+            total: 0,
+            at_ms: crate::status::now_ms(),
+        };
+        if let Some(me) = self.local_mut() {
+            me.ops.insert(0, op);
+            me.ops.truncate(MAX_OPS);
+        }
+        id
+    }
+
+    pub fn op_update(&mut self, id: u64, f: impl FnOnce(&mut EngineOp)) {
+        if let Some(op) = self
+            .local_mut()
+            .and_then(|me| me.ops.iter_mut().find(|o| o.id == id))
+        {
+            f(op);
+            op.at_ms = crate::status::now_ms();
+        }
+    }
+
     /// Fold a peer announcement in: refresh an existing card in place so its
     /// chart history survives, or create one. An announcement never
     /// overwrites what node-info already told us in more detail (model
@@ -712,6 +782,7 @@ pub fn lan_address() -> String {
 /// and none holds the lock across an await, so one stalling probe cannot
 /// freeze a card.
 pub fn spawn(shared: Shared, accel: crate::gpu::Backend) {
+    engine::init(&lock(&shared).node_dir);
     tokio::spawn(telemetry::sample_local(shared.clone(), accel));
     tokio::spawn(telemetry::scan_engines(shared.clone()));
     tokio::spawn(telemetry::expire_peers(shared.clone()));
@@ -870,6 +941,8 @@ mod tests {
             base: "http://127.0.0.1:11434".into(),
             models: vec!["qwen3:latest".into(), "bge-m3:567m".into()],
             running: true,
+            installed: true,
+            owned: false,
         });
         assert!(n.serves("qwen3", proxy::Api::Ollama).is_some());
         assert!(n.serves("qwen3:latest", proxy::Api::OpenAi).is_some());
@@ -890,6 +963,8 @@ mod tests {
                 base: String::new(),
                 models: vec![model.into()],
                 running: true,
+                installed: true,
+                owned: false,
             });
             r.nodes.insert(id.into(), n);
         }

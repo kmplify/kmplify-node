@@ -58,10 +58,12 @@ pub fn decode_engines(s: &str) -> Vec<Engine> {
                     .map(|k| k.name.to_string())
                     .unwrap_or_else(|| id.to_string()),
                 base: known.map(|k| k.default_base.to_string()).unwrap_or_default(),
-                // The count travels; the names come with the node-info fetch
-                // in phase 2. Placeholders keep `model_count()` truthful.
+                // The count travels; the names come with the node-info
+                // fetch. Placeholders keep `model_count()` truthful.
                 models: vec![String::new(); n.trim().parse().unwrap_or(0)],
                 running: true,
+                installed: true,
+                owned: false,
             }
         })
         .collect()
@@ -287,6 +289,8 @@ mod tests {
                 base: "http://127.0.0.1:11434".into(),
                 models: vec!["a".into(), "b".into(), "c".into()],
                 running: true,
+                installed: true,
+                owned: false,
             },
             Engine {
                 id: "vllm".into(),
@@ -294,6 +298,8 @@ mod tests {
                 base: String::new(),
                 models: vec![],
                 running: false,
+                installed: false,
+                owned: false,
             },
         ];
         let s = encode_engines(&engines);

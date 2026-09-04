@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use super::cluster::{self, Member, PairRequest};
 use super::listen::{self, PeerInfo};
-use super::{lock, node_info_port, Engine, GpuInfo, Job, Node, Router, Shared, Source};
+use super::{lock, node_info_port, Engine, EngineOp, GpuInfo, Job, Node, Router, Shared, Source};
 
 const HEALTHY_POLL: Duration = Duration::from_secs(2);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(2);
@@ -59,6 +59,10 @@ pub struct EngineReport {
     pub base: String,
     pub models: Vec<String>,
     pub running: bool,
+    #[serde(default)]
+    pub installed: bool,
+    #[serde(default)]
+    pub owned: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -87,6 +91,21 @@ pub struct NodeInfo {
     /// them, but only from a report it fetched over mutual TLS.
     #[serde(default)]
     pub members: Vec<Member>,
+    /// Engine operations on this node, newest first, so a paired node's
+    /// card shows an install or a pull progressing here.
+    #[serde(default)]
+    pub ops: Vec<EngineOp>,
+}
+
+/// A request to operate an engine on this node, from its own window or
+/// from a paired node over mutual TLS.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EngineRequest {
+    pub engine: String,
+    /// `install`, `start`, `stop` or `pull`.
+    pub action: String,
+    #[serde(default)]
+    pub model: String,
 }
 
 /// This machine's report, from the shared state.
@@ -125,8 +144,11 @@ pub fn report(r: &Router) -> Option<NodeInfo> {
                 base: e.base.clone(),
                 models: e.models.clone(),
                 running: e.running,
+                installed: e.installed,
+                owned: e.owned,
             })
             .collect(),
+        ops: me.ops.clone(),
         sampled: m.sampled,
         vram_known: m.vram_known,
         pending: r.pending_for(&me.id),
@@ -188,10 +210,43 @@ async fn pair(
     }
 }
 
+/// Operate an engine here: this machine's own window, or a paired node
+/// over mutual TLS — PAIR's cluster-scoped engine control. Anyone else is
+/// refused; installing software on a machine is not a thing a stranger on
+/// the subnet gets to ask for.
+async fn engine_control(
+    State(shared): State<Shared>,
+    ConnectInfo(info): ConnectInfo<PeerInfo>,
+    Json(req): Json<EngineRequest>,
+) -> Response {
+    if !(info.is_loopback() || info.is_member()) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "engine control is for this machine and paired nodes" })),
+        )
+            .into_response();
+    }
+    let Some(action) = super::engine::Action::parse(&req.action, &req.model) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "action is install, start, stop or pull (with a model)" })),
+        )
+            .into_response();
+    };
+    let who = info
+        .tls
+        .as_ref()
+        .and_then(|t| lock(&shared).cluster.members.get(&t.node_id).map(|m| m.name.clone()))
+        .unwrap_or_else(|| "this machine".into());
+    let id = super::engine::launch(shared, req.engine, action, who);
+    (StatusCode::ACCEPTED, Json(serde_json::json!({ "op": id }))).into_response()
+}
+
 pub async fn serve(shared: Shared) {
     let app = axum::Router::new()
         .route("/v1/node-info", get(handler))
         .route("/v1/pair", post(pair))
+        .route("/v1/engine", post(engine_control))
         .with_state(shared.clone());
     listen::serve(shared, node_info_port(), app, "node-info").await;
 }
@@ -350,8 +405,11 @@ pub fn apply(shared: &Shared, id: &str, address: String, info: NodeInfo, now: In
                 base: e.base,
                 models: e.models,
                 running: e.running,
+                installed: e.installed,
+                owned: e.owned,
             })
             .collect();
+        n.ops = info.ops;
         let m = &mut n.metrics;
         if info.sampled {
             m.sampled = true;
@@ -424,6 +482,8 @@ mod tests {
                 base: "http://127.0.0.1:11434".into(),
                 models: vec!["qwen3:latest".into()],
                 running: true,
+                installed: true,
+                owned: false,
             }],
             sampled: true,
             vram_known: true,
@@ -434,6 +494,7 @@ mod tests {
             fingerprint: String::new(),
             cluster_id: String::new(),
             members: vec![],
+            ops: vec![],
         }
     }
 

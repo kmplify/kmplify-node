@@ -261,6 +261,8 @@ struct GuiApp {
     solo: HashMap<String, String>,
     /// Per node: whether the engine section is open.
     engines_open: HashMap<String, bool>,
+    /// Per node and engine: the model typed into the pull field.
+    pull_input: HashMap<String, String>,
     add_node: Option<String>,
     endpoints_open: bool,
     chat_open: bool,
@@ -304,6 +306,7 @@ impl GuiApp {
             last_poll: Instant::now() - POLL,
             solo: HashMap::new(),
             engines_open: HashMap::new(),
+            pull_input: HashMap::new(),
             add_node: None,
             endpoints_open: false,
             chat_open: false,
@@ -880,9 +883,174 @@ impl GuiApp {
 
             if self.engines_open.get(&node.id).copied().unwrap_or(false) {
                 ui.add_space(8.0);
-                engine_details(ui, node);
+                self.engine_panel(ui, node, paired);
             }
         });
+    }
+
+    /// Engine settings for a card: what is installed, running and owned,
+    /// with the lifecycle buttons, a model pull, and the operations in
+    /// flight. The same panel drives a paired node through its `/v1/engine`
+    /// over mutual TLS — PAIR's cluster-scoped engine control.
+    fn engine_panel(&mut self, ui: &mut egui::Ui, node: &Node, paired: bool) {
+        use kmplify_node::router::engine::Action;
+        let controllable = node.is_local() || paired;
+        let mut request: Option<(String, Action)> = None;
+        theme::card_low().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(theme::heading("Engines"));
+            for e in &node.engines {
+                let managed = matches!(e.id.as_str(), "ollama" | "lmstudio");
+                ui.horizontal(|ui| {
+                    let color = if e.running { theme::OK } else { theme::TEXT_DIM };
+                    let (r, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
+                    ui.painter().circle_filled(r.center(), 4.0, color);
+                    ui.label(RichText::new(&e.name).strong().size(12.5));
+                    ui.label(theme::muted(&e.base));
+                    ui.label(theme::dim(if e.running {
+                        format!(
+                            "{} model(s){}",
+                            e.models.len(),
+                            if e.owned { " · started by this node" } else { " · adopted" }
+                        )
+                    } else if e.installed {
+                        "installed, not running".to_string()
+                    } else {
+                        "not installed".to_string()
+                    }));
+                    if controllable && managed {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if e.running {
+                                let can_stop = e.owned || e.id == "lmstudio";
+                                let stop = ui.add_enabled(can_stop, egui::Button::new("Stop").small());
+                                if stop.clicked() {
+                                    request = Some((e.id.clone(), Action::Stop));
+                                }
+                                if !can_stop {
+                                    stop.on_hover_text("started outside this node; stop it where it was started");
+                                }
+                            } else if e.installed {
+                                if ui.add(egui::Button::new("Start").small()).clicked() {
+                                    request = Some((e.id.clone(), Action::Start));
+                                }
+                            } else if ui.add(egui::Button::new("Install").small()).clicked() {
+                                request = Some((e.id.clone(), Action::Install));
+                            }
+                        });
+                    }
+                });
+                let named: Vec<&String> = e.models.iter().filter(|m| !m.is_empty()).collect();
+                if e.running && !named.is_empty() {
+                    ui.indent(&e.id, |ui| {
+                        ui.label(theme::dim(
+                            named.iter().map(|m| m.as_str()).collect::<Vec<_>>().join("  ·  "),
+                        ));
+                    });
+                }
+                if controllable && managed && e.running {
+                    ui.indent(format!("pull-{}", e.id), |ui| {
+                        ui.horizontal(|ui| {
+                            let key = format!("{}:{}", node.id, e.id);
+                            let input = self.pull_input.entry(key).or_default();
+                            ui.add(
+                                egui::TextEdit::singleline(input)
+                                    .hint_text(if e.id == "ollama" { "model to pull, e.g. qwen3:0.6b" } else { "model to download" })
+                                    .desired_width(260.0),
+                            );
+                            let can = !input.trim().is_empty();
+                            if ui.add_enabled(can, egui::Button::new("Pull").small()).clicked() {
+                                let m = input.trim().to_string();
+                                input.clear();
+                                request = Some((e.id.clone(), Action::Pull(m)));
+                            }
+                        });
+                    });
+                }
+            }
+            if !controllable {
+                ui.label(theme::dim("Pair with this node to start, stop or install its engines."));
+            }
+            if !node.ops.is_empty() {
+                ui.add_space(4.0);
+                for op in node.ops.iter().take(5) {
+                    let (color, word) = match op.state {
+                        kmplify_node::router::OpState::Running => (theme::WARN, "running"),
+                        kmplify_node::router::OpState::Done => (theme::OK, "done"),
+                        kmplify_node::router::OpState::Failed => (theme::ERR, "failed"),
+                    };
+                    ui.horizontal(|ui| {
+                        theme::pill(ui, word, color);
+                        ui.label(RichText::new(format!(
+                            "{} {}{}",
+                            op.action,
+                            op.engine,
+                            if op.model.is_empty() { String::new() } else { format!(" {}", op.model) }
+                        )).size(12.0));
+                        if !op.message.is_empty() {
+                            ui.label(theme::muted(&op.message));
+                        }
+                        ui.label(theme::dim(status::clock_hms(op.at_ms)));
+                    });
+                    if op.state == kmplify_node::router::OpState::Running && op.total > 0 {
+                        let frac = (op.done as f64 / op.total as f64).clamp(0.0, 1.0) as f32;
+                        ui.add(
+                            egui::ProgressBar::new(frac)
+                                .desired_width(320.0)
+                                .text(format!("{} / {} MB", op.done / (1024 * 1024), op.total / (1024 * 1024))),
+                        );
+                    }
+                }
+            }
+        });
+        if let Some((engine, action)) = request {
+            self.engine_request(node, engine, action);
+        }
+    }
+
+    /// Run an engine operation: here directly, on a paired node through
+    /// its node-info surface over mutual TLS.
+    fn engine_request(&mut self, node: &Node, engine: String, action: kmplify_node::router::engine::Action) {
+        if node.is_local() {
+            kmplify_node::router::engine::launch(self.shared.clone(), engine, action, "this window".into());
+            return;
+        }
+        let (client, url, name) = {
+            let r = router::lock(&self.shared);
+            (
+                r.tls_client.clone(),
+                format!("https://{}:{}/v1/engine", node.address, node.info_port),
+                r.local().map(|n| n.name.clone()).unwrap_or_default(),
+            )
+        };
+        let Some(client) = client else {
+            self.notify("no cluster certificate here; cannot control a remote engine", theme::ERR);
+            return;
+        };
+        let body = serde_json::json!({
+            "engine": engine,
+            "action": action.name(),
+            "model": match &action { kmplify_node::router::engine::Action::Pull(m) => m.clone(), _ => String::new() },
+        });
+        let shared = self.shared.clone();
+        let target = node.name.clone();
+        let _ = name;
+        tokio::spawn(async move {
+            let result = client
+                .post(&url)
+                .json(&body)
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await;
+            let mut r = router::lock(&shared);
+            match result {
+                Ok(resp) if resp.status().is_success() => {
+                    r.push_log(format!("asked {target} to {} {}", body["action"], body["engine"]))
+                }
+                Ok(resp) => r.push_log(format!("{target} refused the engine request: {}", resp.status())),
+                Err(e) => r.push_log(format!("cannot reach {target} for engine control: {e}")),
+            }
+        });
+        self.notify(format!("asked {} to {} {}", node.name, action.name(), engine), theme::OK);
     }
 
     fn legend(&mut self, ui: &mut egui::Ui, node: &Node) {
@@ -1012,40 +1180,6 @@ fn engine_badges(ui: &mut egui::Ui, node: &Node) {
     if shown == 0 {
         ui.label(theme::dim("no engine answering"));
     }
-}
-
-fn engine_details(ui: &mut egui::Ui, node: &Node) {
-    theme::card_low().show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.label(theme::heading("Engines"));
-        for e in &node.engines {
-            ui.horizontal(|ui| {
-                let color = if e.running { theme::OK } else { theme::TEXT_DIM };
-                let (r, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
-                ui.painter().circle_filled(r.center(), 4.0, color);
-                ui.label(RichText::new(&e.name).strong().size(12.5));
-                ui.label(theme::muted(&e.base));
-                ui.label(theme::dim(if e.running {
-                    format!("{} model(s)", e.models.len())
-                } else {
-                    "not running".to_string()
-                }));
-            });
-            let named: Vec<&String> = e.models.iter().filter(|m| !m.is_empty()).collect();
-            if e.running && !named.is_empty() {
-                ui.indent(&e.id, |ui| {
-                    ui.label(theme::dim(
-                        named.iter().map(|m| m.as_str()).collect::<Vec<_>>().join("  ·  "),
-                    ));
-                });
-            }
-        }
-        if !node.is_local() {
-            ui.label(theme::dim(
-                "Starting, stopping and installing a peer's engine arrives with pairing (phase 3).",
-            ));
-        }
-    });
 }
 
 fn gb(mb: u64) -> String {

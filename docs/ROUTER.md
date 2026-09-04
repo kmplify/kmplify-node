@@ -124,7 +124,7 @@ fabric worker paused is a purely on-premises cluster.
 |---|---|---|
 | `nvpair-node-scanner` (mDNS, directory, enrichment, eviction) | `router::discovery` + `node_info::poll_peers` + `Router::expire` | done |
 | `nvpair-node-info` (GPU/CPU/RAM telemetry, `/v1/node-info`) | `router::telemetry` (sampling) + `router::node_info` (surface and polling) | done |
-| `nvpair-engine-manager` (detect, inventory) | `engines::scan` via `telemetry::scan_engines` | detect, inventory done · 3 (install, start, stop, pull) |
+| `nvpair-engine-manager` (detect, inventory, install, start, stop, pull, remote control) | `engines::scan` via `telemetry::refresh_roster` + `router::engine` + `POST /v1/engine` | done |
 | `nvpair-manual-nodes` | `Router::manual` + `node_info::poll_peers` (re-keyed to the real id on first answer) | done |
 | `nvpair-node-settings` | `settings::Settings` (existing) | done |
 | `ollama-proxy`, `lmstudio-proxy` (routing, owner failover, fan-out listings) | `router::proxy` | done |
@@ -257,11 +257,45 @@ the LAN address to a proxy was refused with `403`, and so was a plaintext
 node-info read once the node was clustered. mDNS does not let two nodes on
 one host see each other, so that path used the address typed at pairing.
 
+### Engine lifecycle (`router::engine`)
+
+Also on this branch: install, start, stop and model pulls, from a node's
+own window or from a paired node over mutual TLS (`POST /v1/engine` on the
+node-info surface, PAIR's cluster-scoped engine control). PAIR's two rules
+are kept whole:
+
+- **Find before install.** Detection looks on PATH, in the places the
+  official installers use, and in the router's own
+  `<node dir>/router/engines/`; an engine the operator installed is used
+  where it is, and "install" on such a machine downloads nothing.
+- **Adopt, never seize.** An instance already serving its port is used and
+  reported as running, but this node did not start it, so it will not stop
+  it. Only a process this node spawned is *owned*, and only an owned one
+  can be stopped from here. LM Studio is the exception PAIR also makes: it
+  publishes an official stop (`lms server stop`), so an adopted instance
+  can be stopped too.
+
+Ollama is installed from its official release archive for the platform
+(Windows zip, Linux and macOS tarballs), extracted with the `tar` every
+supported platform ships, and started with `OLLAMA_HOST` on loopback so
+the proxy stays the only network-facing listener. Pulls stream Ollama's
+`/api/pull` progress. LM Studio is a desktop application with its own
+installer; once installed, its `lms` command starts, stops and downloads
+for it. Every step is an operation on the node's card, with byte progress
+where there is a size, carried in node-info reports so a paired node's
+window shows it too.
+
+Verified here: start on a machine whose Ollama was already running was
+reported as adopted; stop of that adopted instance was refused with the
+reason; install found the existing binary and downloaded nothing; a pull
+streamed progress to done and the model appeared in the inventory; LM
+Studio's server was stopped and started again through `lms`; an engine
+request from an unpaired LAN address was refused. The download path of
+`install` has not been exercised on a machine without Ollama.
+
 Still to do:
 
-- Engine lifecycle: install, start, stop, update Ollama and LM Studio;
-  adopt an instance the user started; model pulls with progress.
-- Terminal screens for the same, so a headless router is operated fully.
+- Terminal screens for the router, so a headless node is operated fully.
 - Packaging: `.deb`, `.dmg`, Windows installer, autostart, tray.
 
 ## Compliance notes
