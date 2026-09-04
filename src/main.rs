@@ -1673,7 +1673,7 @@ async fn main() {
         cli::Cmd::Rewards => run_rewards(&dir, &cfg, &stored).await,
         cli::Cmd::Set => unreachable!("handled above"),
         cli::Cmd::Run => serve(cfg, dir).await,
-        cli::Cmd::Tui => run_tui(cfg, dir, &cli).await,
+        cli::Cmd::Tui => run_tui(cfg, dir, &cli, gpus).await,
         cli::Cmd::Gui => run_gui(cfg, dir, &cli, gpus).await,
         cli::Cmd::Status | cli::Cmd::Help | cli::Cmd::Version => unreachable!("handled above"),
     };
@@ -1696,12 +1696,12 @@ async fn run_gui(_cfg: WorkerConfig, _dir: PathBuf, _cli: &cli::Cli, _gpus: Vec<
 }
 
 #[cfg(feature = "tui")]
-async fn run_tui(cfg: WorkerConfig, dir: PathBuf, cli: &cli::Cli) -> i32 {
-    tui::main(cfg, dir, cli.attach, cli.standalone).await
+async fn run_tui(cfg: WorkerConfig, dir: PathBuf, cli: &cli::Cli, gpus: Vec<gpu::Gpu>) -> i32 {
+    tui::main(cfg, dir, cli.attach, cli.standalone, cli.router, gpus).await
 }
 
 #[cfg(not(feature = "tui"))]
-async fn run_tui(_cfg: WorkerConfig, _dir: PathBuf, _cli: &cli::Cli) -> i32 {
+async fn run_tui(_cfg: WorkerConfig, _dir: PathBuf, _cli: &cli::Cli, _gpus: Vec<gpu::Gpu>) -> i32 {
     eprintln!(
         "this build has no dashboard (built without the `tui` feature).\n\
          Rebuild with `cargo build --release --features tui`, or use \

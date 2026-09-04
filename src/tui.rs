@@ -23,6 +23,9 @@
 //! Both read the SAME [`crate::status::Snapshot`], so the panels cannot say
 //! one thing here and another over there.
 
+#[cfg(feature = "router")]
+mod router_screens;
+
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -161,7 +164,7 @@ fn percent(used: u64, total: u64) -> Option<u64> {
     (total > 0).then(|| (used * 100 / total).min(100))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum View {
     Home,
     Sessions,
@@ -175,6 +178,11 @@ enum View {
     /// The activity monitor: CPU, GPU, VRAM and RAM over time, per core, and
     /// what the fabric is holding.
     Activity,
+    /// The LAN router: every node on this network, and the requests routed
+    /// across them. Needs `--router` and a build with the `router` feature.
+    Network,
+    /// Pairing and membership: invite with a PIN, join with one, members.
+    Cluster,
 }
 
 /// Something a spawned background call has to say: the gateway about peers,
@@ -186,6 +194,9 @@ enum BgMsg {
     Acted(Result<String, String>),
     /// What a rewards companion reports, or why it could not be asked.
     Rewards(Result<kmplify_node::rewards::Report, String>),
+    /// The outcome of a pairing attempt on the cluster screen.
+    #[cfg_attr(not(feature = "router"), allow(dead_code))]
+    Router(Result<String, String>),
 }
 
 /// A text setting being typed into.
@@ -206,11 +217,23 @@ enum Confirm {
     /// Revoking is permanent: the consumer holding this invitation loses the
     /// contract and cannot get it back.
     Revoke(String),
+    /// Unpin a cluster member (id, name) and tombstone it.
+    #[cfg_attr(not(feature = "router"), allow(dead_code))]
+    RemoveMember(String, String),
+    /// Drop every pin and the cluster id.
+    #[cfg_attr(not(feature = "router"), allow(dead_code))]
+    Leave,
 }
 
 impl Confirm {
     fn question(&self) -> String {
         match self {
+            Confirm::RemoveMember(_, name) => format!(
+                "Remove {name} from the cluster? Its certificate is unpinned and it is not re-added by other members' reports.  [y/N]"
+            ),
+            Confirm::Leave => {
+                "Leave the cluster? Every pinned certificate is dropped; pair again to rejoin.  [y/N]".into()
+            }
             Confirm::Evict(id) => format!(
                 "Stop session {} and remove its container?  [y/N]",
                 &id[..12.min(id.len())]
@@ -271,6 +294,10 @@ struct App {
     notice_at: Instant,
     help: bool,
     quit: bool,
+    /// The LAN router running in this process, when started with
+    /// `--router`; the network and cluster screens draw from it.
+    #[cfg(feature = "router")]
+    router: Option<router_screens::RouterState>,
 }
 
 impl App {
@@ -387,6 +414,12 @@ impl App {
                     match pending {
                         Confirm::Evict(id) => self.send(Command::StopSession(id)),
                         Confirm::Revoke(id) => self.revoke_invitation(id),
+                        #[cfg(feature = "router")]
+                        Confirm::RemoveMember(id, _) => router_screens::remove_member(self, &id),
+                        #[cfg(feature = "router")]
+                        Confirm::Leave => router_screens::leave(self),
+                        #[cfg(not(feature = "router"))]
+                        Confirm::RemoveMember(..) | Confirm::Leave => {}
                         // Standalone, this process IS the node and leaving
                         // the dashboard already tears it down; sending the
                         // command as well would ask the node to stop itself
@@ -421,6 +454,15 @@ impl App {
         if self.view == View::Peers && self.on_peers_key(key) {
             return;
         }
+        #[cfg(feature = "router")]
+        {
+            if self.view == View::Network && router_screens::on_network_key(self, key) {
+                return;
+            }
+            if self.view == View::Cluster && router_screens::on_cluster_key(self, key) {
+                return;
+            }
+        }
 
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
@@ -446,6 +488,8 @@ impl App {
                 self.fetch_peers();
             }
             KeyCode::Char('7') | KeyCode::Char('t') => self.view = View::Activity,
+            KeyCode::Char('8') => self.view = View::Network,
+            KeyCode::Char('9') => self.view = View::Cluster,
             KeyCode::Char('r') => {
                 self.refresh();
                 self.say("refreshed");
@@ -482,8 +526,17 @@ impl App {
     }
 }
 
-/// Entry point for `kmplify-node tui`.
-pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: bool) -> i32 {
+/// Entry point for `kmplify-node tui`. `router` starts the LAN router in
+/// this process as well (feature `router`); `gpus` is the detection round
+/// main already did, which the router's card needs.
+pub async fn main(
+    cfg: WorkerConfig,
+    dir: PathBuf,
+    attach: bool,
+    standalone: bool,
+    router: bool,
+    gpus: Vec<kmplify_node::gpu::Gpu>,
+) -> i32 {
     // Checked before anything is started: without a terminal, entering the
     // alternate screen fails, and in standalone mode that would leave a node
     // running behind a panic message.
@@ -550,6 +603,7 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
     // The stored sharing choices are the starting point of the draft, so the
     // screen opens showing what this node is actually applying.
     let stored = Settings::load(&dir);
+    let app_dir = dir.clone();
     let (peer_tx, mut peer_rx) = tokio::sync::mpsc::unbounded_channel::<BgMsg>();
     let mut app = App {
         attached_to: attach_mode.then(|| dir.clone()),
@@ -582,7 +636,15 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
         notice_at: Instant::now(),
         help: false,
         quit: false,
+        #[cfg(feature = "router")]
+        router: router.then(|| router_screens::start(&app_dir, &gpus, accel)),
     };
+    #[cfg(not(feature = "router"))]
+    if router {
+        app.say("this build has no LAN router; rebuild with --features router");
+    }
+    #[cfg(not(feature = "router"))]
+    let _ = (&gpus, &app_dir);
 
     // Keys are read on a blocking thread: crossterm's reader is blocking, and
     // an async runtime thread parked in it would stall every task on it.
@@ -691,6 +753,12 @@ fn draw(f: &mut Frame, app: &App) {
         View::Sharing => draw_sharing(f, app, body),
         View::Peers => draw_peers(f, app, body),
         View::Activity => draw_activity(f, app, body),
+        #[cfg(feature = "router")]
+        View::Network => router_screens::draw_network(f, app, body),
+        #[cfg(feature = "router")]
+        View::Cluster => router_screens::draw_cluster(f, app, body),
+        #[cfg(not(feature = "router"))]
+        View::Network | View::Cluster => draw_router_absent(f, body),
     }
     f.render_widget(footer_line(app), footer);
 
@@ -702,6 +770,27 @@ fn draw(f: &mut Frame, app: &App) {
     }
 }
 
+/// Without the `router` feature these screens cannot exist; say so where
+/// the screen would be, rather than making 8 and 9 dead keys.
+#[cfg(not(feature = "router"))]
+fn draw_router_absent(f: &mut Frame, area: Rect) {
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  This build has no LAN router (built without the `router` feature).",
+                Style::new().fg(Color::Yellow),
+            )),
+            Line::from(Span::styled(
+                "  Rebuild with `cargo build --release --features router` and start with --router.",
+                Style::new().fg(MUTED),
+            )),
+        ])
+        .block(panel("router")),
+        area,
+    );
+}
+
 fn header_line(app: &App) -> Paragraph<'static> {
     let title = match app.view {
         View::Home => "live dashboard",
@@ -711,6 +800,8 @@ fn header_line(app: &App) -> Paragraph<'static> {
         View::Sharing => "sharing",
         View::Peers => "peers",
         View::Activity => "activity",
+        View::Network => "network",
+        View::Cluster => "cluster",
     };
     Paragraph::new(Line::from(vec![
         Span::styled(" ◆", Style::new().fg(GPU_C).bold()),
@@ -791,6 +882,8 @@ fn view_colour(view: View) -> Color {
         View::Sharing => GPU_C,
         View::Peers => ACCENT,
         View::Activity => CPU_C,
+        View::Network => Color::LightGreen,
+        View::Cluster => Color::LightYellow,
     }
 }
 
@@ -830,9 +923,15 @@ fn footer_line(app: &App) -> Paragraph<'static> {
         format!(
             " {quit}   1 home … 5 sharing  6 peers   a approve  n deny  b block  u clear  i invite  h hold  v revoke  ? keys"
         )
+    } else if app.view == View::Network {
+        format!(" {quit}   1 home … 8 network  9 cluster   ↑/↓ select  a add a node by address  ? keys")
+    } else if app.view == View::Cluster {
+        format!(
+            " {quit}   1 home … 8 network  9 cluster   i invite  n cancel  o join  d remove  L leave  ? keys"
+        )
     } else {
         format!(
-            " {quit}   1 home  2 sessions  3 models  4 log  5 sharing  6 peers  7 activity   {pause}  c reconnect  e evict  x stop node  ? keys"
+            " {quit}   1 home  2 sessions  3 models  4 log  5 sharing  6 peers  7 activity  8 network  9 cluster   {pause}  c reconnect  x stop  ? keys"
         )
     };
     // The notice replaces the key hints for a few seconds after an action, so
@@ -1320,6 +1419,7 @@ fn draw_overlay(f: &mut Frame, title: &str, body: String) {
 
 fn help_text() -> String {
     "1/h home  2/s sessions  3/m models  4/l log  5/g sharing  6 peers  7/t activity\n\
+     8 network  9 cluster  (the LAN router, with --router)\n\
      ↑/↓ or j/k   move (log: scroll back)\n\
      p  pause or resume sharing — stays connected, advertises nothing\n\
      c  reconnect to the gateway now\n\
@@ -1336,7 +1436,13 @@ fn help_text() -> String {
      \n\
      activity (7): CPU, GPU, VRAM and RAM live, with five minutes of\n\
      history and a bar per core. Figures the platform will not report say\n\
-     so rather than drawing a zero."
+     so rather than drawing a zero.\n\
+     \n\
+     network (8): every node on this network with its engines and meters,\n\
+     and the requests routed across them; a adds a node by address.\n\
+     cluster (9): i opens an invitation (a PIN), o joins one, d removes\n\
+     the selected member, L leaves. Pairing pins certificates; every\n\
+     request between machines is mutual TLS from then on."
         .into()
 }
 
@@ -1827,6 +1933,10 @@ impl App {
                 self.editing = None;
                 if k == "invite-label" {
                     self.mint_invitation(value);
+                    return;
+                }
+                #[cfg(feature = "router")]
+                if router_screens::on_edit(self, k, value.clone()) {
                     return;
                 }
                 match self.draft.set(k, &value) {
@@ -2328,6 +2438,10 @@ impl App {
             }
             BgMsg::Acted(Err(e)) => self.say(format!("gateway refused: {e}")),
             BgMsg::Rewards(r) => self.rewards = Some(r),
+            #[cfg(feature = "router")]
+            BgMsg::Router(result) => router_screens::on_router_msg(self, result),
+            #[cfg(not(feature = "router"))]
+            BgMsg::Router(_) => {}
         }
     }
 }
@@ -2819,10 +2933,12 @@ fn panel_coloured(title: &str, colour: Color) -> Block<'static> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
-    fn app() -> App {
+    /// A dashboard with nothing loaded, for tests here and in the router
+    /// screens module.
+    pub(super) fn app() -> App {
         App {
             attached_to: None,
             node_dir: std::env::temp_dir(),
@@ -2850,6 +2966,8 @@ mod tests {
             notice_at: Instant::now(),
             help: false,
             quit: false,
+            #[cfg(feature = "router")]
+            router: None,
         }
     }
 

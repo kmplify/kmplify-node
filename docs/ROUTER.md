@@ -133,7 +133,7 @@ fabric worker paused is a purely on-premises cluster.
 | `nvpair-cluster-manager` + `eap-noob` (identity, PIN pairing, pinned certs, mTLS) | `router::cluster` (SPAKE2 pairing, pinned-fingerprint verifiers) + `router::listen` (one port, two personalities) | done |
 | `nvpair-errors` | log ring + peer sync | local done · 3 |
 | `nvpair-ui-broker` (supervision, JSON-RPC relay) | not needed: one process, one `Router` behind a mutex | — |
-| `nvpair-tui` | `kmplify-node tui` gains the router screens | 3 |
+| `nvpair-tui` | `kmplify-node tui --router`: screens 8 network and 9 cluster | done |
 | Electron `desktop/` | `src/gui` (egui, native) | Overview, Jobs, Settings, Endpoints, Add node, Chat done · 3 (Model hub, Welcome, Tray) |
 
 Ports, chosen apart from the engines' defaults and from PAIR's `143xx` band
@@ -293,9 +293,52 @@ Studio's server was stopped and started again through `lms`; an engine
 request from an unpaired LAN address was refused. The download path of
 `install` has not been exercised on a machine without Ollama.
 
+### Terminal screens (`kmplify-node tui --router`)
+
+A router node usually runs where there is no desktop. `--router` starts
+the router in the dashboard's process (needs a build with the `router`
+feature; without one, or without the flag, the screens say so) and adds two
+screens in the dashboard's idiom:
+
+- **8 network**: every node with its state (LOCAL, PAIRED, UNPAIRED, OTHER
+  cluster, OFFLINE), address, GPU, the engines answering with their model
+  counts, CPU and GPU load and pending work; the routed jobs; the
+  endpoints and the discovery and listener state. `a` adds a node by
+  address.
+- **9 cluster**: this node's certificate fingerprint, the cluster id, the
+  members with online marks and fingerprints; `i` opens an invitation and
+  shows its PIN with this machine's address and the time left, `n` cancels
+  it; `o` joins — the address is asked for, then the PIN, which is never
+  echoed; `d` removes the selected member and `L` leaves, both after a
+  `y`.
+
+Verified here with the dashboard in one window and a second node in the
+desktop window: the network screen listed both nodes as LOCAL and PAIRED
+with their engines and meters, a node added by address through `a` was
+re-keyed to its pinned identity (its plaintext report was refused, the
+retry over mutual TLS succeeded), its address was persisted for the next
+start, the fan-out listing named both nodes, and `i` showed a PIN. The
+screens are also rendered into ratatui's test backend by unit tests that
+check their content and key handling.
+
+Four robustness changes came out of this, all in how a peer's address is
+chosen and kept:
+
+- a member's last known address and node-info port are persisted in
+  `cluster.json` and its card recreated at start;
+- a member that reaches this node over the cluster's TLS gets a card at
+  that address if none exists, and moves a failing card there, so
+  membership stays symmetric after either side restarts;
+- of the addresses a node announces (its LAN, a link-local leftover, the
+  virtual adapters of WSL, Hyper-V or Docker) the one on this machine's
+  own /24 is preferred, then any routable IPv4, and an announcement never
+  moves a card whose polls are succeeding;
+- the announced SRV port is the port a peer is polled on, rather than
+  this process's own — which is what let two nodes on one machine, on
+  different ports, reach each other in both directions.
+
 Still to do:
 
-- Terminal screens for the router, so a headless node is operated fully.
 - Packaging: `.deb`, `.dmg`, Windows installer, autostart, tray.
 
 ## Compliance notes

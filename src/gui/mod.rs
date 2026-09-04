@@ -1210,8 +1210,11 @@ impl GuiApp {
                         .unwrap_or((0, 0));
 
                     // Pairing first: on this screen it is the action a new
-                    // install is looking for.
+                    // install is looking for; the network's state and log
+                    // right under it, because that is what pairing changes.
                     self.cluster_card(ui, view);
+                    ui.add_space(10.0);
+                    self.network_card(ui, view);
                     ui.add_space(10.0);
 
                     theme::card().show(ui, |ui| {
@@ -1286,64 +1289,6 @@ impl GuiApp {
                         });
                         ui.checkbox(&mut self.form.share_vectors, "Hold peers' vector collections");
                     });
-                    ui.add_space(10.0);
-
-                    theme::card().show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.label(theme::heading("This network"));
-                        if let Some(me) = view.local() {
-                            ui.label(theme::muted(format!(
-                                "Advertising as {} ({}) on {} — id {}",
-                                me.name,
-                                me.address,
-                                router::SERVICE_TYPE.trim_end_matches('.'),
-                                &me.id[..12.min(me.id.len())]
-                            )));
-                        }
-                        ui.label(theme::muted(format!(
-                            "Discovery: {} · listeners: {}",
-                            view.discovery, view.listeners
-                        )));
-                        let mut ingress = view.lan_ingress;
-                        if ui
-                            .checkbox(&mut ingress, "Serve requests from paired nodes")
-                            .changed()
-                        {
-                            let mut r = router::lock(&self.shared);
-                            r.lan_ingress = ingress;
-                            r.push_log(if ingress {
-                                "LAN ingress on: peers may use this node's engines"
-                            } else {
-                                "LAN ingress off: this node only consumes the cluster"
-                            });
-                        }
-                        ui.label(theme::dim(
-                            "What crosses the network: hostname, node id, hardware, which engines \
-                             answer and their model names, how busy the machine is, and which jobs \
-                             ran where. Never a request or a response. Requests between machines \
-                             travel only between paired nodes, over mutual TLS. While this node is \
-                             in no cluster its report is readable by anything on the subnet, so \
-                             strangers can find each other to pair; once paired, only members read it.",
-                        ));
-                        if !view.manual.is_empty() {
-                            ui.add_space(4.0);
-                            ui.label(theme::muted("Nodes added by address:"));
-                            let mut forget: Option<String> = None;
-                            for a in &view.manual {
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new(a).size(12.5));
-                                    if ui.small_button("forget").clicked() {
-                                        forget = Some(a.clone());
-                                    }
-                                });
-                            }
-                            if let Some(a) = forget {
-                                let mut r = router::lock(&self.shared);
-                                r.manual.retain(|x| x != &a);
-                                r.nodes.remove(&format!("manual:{a}"));
-                            }
-                        }
-                    });
                     ui.add_space(12.0);
 
                     ui.horizontal(|ui| {
@@ -1394,6 +1339,74 @@ fn slider_gb(mb: u64) -> String {
 // ------------------------------------------------------------------ cluster
 
 impl GuiApp {
+    /// Discovery and listener state, the LAN ingress switch, what crosses
+    /// the network, the router's log and the nodes added by address.
+    fn network_card(&mut self, ui: &mut egui::Ui, view: &Router) {
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(theme::heading("This network"));
+            if let Some(me) = view.local() {
+                ui.label(theme::muted(format!(
+                    "Advertising as {} ({}) on {} — id {}",
+                    me.name,
+                    me.address,
+                    router::SERVICE_TYPE.trim_end_matches('.'),
+                    &me.id[..12.min(me.id.len())]
+                )));
+            }
+            ui.label(theme::muted(format!(
+                "Discovery: {} · listeners: {}",
+                view.discovery, view.listeners
+            )));
+            let mut ingress = view.lan_ingress;
+            if ui
+                .checkbox(&mut ingress, "Serve requests from paired nodes")
+                .changed()
+            {
+                let mut r = router::lock(&self.shared);
+                r.lan_ingress = ingress;
+                r.push_log(if ingress {
+                    "LAN ingress on: peers may use this node's engines"
+                } else {
+                    "LAN ingress off: this node only consumes the cluster"
+                });
+            }
+            ui.label(theme::dim(
+                "What crosses the network: hostname, node id, hardware, which engines \
+                 answer and their model names, how busy the machine is, and which jobs \
+                 ran where. Never a request or a response. Requests between machines \
+                 travel only between paired nodes, over mutual TLS. While this node is \
+                 in no cluster its report is readable by anything on the subnet, so \
+                 strangers can find each other to pair; once paired, only members read it.",
+            ));
+            if !view.log.is_empty() {
+                ui.add_space(6.0);
+                ui.label(theme::muted("Router log"));
+                for line in view.log.iter().rev().take(8) {
+                    ui.label(theme::dim(line.as_str()));
+                }
+            }
+            if !view.manual.is_empty() {
+                ui.add_space(4.0);
+                ui.label(theme::muted("Nodes added by address:"));
+                let mut forget: Option<String> = None;
+                for a in &view.manual {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(a).size(12.5));
+                        if ui.small_button("forget").clicked() {
+                            forget = Some(a.clone());
+                        }
+                    });
+                }
+                if let Some(a) = forget {
+                    let mut r = router::lock(&self.shared);
+                    r.manual.retain(|x| x != &a);
+                    r.nodes.remove(&format!("manual:{a}"));
+                }
+            }
+        });
+    }
+
     /// Pairing and membership: the card PAIR puts under Settings → Cluster.
     fn cluster_card(&mut self, ui: &mut egui::Ui, view: &Router) {
         if let Some(rx) = &mut self.join_rx {

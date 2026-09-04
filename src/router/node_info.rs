@@ -95,6 +95,10 @@ pub struct NodeInfo {
     /// card shows an install or a pull progressing here.
     #[serde(default)]
     pub ops: Vec<EngineOp>,
+    /// The port this report is served on, so a peer that learned this
+    /// node's address from an inbound connection polls the right port.
+    #[serde(default)]
+    pub info_port: u16,
 }
 
 /// A request to operate an engine on this node, from its own window or
@@ -158,7 +162,64 @@ pub fn report(r: &Router) -> Option<NodeInfo> {
         fingerprint: r.identity.as_ref().map(|i| i.fingerprint.clone()).unwrap_or_default(),
         cluster_id: r.cluster.cluster_id.clone(),
         members: r.members_report(),
+        info_port: node_info_port(),
     })
+}
+
+/// A paired node connected to us over mutual TLS from `info`: if we have
+/// no card for it yet (a restart, or it paired with a third node), open
+/// one at that address so we poll it too. Membership is symmetric; being
+/// reached should be enough to reach back.
+pub fn note_inbound_member(shared: &Shared, info: &PeerInfo) {
+    let Some(tls) = &info.tls else {
+        return;
+    };
+    if tls.node_id.is_empty() || info.is_loopback() {
+        return;
+    }
+    let mut r = lock(shared);
+    let inbound_ip = info.addr.ip().to_string();
+    if let Some(existing) = r.nodes.get_mut(&tls.node_id) {
+        // A card we cannot reach, while the node reaches us from a
+        // different address: discovery picked the wrong interface (a
+        // virtual adapter, say). The address it actually talks from is
+        // the better evidence.
+        if existing.poll_failures > 0 && existing.address != inbound_ip {
+            existing.address = inbound_ip.clone();
+            existing.next_poll = Instant::now();
+            // Being reached from there is stronger evidence than a guess
+            // from an announcement; clearing the failures keeps the next
+            // announcement from moving the card back.
+            existing.poll_failures = 0;
+            let name = existing.name.clone();
+            r.push_log(format!("{name} reached us from {inbound_ip}; polling it there instead"));
+        }
+        return;
+    }
+    let name = r
+        .cluster
+        .members
+        .get(&tls.node_id)
+        .map(|m| m.name.clone())
+        .unwrap_or_else(|| tls.node_id.clone());
+    let port = r
+        .cluster
+        .members
+        .get(&tls.node_id)
+        .map(|m| m.info_port)
+        .filter(|p| *p != 0)
+        .unwrap_or_else(node_info_port);
+    let mut node = Node::new_peer(
+        tls.node_id.clone(),
+        name.clone(),
+        info.addr.ip().to_string(),
+        Source::Member,
+        Instant::now(),
+    );
+    node.info_port = port;
+    node.last_seen = Instant::now() - super::PEER_TIMEOUT;
+    r.upsert_peer(node);
+    r.push_log(format!("{name} reached us over the cluster's TLS; polling it back"));
 }
 
 /// Who may read the report: this machine, a paired node over mutual TLS,
@@ -170,6 +231,7 @@ pub fn may_read(info: &PeerInfo, clustered: bool) -> bool {
 }
 
 async fn handler(State(shared): State<Shared>, ConnectInfo(info): ConnectInfo<PeerInfo>) -> Response {
+    note_inbound_member(&shared, &info);
     let r = lock(&shared);
     if !may_read(&info, r.cluster.is_clustered()) {
         return (
@@ -299,28 +361,39 @@ pub fn info_url(address: &str, port: u16, tls: bool) -> String {
 
 async fn fetch(shared: Shared, id: String, address: String, port: u16) {
     // A member is asked over mutual TLS, which is also what makes its
-    // member list trustworthy; anyone else over plaintext.
-    let tls_client = {
+    // member list trustworthy; anyone else over plaintext. A node typed by
+    // address is not known by id yet: it is asked in plaintext, and if it
+    // answers 403 (it is clustered), asked again over TLS — which succeeds
+    // exactly when it is one of this node's pinned members, and then its
+    // report is as trustworthy as any member's.
+    let (member_tls, any_tls) = {
         let r = lock(&shared);
-        if r.is_member(&id) {
-            r.tls_client.clone()
-        } else {
-            None
-        }
+        (
+            if r.is_member(&id) { r.tls_client.clone() } else { None },
+            r.tls_client.clone(),
+        )
     };
-    let trusted = tls_client.is_some();
+    let mut trusted = member_tls.is_some();
     let result = async {
-        let url = info_url(&address, port, trusted);
-        let resp = match &tls_client {
-            Some(c) => c.get(url).timeout(FETCH_TIMEOUT).send().await?,
-            None => client().get(url).send().await?,
+        let resp = match &member_tls {
+            Some(c) => c.get(info_url(&address, port, true)).timeout(FETCH_TIMEOUT).send().await?,
+            None => {
+                let plain = client().get(info_url(&address, port, false)).send().await?;
+                match (&any_tls, plain.status() == reqwest::StatusCode::FORBIDDEN) {
+                    (Some(c), true) => {
+                        trusted = true;
+                        c.get(info_url(&address, port, true)).timeout(FETCH_TIMEOUT).send().await?
+                    }
+                    _ => plain,
+                }
+            }
         };
         resp.error_for_status()?.json::<NodeInfo>().await
     }
     .await;
     let now = Instant::now();
     match result {
-        Ok(info) => apply(&shared, &id, address, info, now, trusted),
+        Ok(info) => apply(&shared, &id, address, port, info, now, trusted),
         Err(e) => {
             let mut r = lock(&shared);
             if let Some(n) = r.nodes.get_mut(&id) {
@@ -350,7 +423,7 @@ pub fn backoff(failures: u32) -> Duration {
 /// Fold a report into the directory. A manual node answering for the first
 /// time is re-keyed from its typed address to its real id, so the card
 /// becomes the same node discovery would have produced.
-pub fn apply(shared: &Shared, id: &str, address: String, info: NodeInfo, now: Instant, trusted: bool) {
+pub fn apply(shared: &Shared, id: &str, address: String, port: u16, info: NodeInfo, now: Instant, trusted: bool) {
     let mut r = lock(shared);
     if info.id == r.self_id {
         // The operator typed this machine's own address. Drop the ghost.
@@ -374,6 +447,15 @@ pub fn apply(shared: &Shared, id: &str, address: String, info: NodeInfo, now: In
         id.to_string()
     };
     let self_id = r.self_id.clone();
+    if trusted {
+        // The report names the port it is served on; the polled port is
+        // the fallback for an older node that does not say.
+        let served_port = if info.info_port != 0 { info.info_port } else { port };
+        r.note_member_address(&key, &address, served_port);
+        if let Some(n) = r.nodes.get_mut(&key) {
+            n.info_port = served_port;
+        }
+    }
     let mut jobs_to_merge = Vec::new();
     if let Some(n) = r.nodes.get_mut(&key) {
         n.name = info.name;
@@ -495,7 +577,51 @@ mod tests {
             cluster_id: String::new(),
             members: vec![],
             ops: vec![],
+            info_port: 0,
         }
+    }
+
+    #[test]
+    fn a_member_that_reaches_us_over_tls_gets_a_card_to_poll_back() {
+        use crate::router::listen::{PeerInfo, TlsPeer};
+        let shared = new_shared_for_tests("me");
+        lock(&shared).cluster.members.insert(
+            "p".into(),
+            Member { id: "p".into(), name: "Spark".into(), fingerprint: "f".into(), added_ms: 0, address: String::new(), info_port: 24418 },
+        );
+        let inbound = PeerInfo {
+            addr: "192.168.1.25:51000".parse().unwrap(),
+            tls: Some(TlsPeer { node_id: "p".into(), fingerprint: "f".into() }),
+        };
+        note_inbound_member(&shared, &inbound);
+        let r = lock(&shared);
+        let n = &r.nodes["p"];
+        assert_eq!(n.address, "192.168.1.25");
+        assert_eq!(n.info_port, 24418, "the port it named when pairing, not the ephemeral one");
+        assert_eq!(n.name, "Spark");
+        assert_eq!(n.source, Source::Member);
+        drop(r);
+        let plain = PeerInfo { addr: "192.168.1.30:1".parse().unwrap(), tls: None };
+        note_inbound_member(&shared, &plain);
+        assert_eq!(lock(&shared).nodes.len(), 2, "plaintext callers get no card");
+
+        // The card stops answering at its address; the member keeps
+        // reaching us from another one — that one is taken.
+        lock(&shared).nodes.get_mut("p").unwrap().poll_failures = 3;
+        let moved = PeerInfo {
+            addr: "192.168.1.77:51001".parse().unwrap(),
+            tls: Some(TlsPeer { node_id: "p".into(), fingerprint: "f".into() }),
+        };
+        note_inbound_member(&shared, &moved);
+        assert_eq!(lock(&shared).nodes["p"].address, "192.168.1.77");
+        // But a healthy card is left alone.
+        lock(&shared).nodes.get_mut("p").unwrap().poll_failures = 0;
+        let another = PeerInfo {
+            addr: "192.168.1.78:51002".parse().unwrap(),
+            tls: Some(TlsPeer { node_id: "p".into(), fingerprint: "f".into() }),
+        };
+        note_inbound_member(&shared, &another);
+        assert_eq!(lock(&shared).nodes["p"].address, "192.168.1.77");
     }
 
     #[test]
@@ -522,10 +648,10 @@ mod tests {
         );
         let mut i = info("p", "p");
         i.cluster_id = "c1".into();
-        i.members = vec![Member { id: "q".into(), name: "q".into(), fingerprint: "fq".into(), added_ms: 0 }];
-        apply(&shared, "p", "10.0.0.7".into(), i.clone(), now, false);
+        i.members = vec![Member { id: "q".into(), name: "q".into(), fingerprint: "fq".into(), added_ms: 0, address: String::new(), info_port: 0 }];
+        apply(&shared, "p", "10.0.0.7".into(), 14418, i.clone(), now, false);
         assert!(!lock(&shared).is_member("q"), "a plaintext report cannot add members");
-        apply(&shared, "p", "10.0.0.7".into(), i, now, true);
+        apply(&shared, "p", "10.0.0.7".into(), 14418, i, now, true);
         assert!(lock(&shared).is_member("q"));
         assert_eq!(lock(&shared).nodes["p"].cluster_id, "c1");
     }
@@ -541,7 +667,7 @@ mod tests {
             "manual:10.0.0.5".into(),
             Node::new_peer("manual:10.0.0.5".into(), "10.0.0.5".into(), "10.0.0.5".into(), Source::Manual, now),
         );
-        apply(&shared, "manual:10.0.0.5", "10.0.0.5".into(), info("real", "spark"), now, false);
+        apply(&shared, "manual:10.0.0.5", "10.0.0.5".into(), 14418, info("real", "spark"), now, false);
         let r = lock(&shared);
         assert!(!r.nodes.contains_key("manual:10.0.0.5"));
         let n = &r.nodes["real"];
@@ -564,7 +690,7 @@ mod tests {
             "manual:127.0.0.1".into(),
             Node::new_peer("manual:127.0.0.1".into(), "127.0.0.1".into(), "127.0.0.1".into(), Source::Manual, now),
         );
-        apply(&shared, "manual:127.0.0.1", "127.0.0.1".into(), info("me", "me"), now, false);
+        apply(&shared, "manual:127.0.0.1", "127.0.0.1".into(), 14418, info("me", "me"), now, false);
         assert_eq!(lock(&shared).nodes.len(), 1);
     }
 
@@ -591,7 +717,7 @@ mod tests {
                 local_origin: false,
             },
         ];
-        apply(&shared, "p", "10.0.0.7".into(), i, now, false);
+        apply(&shared, "p", "10.0.0.7".into(), 14418, i, now, false);
         let r = lock(&shared);
         assert_eq!(r.jobs.len(), 1);
         assert!(!r.jobs[0].local_origin);

@@ -236,6 +236,10 @@ pub enum Source {
     Local,
     Discovered,
     Manual,
+    /// A pinned cluster member reached at the address it was last seen
+    /// at. Like a manual node it never expires: a member that is off
+    /// tonight is still a member.
+    Member,
 }
 
 #[derive(Clone, Debug)]
@@ -593,7 +597,21 @@ impl Router {
         match self.nodes.get_mut(&peer.id) {
             Some(existing) => {
                 existing.name = peer.name;
-                existing.address = peer.address;
+                // An announcement names every interface the node has and
+                // this side guessed which one to use. A card whose polls
+                // succeed keeps the address that works; only one with no
+                // address, or one that is failing, takes the announced one.
+                // Otherwise a guess that happened to be wrong would be
+                // re-applied on every announcement, undoing the address the
+                // node was actually reached at.
+                if existing.address.is_empty()
+                    || (existing.poll_failures > 0
+                        && (existing.address != peer.address || existing.info_port != peer.info_port))
+                {
+                    existing.address = peer.address;
+                    existing.info_port = peer.info_port;
+                    existing.next_poll = Instant::now();
+                }
                 if existing.gpus.is_empty() {
                     existing.gpus = peer.gpus;
                 }
@@ -621,8 +639,8 @@ impl Router {
         }
     }
 
-    /// Drop discovered peers that have gone quiet. Manual ones stay, and
-    /// merely read as offline.
+    /// Drop discovered peers that have gone quiet. Manual nodes and cluster
+    /// members stay, and merely read as offline.
     pub fn expire(&mut self, now: Instant) {
         let gone: Vec<String> = self
             .nodes
@@ -742,6 +760,7 @@ pub fn new_shared(
     if router.cluster.is_clustered() {
         let n = router.cluster.members.len();
         router.push_log(format!("in a cluster with {n} pinned node(s)"));
+        router.seed_member_cards();
     }
     Arc::new(Mutex::new(router))
 }
@@ -863,6 +882,31 @@ mod tests {
         assert!(!r.nodes.contains_key("d"));
         assert!(r.nodes.contains_key("m"));
         assert!(!r.nodes["m"].online(now));
+    }
+
+    #[test]
+    fn an_announcement_does_not_move_a_card_that_is_being_reached() {
+        let now = Instant::now();
+        let mut r = Router::default();
+        let mut first = node("p", "peer", Source::Discovered, now);
+        first.address = "192.168.2.171".into();
+        r.upsert_peer(first);
+        let mut again = node("p", "peer", Source::Discovered, now);
+        again.address = "172.23.240.1".into();
+        r.upsert_peer(again.clone());
+        assert_eq!(r.nodes["p"].address, "192.168.2.171", "polls are fine: keep the working address");
+        r.nodes.get_mut("p").unwrap().poll_failures = 2;
+        r.upsert_peer(again);
+        assert_eq!(r.nodes["p"].address, "172.23.240.1", "failing: try what was announced");
+
+        // The announced port travels with the address: a node on another
+        // port than ours is polled where it actually answers.
+        r.nodes.get_mut("p").unwrap().poll_failures = 1;
+        let mut other_port = node("p", "peer", Source::Discovered, now);
+        other_port.address = "172.23.240.1".into();
+        other_port.info_port = 24418;
+        r.upsert_peer(other_port);
+        assert_eq!(r.nodes["p"].info_port, 24418);
     }
 
     #[test]

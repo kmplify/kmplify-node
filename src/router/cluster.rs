@@ -145,6 +145,12 @@ pub struct Member {
     pub fingerprint: String,
     #[serde(default)]
     pub added_ms: u64,
+    /// Where it last answered, so a restart polls it at once instead of
+    /// waiting for multicast to find it again. Empty when never reached.
+    #[serde(default)]
+    pub address: String,
+    #[serde(default)]
+    pub info_port: u16,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -546,6 +552,8 @@ pub fn handle_pair(
                         name: joiner_name,
                         fingerprint: joiner_fp,
                         added_ms: crate::status::now_ms(),
+                        address: joiner_addr.map(|a| a.to_string()).unwrap_or_default(),
+                        info_port: joiner_info_port.unwrap_or_else(node_info_port),
                     },
                     transcript,
                     joiner_addr,
@@ -591,7 +599,7 @@ pub fn handle_pair(
                     joiner_id.clone(),
                     name.clone(),
                     ip.to_string(),
-                    super::Source::Manual,
+                    super::Source::Member,
                     Instant::now(),
                 );
                 node.info_port = s.joiner_info_port;
@@ -611,6 +619,8 @@ pub fn handle_pair(
                 name: self_name,
                 fingerprint: identity.fingerprint.clone(),
                 added_ms: crate::status::now_ms(),
+                address: r.local().map(|n| n.address.clone()).unwrap_or_default(),
+                info_port: node_info_port(),
             });
             Ok(PairResponse::Done {
                 cluster_id: r.cluster.cluster_id.clone(),
@@ -707,22 +717,37 @@ pub async fn join(shared: Shared, address: String, pin: String) -> Result<String
     };
     let mut r = lock(&shared);
     r.cluster.cluster_id = cluster_id;
+    let (host, port) = super::Node::parse_address(&address);
     r.admit(Member {
         id: inviter_id.clone(),
         name: inviter_name.clone(),
         fingerprint: inviter_fp,
         added_ms: crate::status::now_ms(),
+        address: host.clone(),
+        info_port: port,
     });
     let mut added = 0;
     for m in members {
         if m.id != self_id && !r.cluster.members.contains_key(&m.id) {
+            // Other members come with the address the inviter knew them
+            // by; a card for each starts polling at once.
+            if !m.address.is_empty() && !r.nodes.contains_key(&m.id) {
+                let mut node = super::Node::new_peer(
+                    m.id.clone(),
+                    m.name.clone(),
+                    m.address.clone(),
+                    super::Source::Member,
+                    Instant::now(),
+                );
+                node.info_port = if m.info_port == 0 { node_info_port() } else { m.info_port };
+                r.upsert_peer(node);
+            }
             r.admit(m);
             added += 1;
         }
     }
     // The inviter is reachable at the address that was typed; a card for
     // it starts polling at once.
-    let (host, port) = super::Node::parse_address(&address);
     match r.nodes.get_mut(&inviter_id) {
         Some(existing) => {
             existing.address = host;
@@ -734,7 +759,7 @@ pub async fn join(shared: Shared, address: String, pin: String) -> Result<String
                 inviter_id.clone(),
                 inviter_name.clone(),
                 host,
-                super::Source::Manual,
+                super::Source::Member,
                 Instant::now(),
             );
             node.info_port = port;
@@ -828,6 +853,48 @@ impl Router {
         self.pins.set(self.cluster.fingerprints());
         if let Err(e) = self.cluster.save(&self.node_dir) {
             self.push_log(format!("cannot save cluster.json: {e}"));
+        }
+    }
+
+    /// A member answered from `address`: remember where, so the next start
+    /// polls it without waiting for discovery. Written only on a change,
+    /// not on every poll.
+    pub fn note_member_address(&mut self, id: &str, address: &str, info_port: u16) {
+        let changed = match self.cluster.members.get_mut(id) {
+            Some(m) if m.address != address || m.info_port != info_port => {
+                m.address = address.to_string();
+                m.info_port = info_port;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            if let Err(e) = self.cluster.save(&self.node_dir) {
+                self.push_log(format!("cannot save cluster.json: {e}"));
+            }
+        }
+    }
+
+    /// Cards for the members this node already knows an address for, so a
+    /// restarted node reaches its cluster at once.
+    pub fn seed_member_cards(&mut self) {
+        let now = Instant::now();
+        let seeds: Vec<(String, String, String, u16)> = self
+            .cluster
+            .members
+            .values()
+            .filter(|m| !m.address.is_empty())
+            .map(|m| (m.id.clone(), m.name.clone(), m.address.clone(), m.info_port))
+            .collect();
+        for (id, name, address, port) in seeds {
+            if self.nodes.contains_key(&id) {
+                continue;
+            }
+            let mut node = super::Node::new_peer(id, name, address, super::Source::Member, now);
+            node.info_port = if port == 0 { node_info_port() } else { port };
+            // Offline until it answers; the poll is due at once.
+            node.last_seen = now - super::PEER_TIMEOUT;
+            self.nodes.insert(node.id.clone(), node);
         }
     }
 
@@ -939,6 +1006,24 @@ mod tests {
         let card = &r.nodes["joiner"];
         assert_eq!(card.address, "10.0.0.9", "the joiner gets a card at the address it paired from");
         assert_eq!(card.info_port, 24418);
+        assert_eq!(r.cluster.members["joiner"].address, "10.0.0.9", "and the address is remembered");
+        assert_eq!(r.cluster.members["joiner"].info_port, 24418);
+    }
+
+    #[test]
+    fn a_restart_seeds_cards_for_members_with_a_known_address() {
+        let (shared, _) = party("seed");
+        let mut r = lock(&shared);
+        r.cluster.cluster_id = "c".into();
+        r.cluster.members.insert("a".into(), Member { id: "a".into(), name: "a".into(), fingerprint: "fa".into(), added_ms: 0, address: "10.0.0.2".into(), info_port: 24418 });
+        r.cluster.members.insert("b".into(), Member { id: "b".into(), name: "b".into(), fingerprint: "fb".into(), added_ms: 0, address: String::new(), info_port: 0 });
+        r.seed_member_cards();
+        assert_eq!(r.nodes["a"].address, "10.0.0.2");
+        assert_eq!(r.nodes["a"].info_port, 24418);
+        assert_eq!(r.nodes["a"].source, Source::Member);
+        assert!(!r.nodes.contains_key("b"), "no address, no card");
+        r.note_member_address("b", "10.0.0.3", 14418);
+        assert_eq!(r.cluster.members["b"].address, "10.0.0.3");
     }
 
     #[test]
@@ -1011,7 +1096,7 @@ mod tests {
         let (shared, _) = party("merge");
         let mut r = lock(&shared);
         r.cluster.cluster_id = "c1".into();
-        let m = |id: &str| Member { id: id.into(), name: id.into(), fingerprint: format!("fp-{id}"), added_ms: 0 };
+        let m = |id: &str| Member { id: id.into(), name: id.into(), fingerprint: format!("fp-{id}"), added_ms: 0, address: String::new(), info_port: 0 };
         assert_eq!(r.merge_members("other", vec![m("a")]), 0);
         assert_eq!(r.merge_members("c1", vec![m("a"), m("b")]), 2);
         r.remove_member("a");
@@ -1046,7 +1131,7 @@ mod tests {
         let (shared, _) = party("leave");
         let mut r = lock(&shared);
         r.open_invite();
-        r.admit(Member { id: "p".into(), name: "p".into(), fingerprint: "f".into(), added_ms: 0 });
+        r.admit(Member { id: "p".into(), name: "p".into(), fingerprint: "f".into(), added_ms: 0, address: String::new(), info_port: 0 });
         r.leave_cluster();
         assert!(!r.cluster.is_clustered());
         assert!(r.invite.is_none());

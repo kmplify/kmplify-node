@@ -111,6 +111,40 @@ pub fn node_from_txt(
     Some(node)
 }
 
+/// Which of a peer's announced addresses to use. A machine announces every
+/// interface it has — the LAN, a 169.254.x link-local leftover, the
+/// virtual adapters of WSL, Hyper-V or Docker — and only one of them is
+/// reachable from here. The best evidence is sharing a /24 with this
+/// machine's own LAN address; after that, any routable IPv4; link-local
+/// and IPv6 only when nothing else was announced.
+pub fn pick_address(candidates: &[String], own_lan: &str) -> String {
+    use std::net::{IpAddr, Ipv4Addr};
+    let parse = |s: &str| s.parse::<IpAddr>().ok();
+    let own: Option<Ipv4Addr> = match parse(own_lan) {
+        Some(IpAddr::V4(v4)) => Some(v4),
+        _ => None,
+    };
+    let same_subnet = |v4: &Ipv4Addr| own.is_some_and(|o| o.octets()[..3] == v4.octets()[..3]);
+    let routable = |v4: &Ipv4Addr| !v4.is_link_local() && !v4.is_loopback() && !v4.is_unspecified();
+    let v4s: Vec<Ipv4Addr> = candidates
+        .iter()
+        .filter_map(|c| match parse(c) {
+            Some(IpAddr::V4(v4)) => Some(v4),
+            _ => None,
+        })
+        .collect();
+    if let Some(a) = v4s.iter().find(|a| routable(a) && same_subnet(a)) {
+        return a.to_string();
+    }
+    if let Some(a) = v4s.iter().find(|a| routable(a)) {
+        return a.to_string();
+    }
+    if let Some(a) = v4s.first() {
+        return a.to_string();
+    }
+    candidates.first().cloned().unwrap_or_default()
+}
+
 /// The TXT properties this machine advertises right now.
 fn own_txt(shared: &Shared) -> Vec<(String, String)> {
     let r = lock(shared);
@@ -161,9 +195,13 @@ fn run(shared: Shared) {
         }
     };
 
-    let (self_id, host) = {
+    let (self_id, host, own_lan) = {
         let r = lock(&shared);
-        (r.self_id.clone(), super::hostname())
+        (
+            r.self_id.clone(),
+            super::hostname(),
+            r.local().map(|n| n.address.clone()).unwrap_or_default(),
+        )
     };
     // Instance name = hostname plus a slice of the id, so two machines with
     // one hostname (the default on a fresh install of anything) stay two
@@ -237,26 +275,19 @@ fn run(shared: Shared) {
                     .iter()
                     .map(|p| (p.key().to_string(), p.val_str().to_string()))
                     .collect();
-                // Prefer a routable IPv4 address: it is what an operator
-                // recognises on the card and what the engines bind by
-                // default. A host with an idle adapter also announces its
-                // 169.254.x link-local address, which nobody else can reach.
-                let addrs = info.get_addresses();
-                let address = addrs
-                    .iter()
-                    .find(|a| match a.to_string().parse::<std::net::IpAddr>() {
-                        Ok(std::net::IpAddr::V4(v4)) => !v4.is_link_local() && !v4.is_loopback(),
-                        _ => false,
-                    })
-                    .or_else(|| addrs.iter().find(|a| a.is_ipv4()))
-                    .or_else(|| addrs.iter().next())
-                    .map(|a| a.to_string())
-                    .unwrap_or_default();
-                let Some(node) = node_from_txt(&txt, address, Instant::now()) else {
+                let candidates: Vec<String> =
+                    info.get_addresses().iter().map(|a| a.to_string()).collect();
+                let address = pick_address(&candidates, &own_lan);
+                let Some(mut node) = node_from_txt(&txt, address, Instant::now()) else {
                     continue;
                 };
                 if node.id == self_id {
                     continue;
+                }
+                // The record's SRV port is where that node's node-info
+                // answers — not necessarily this process's own port.
+                if info.get_port() != 0 {
+                    node.info_port = info.get_port();
                 }
                 let mut r = lock(&shared);
                 let fresh = !r.nodes.contains_key(&node.id);
@@ -309,6 +340,21 @@ mod tests {
         assert_eq!(back[0].name, "Ollama");
         assert_eq!(back[0].models.len(), 3);
         assert!(back[0].running);
+    }
+
+    #[test]
+    fn the_address_on_our_subnet_wins_over_virtual_and_link_local_ones() {
+        let announced = vec![
+            "169.254.83.107".to_string(),
+            "172.23.240.1".to_string(),
+            "192.168.2.171".to_string(),
+            "fe80::1".to_string(),
+        ];
+        assert_eq!(pick_address(&announced, "192.168.2.50"), "192.168.2.171");
+        assert_eq!(pick_address(&announced, "10.0.0.5"), "172.23.240.1", "no subnet match: any routable IPv4");
+        assert_eq!(pick_address(&["169.254.1.1".to_string()], "192.168.2.50"), "169.254.1.1", "link-local only when nothing else");
+        assert_eq!(pick_address(&["fe80::1".to_string()], "192.168.2.50"), "fe80::1");
+        assert_eq!(pick_address(&[], "192.168.2.50"), "");
     }
 
     #[test]
