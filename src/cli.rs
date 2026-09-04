@@ -30,6 +30,9 @@ pub enum Cmd {
     Run,
     /// Full-screen dashboard: watch and control the node from a terminal.
     Tui,
+    /// The desktop window: this node and the other kmplify-nodes on the
+    /// local network, with live meters, jobs and settings.
+    Gui,
     /// Resolve the configuration, probe the host, report whether this machine
     /// can actually serve. Never connects.
     Check,
@@ -208,6 +211,7 @@ pub fn usage() -> String {
          USAGE\n\
          \x20 kmplify-node [run] [options]     join the fabric and serve (logs to stdout)\n\
          \x20 kmplify-node tui [options]       live dashboard: watch and control the node\n\
+         \x20 kmplify-node gui [options]       desktop window: this node and the LAN's other nodes\n\
          \x20 kmplify-node check [options]     preflight this host, then exit\n\
          \x20 kmplify-node status [--json]     one-shot report of the running node\n\
          \x20 kmplify-node id                  print this install's node id\n\
@@ -247,8 +251,8 @@ pub fn usage() -> String {
          OPTIONS\n\
          \x20 --json                 machine-readable output (check, status, peers)\n\
          \x20 --timeout SECS         per-probe ceiling in check (default 5)\n\
-         \x20 --attach               tui: require a running node, never start one\n\
-         \x20 --standalone           tui: run the node in this process\n\
+         \x20 --attach               tui/gui: require a running node, never start one\n\
+         \x20 --standalone           tui/gui: run the node in this process\n\
          \x20 -h, --help             this text\n\
          \x20 -V, --version          version and build stamp\n\
          \n\
@@ -329,6 +333,7 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
             cli.cmd = match arg.as_str() {
                 "run" | "start" | "serve" => Cmd::Run,
                 "tui" | "dashboard" | "top" => Cmd::Tui,
+                "gui" | "window" | "app" => Cmd::Gui,
                 "check" | "doctor" | "preflight" => Cmd::Check,
                 "status" => Cmd::Status,
                 "id" | "node-id" => Cmd::Id,
@@ -530,6 +535,7 @@ mod tests {
         for (word, cmd) in [
             ("run", Cmd::Run),
             ("tui", Cmd::Tui),
+            ("gui", Cmd::Gui),
             ("check", Cmd::Check),
             ("status", Cmd::Status),
             ("id", Cmd::Id),

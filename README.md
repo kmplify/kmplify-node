@@ -464,6 +464,22 @@ The full contract, including what the node will never do, is in
 [docs/REWARDS.md](docs/REWARDS.md). Payout rails are testnet-only today: a
 balance that cannot be spent is labelled `TESTNET` everywhere it appears.
 
+## The desktop window and the LAN router
+
+The same machine can also be the hub of a personal inference cluster: the
+kmplify-nodes on one local network find each other, every window shows every
+node's engines and live meters, and (from the next phase) one endpoint routes
+each request to whichever machine can serve it. It is opt-in, local-first
+and off by default; the design is adapted from NVIDIA's Personal AI Router
+(Apache-2.0). Build with the `gui` feature and run:
+
+```bash
+kmplify-node gui
+```
+
+What it does, what it puts on the network and what is still to come is in
+[docs/ROUTER.md](docs/ROUTER.md).
+
 ## The terminal dashboard
 
 A node usually runs where there is no desktop, which used to mean it was

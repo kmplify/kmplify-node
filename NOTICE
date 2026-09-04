@@ -25,3 +25,19 @@ Container images referenced by the workload templates (vLLM, ComfyUI, Ollama
 and others) are the property of their respective publishers, are not
 distributed with this software, and are pulled at runtime under their own
 licenses.
+
+---
+
+The LAN router (src/router) and the desktop window (src/gui) adapt the design
+of NVIDIA Personal AI Router:
+
+    Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+    Licensed under the Apache License, Version 2.0.
+    https://github.com/NVIDIA/Personal-AI-Router
+
+The adaptation is a reimplementation in Rust of that project's architecture
+and screens (node discovery over one consolidated mDNS record, per-node
+telemetry, the overview, jobs, endpoints and settings screens, and the
+routing model described in its documentation), not a copy of its Go or
+TypeScript source. NVIDIA, Personal AI Router and PAIR are trademarks of
+NVIDIA Corporation and are not used to name or endorse this software.

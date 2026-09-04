@@ -52,6 +52,8 @@ mod cli;
 mod onboard;
 #[cfg(feature = "tui")]
 mod tui;
+#[cfg(feature = "gui")]
+mod gui;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1638,7 +1640,10 @@ async fn main() {
     // and skipped entirely for the commands that never look at the hardware,
     // because probing four vendor tools to print a node id is pure latency in
     // whatever script called it.
-    let gpus = if matches!(cli.cmd, cli::Cmd::Check | cli::Cmd::Run | cli::Cmd::Tui) {
+    let gpus = if matches!(
+        cli.cmd,
+        cli::Cmd::Check | cli::Cmd::Run | cli::Cmd::Tui | cli::Cmd::Gui
+    ) {
         gpu::detect_all().await
     } else {
         Vec::new()
@@ -1669,9 +1674,25 @@ async fn main() {
         cli::Cmd::Set => unreachable!("handled above"),
         cli::Cmd::Run => serve(cfg, dir).await,
         cli::Cmd::Tui => run_tui(cfg, dir, &cli).await,
+        cli::Cmd::Gui => run_gui(cfg, dir, &cli, gpus).await,
         cli::Cmd::Status | cli::Cmd::Help | cli::Cmd::Version => unreachable!("handled above"),
     };
     std::process::exit(code);
+}
+
+#[cfg(feature = "gui")]
+async fn run_gui(cfg: WorkerConfig, dir: PathBuf, cli: &cli::Cli, gpus: Vec<gpu::Gpu>) -> i32 {
+    gui::main(cfg, dir, cli.attach, cli.standalone, gpus).await
+}
+
+#[cfg(not(feature = "gui"))]
+async fn run_gui(_cfg: WorkerConfig, _dir: PathBuf, _cli: &cli::Cli, _gpus: Vec<gpu::Gpu>) -> i32 {
+    eprintln!(
+        "this build has no window (built without the `gui` feature).\n\
+         Rebuild with `cargo build --release --features gui`, or use \
+         `kmplify-node tui` for the terminal dashboard."
+    );
+    EXIT_USAGE
 }
 
 #[cfg(feature = "tui")]

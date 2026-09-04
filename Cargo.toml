@@ -74,6 +74,21 @@ ratatui = { version = "0.30", optional = true }
 # trap path was broken.
 wasmtime = { version = "48", optional = true, default-features = false, features = ["cranelift", "runtime", "wat"] }
 wasmtime-wasi = { version = "48", optional = true, default-features = false, features = ["p1"] }
+# The LAN router (src/router): finding the other kmplify-nodes on this
+# network. Its own mDNS responder rather than the system's, because Windows
+# ships none; shares UDP 5353 with Bonjour and Avahi where they exist.
+mdns-sd = { version = "0.21", optional = true }
+# The desktop window (src/gui): the router's screens, drawn natively.
+# Opt-in at build time because a GPU-backed window toolkit is a large
+# dependency a headless service binary has no use for. The OpenGL backend
+# only: it is enough for a dashboard, it is the smaller tree, and eframe's
+# wgpu backend does not currently build on Windows in this dependency set.
+eframe = { version = "0.36", optional = true, default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
 
 [profile.release]
 codegen-units = 16
@@ -94,6 +109,12 @@ tui = ["dep:ratatui"]
 # (PROVIDER_FUNCTIONS, plus a catalog key to trust), so what this decides is
 # only whether an operator who opts in has an engine to do it with.
 wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
+# The LAN router: discovery, per-node telemetry and (phase 2) the routing
+# proxies. Headless-capable; the window below is one client of it.
+router = ["dep:mdns-sd"]
+# `kmplify-node gui`: the desktop window for the router, on Linux, macOS
+# and Windows. See docs/ROUTER.md.
+gui = ["router", "dep:eframe"]
 
 [dev-dependencies]
 wat = "1.243.0"

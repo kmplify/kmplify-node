@@ -24,6 +24,8 @@ pub mod identity;
 pub mod peers;
 pub mod proc;
 pub mod rewards;
+#[cfg(feature = "router")]
+pub mod router;
 pub mod settings;
 pub mod status;
 pub mod vectors;
