@@ -264,6 +264,7 @@ struct GuiApp {
     add_node: Option<String>,
     endpoints_open: bool,
     chat_open: bool,
+    chat: Chat,
     notice: Option<(String, Color32, Instant)>,
 }
 
@@ -302,6 +303,7 @@ impl GuiApp {
             add_node: None,
             endpoints_open: false,
             chat_open: false,
+            chat: Chat::default(),
             notice: None,
         }
     }
@@ -328,9 +330,10 @@ impl GuiApp {
             self.snap.link = Link::Stopped;
             return;
         };
-        let (local_name, gateway) = {
+        let (self_id, local_name, gateway) = {
             let r = router::lock(&self.shared);
             (
+                r.self_id.clone(),
                 r.local().map(|n| n.name.clone()).unwrap_or_default(),
                 snap.gateway
                     .trim_start_matches("https://")
@@ -338,33 +341,32 @@ impl GuiApp {
                     .to_string(),
             )
         };
+        let fabric_job = |i: u64, state: JobState, error: &str| Job {
+            id: format!("{}-fabric-{i}", &self_id[..8.min(self_id.len())]),
+            model: snap.jobs.last_model.clone(),
+            engine: "fabric".into(),
+            requested_from: gateway.clone(),
+            ran_on: local_name.clone(),
+            node_id: self_id.clone(),
+            state,
+            at_ms: status::now_ms(),
+            error: error.into(),
+            // Finished already: it must never count as pending here.
+            local_origin: false,
+        };
         let mut new_jobs = Vec::new();
         if snap.jobs.done > self.seen_done {
             for i in self.seen_done..snap.jobs.done {
-                new_jobs.push(Job {
-                    id: format!("fabric-done-{i}"),
-                    model: snap.jobs.last_model.clone(),
-                    engine: "fabric".into(),
-                    requested_from: gateway.clone(),
-                    ran_on: local_name.clone(),
-                    state: JobState::Completed,
-                    at_ms: status::now_ms(),
-                    error: String::new(),
-                });
+                new_jobs.push(fabric_job(i, JobState::Completed, ""));
             }
         }
         if snap.jobs.failed > self.seen_failed {
             for i in self.seen_failed..snap.jobs.failed {
-                new_jobs.push(Job {
-                    id: format!("fabric-failed-{i}"),
-                    model: snap.jobs.last_model.clone(),
-                    engine: "fabric".into(),
-                    requested_from: gateway.clone(),
-                    ran_on: local_name.clone(),
-                    state: JobState::Failed,
-                    at_ms: status::now_ms(),
-                    error: "the fabric reported an error for this job".into(),
-                });
+                new_jobs.push(fabric_job(
+                    1_000_000 + i,
+                    JobState::Failed,
+                    "the fabric reported an error for this job",
+                ));
             }
         }
         if !new_jobs.is_empty() {
@@ -412,23 +414,19 @@ impl GuiApp {
         }
         r.manual.push(address.clone());
         let id = format!("manual:{address}");
-        r.upsert_peer(Node {
-            id: id.clone(),
-            name: address.clone(),
-            address: address.clone(),
-            source: Source::Manual,
-            gpus: vec![],
-            cpu_model: String::new(),
-            cpu_cores: 0,
-            ram_total_mb: 0,
-            engines: vec![],
-            metrics: Default::default(),
-            version: String::new(),
-            last_seen: Instant::now() - router::PEER_TIMEOUT,
-        });
-        r.push_log(format!("added {address} by hand; it is probed once its node-info surface exists (phase 2)"));
+        let mut node = Node::new_peer(
+            id.clone(),
+            address.clone(),
+            address.clone(),
+            Source::Manual,
+            Instant::now(),
+        );
+        // Offline until it answers a node-info poll, which is due at once.
+        node.last_seen = Instant::now() - router::PEER_TIMEOUT;
+        r.upsert_peer(node);
+        r.push_log(format!("added {address} by hand; probing its node-info surface"));
         drop(r);
-        self.notify(format!("added {address}"), theme::OK);
+        self.notify(format!("added {address} — probing"), theme::OK);
     }
 }
 
@@ -455,7 +453,7 @@ impl eframe::App for GuiApp {
         }
         self.add_node_window(&ctx);
         self.endpoints_window(&ctx, &view);
-        self.chat_window(&ctx);
+        self.chat_window(&ctx, &view);
     }
 }
 
@@ -621,8 +619,9 @@ impl GuiApp {
                     theme::card_low().show(ui, |ui| {
                         ui.label(theme::muted("No jobs yet."));
                         ui.label(theme::dim(
-                            "Work the fabric sends this node lands here as it finishes. \
-                             Requests routed across the LAN join once the proxies land (phase 2).",
+                            "Requests that reach the router's endpoints appear here as they \
+                             run, naming the node that served them; so does work the fabric \
+                             sends this node.",
                         ));
                     });
                     return;
@@ -843,8 +842,10 @@ impl GuiApp {
                         "offline"
                     } else if node.is_local() {
                         "no metrics yet"
+                    } else if node.poll_failures > 0 {
+                        "node-info does not answer yet"
                     } else {
-                        "live meters for peers arrive with the node-info surface (phase 2)"
+                        "waiting for the first node-info poll"
                     };
                     ui.painter().text(
                         rect.center(),
@@ -1018,15 +1019,18 @@ fn engine_details(ui: &mut egui::Ui, node: &Node) {
                     "not running".to_string()
                 }));
             });
-            if e.running && node.is_local() && !e.models.is_empty() {
+            let named: Vec<&String> = e.models.iter().filter(|m| !m.is_empty()).collect();
+            if e.running && !named.is_empty() {
                 ui.indent(&e.id, |ui| {
-                    ui.label(theme::dim(e.models.join("  ·  ")));
+                    ui.label(theme::dim(
+                        named.iter().map(|m| m.as_str()).collect::<Vec<_>>().join("  ·  "),
+                    ));
                 });
             }
         }
         if !node.is_local() {
             ui.label(theme::dim(
-                "Model names and remote engine control arrive with the node-info surface (phase 2).",
+                "Starting, stopping and installing a peer's engine arrives with pairing (phase 3).",
             ));
         }
     });
@@ -1145,12 +1149,33 @@ impl GuiApp {
                                 &me.id[..12.min(me.id.len())]
                             )));
                         }
-                        ui.label(theme::muted(format!("Discovery: {}", view.discovery)));
+                        ui.label(theme::muted(format!(
+                            "Discovery: {} · listeners: {}",
+                            view.discovery, view.listeners
+                        )));
+                        let mut ingress = view.lan_ingress;
+                        if ui
+                            .checkbox(
+                                &mut ingress,
+                                "Serve requests from the other nodes on this network",
+                            )
+                            .changed()
+                        {
+                            let mut r = router::lock(&self.shared);
+                            r.lan_ingress = ingress;
+                            r.push_log(if ingress {
+                                "LAN ingress on: peers may use this node's engines"
+                            } else {
+                                "LAN ingress off: this node only consumes the cluster"
+                            });
+                        }
                         ui.label(theme::dim(
-                            "What crosses the network: hostname, node id, GPU model, core and memory \
-                             counts, which engines answer and how many models each serves. Never a \
-                             model name, never a request. Anything on this subnet can read it, which \
-                             is why this mode is opt-in.",
+                            "What crosses the network: hostname, node id, hardware, which engines \
+                             answer and their model names, how busy the machine is, and which jobs \
+                             ran where. Never a request or a response. Peers are the nodes on this \
+                             list; until pairing lands (phase 3) that list is the whole gate, and \
+                             anything on this subnet can read the node-info surface — which is why \
+                             this mode is opt-in.",
                         ));
                         if !view.manual.is_empty() {
                             ui.add_space(4.0);
@@ -1288,9 +1313,6 @@ impl GuiApp {
             .show(ctx, |ui| {
                 ui.set_width(520.0);
                 ui.label(theme::heading("Engines on this machine"));
-                ui.label(theme::muted(
-                    "Point an application at one of these today; each reaches that engine only.",
-                ));
                 if let Some(me) = view.local() {
                     for e in me.running_engines() {
                         ui.horizontal(|ui| {
@@ -1305,44 +1327,199 @@ impl GuiApp {
                         ui.label(theme::dim("nothing is answering right now"));
                     }
                 }
-                ui.add_space(8.0);
-                ui.label(theme::heading("Router endpoints (phase 2)"));
-                ui.label(theme::muted(
-                    "One address per API that routes to whichever node on the LAN can serve the model:",
-                ));
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Ollama-compatible").size(12.5));
-                    ui.monospace(format!("http://127.0.0.1:{}", router::PROXY_OLLAMA_PORT));
-                });
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("OpenAI-compatible").size(12.5));
-                    ui.monospace(format!("http://127.0.0.1:{}", router::PROXY_OPENAI_PORT));
-                });
                 ui.label(theme::dim(
-                    "Loopback only for local applications; peers reach the same port over \
-                     mutual TLS after pairing. Not listening yet — see docs/ROUTER.md.",
+                    "Point an application at one of these and it reaches that engine only.",
                 ));
+                ui.add_space(8.0);
+                ui.label(theme::heading("Router endpoints"));
+                ui.label(theme::muted(
+                    "One address per API. Each request goes to whichever node on this network \
+                     serves the model, with failover; `/api/tags` and `/v1/models` list the \
+                     whole network's inventory.",
+                ));
+                for (label, port) in [
+                    ("Ollama-compatible", router::PROXY_OLLAMA_PORT),
+                    ("OpenAI-compatible", router::PROXY_OPENAI_PORT),
+                ] {
+                    let url = format!("http://127.0.0.1:{port}");
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(label).size(12.5));
+                        ui.monospace(&url);
+                        if ui.small_button("copy").clicked() {
+                            ui.ctx().copy_text(url.clone());
+                        }
+                    });
+                }
+                ui.label(theme::dim(format!(
+                    "Listeners: {}. Loopback for applications on this machine; nodes on this \
+                     network reach the same ports while LAN ingress is on (Settings).",
+                    view.listeners
+                )));
             });
         self.endpoints_open = open;
     }
 
-    fn chat_window(&mut self, ctx: &egui::Context) {
+    /// A chat that goes through the router's own OpenAI endpoint, so what
+    /// you type here is routed exactly as an application's request would
+    /// be — and shows up in the jobs column naming the node that answered.
+    fn chat_window(&mut self, ctx: &egui::Context, view: &Router) {
         if !self.chat_open {
             return;
         }
+        if let Some(rx) = &mut self.chat.rx {
+            if let Ok(result) = rx.try_recv() {
+                match result {
+                    Ok(text) => self.chat.log.push((false, text)),
+                    Err(e) => self.chat.log.push((false, format!("(error) {e}"))),
+                }
+                self.chat.rx = None;
+            }
+        }
+        let models: Vec<String> = view
+            .inventory(kmplify_node::router::proxy::Api::OpenAi, Instant::now())
+            .into_keys()
+            .collect();
+        if self.chat.model.is_empty() {
+            if let Some(m) = models.first() {
+                self.chat.model = m.clone();
+            }
+        }
         let mut open = true;
+        let mut send = false;
         egui::Window::new("Chat")
             .open(&mut open)
             .collapsible(false)
+            .default_size([560.0, 480.0])
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.set_width(460.0);
-                ui.label(theme::muted(
-                    "A chat pane that talks to the router's own endpoint, so a message you \
-                     type here is routed exactly like an application's request would be. It \
-                     lands with the proxies (phase 2/3 in docs/ROUTER.md).",
-                ));
+                ui.horizontal(|ui| {
+                    ui.label(theme::muted("model"));
+                    egui::ComboBox::from_id_salt("chat-model")
+                        .selected_text(if self.chat.model.is_empty() {
+                            "none on the network".to_string()
+                        } else {
+                            self.chat.model.clone()
+                        })
+                        .show_ui(ui, |ui| {
+                            for m in &models {
+                                ui.selectable_value(&mut self.chat.model, m.clone(), m);
+                            }
+                        });
+                    if ui.small_button("clear").clicked() {
+                        self.chat.log.clear();
+                    }
+                });
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("chat-scroll")
+                    .max_height(300.0)
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        for (mine, text) in &self.chat.log {
+                            let frame = if *mine { theme::card() } else { theme::card_low() };
+                            frame.show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.label(theme::dim(if *mine { "you" } else { "router" }));
+                                ui.label(RichText::new(text).size(13.0));
+                            });
+                            ui.add_space(4.0);
+                        }
+                        if self.chat.rx.is_some() {
+                            ui.label(theme::muted("…"));
+                        }
+                    });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(&mut self.chat.input)
+                            .hint_text("Ask the network")
+                            .desired_width(ui.available_width() - 70.0),
+                    );
+                    if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        send = true;
+                    }
+                    let can = self.chat.rx.is_none()
+                        && !self.chat.model.is_empty()
+                        && !self.chat.input.trim().is_empty();
+                    if ui
+                        .add_enabled(
+                            can,
+                            egui::Button::new(RichText::new("Send").color(Color32::WHITE).strong())
+                                .fill(theme::PRIMARY),
+                        )
+                        .clicked()
+                    {
+                        send = true;
+                    }
+                });
             });
+        if send && self.chat.rx.is_none() && !self.chat.model.is_empty() {
+            let text = self.chat.input.trim().to_string();
+            if !text.is_empty() {
+                self.chat.input.clear();
+                self.chat.log.push((true, text));
+                let messages: Vec<serde_json::Value> = self
+                    .chat
+                    .log
+                    .iter()
+                    .filter(|(_, t)| !t.starts_with("(error)"))
+                    .map(|(mine, t)| {
+                        serde_json::json!({ "role": if *mine { "user" } else { "assistant" }, "content": t })
+                    })
+                    .collect();
+                let body = serde_json::json!({
+                    "model": self.chat.model,
+                    "messages": messages,
+                    "stream": false,
+                });
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                self.chat.rx = Some(rx);
+                let ctx2 = ctx.clone();
+                tokio::spawn(async move {
+                    let url = format!(
+                        "http://127.0.0.1:{}/v1/chat/completions",
+                        router::PROXY_OPENAI_PORT
+                    );
+                    let result = async {
+                        let resp = reqwest::Client::new()
+                            .post(&url)
+                            .json(&body)
+                            .timeout(Duration::from_secs(600))
+                            .send()
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let status = resp.status();
+                        let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+                        if !status.is_success() {
+                            let msg = v["error"]["message"]
+                                .as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| v.to_string());
+                            return Err(format!("{status}: {msg}"));
+                        }
+                        v["choices"][0]["message"]["content"]
+                            .as_str()
+                            .map(|s| s.trim().to_string())
+                            .ok_or_else(|| "no content in the answer".to_string())
+                    }
+                    .await;
+                    let _ = tx.send(result);
+                    ctx2.request_repaint();
+                });
+            }
+        }
         self.chat_open = open;
     }
+}
+
+/// The chat pane's state: the conversation, the model, and the reply in
+/// flight. The conversation lives only in this window and dies with it.
+#[derive(Default)]
+struct Chat {
+    model: String,
+    input: String,
+    log: Vec<(bool, String)>,
+    rx: Option<tokio::sync::mpsc::UnboundedReceiver<Result<String, String>>>,
 }

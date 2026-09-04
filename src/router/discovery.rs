@@ -87,27 +87,22 @@ pub fn node_from_txt(
             }]
         }
     };
-    Some(Node {
-        id,
-        name: {
-            let n = get(K_NAME);
-            if n.is_empty() {
-                address.clone()
-            } else {
-                n
-            }
-        },
-        address,
-        source: Source::Discovered,
-        gpus,
-        cpu_model: get(K_CPU),
-        cpu_cores: get(K_CORES).parse().unwrap_or(0),
-        ram_total_mb: get(K_RAM).parse().unwrap_or(0),
-        engines: decode_engines(&get(K_ENGINES)),
-        metrics: Default::default(),
-        version: get(K_VERSION),
-        last_seen: now,
-    })
+    let name = {
+        let n = get(K_NAME);
+        if n.is_empty() {
+            address.clone()
+        } else {
+            n
+        }
+    };
+    let mut node = Node::new_peer(id, name, address, Source::Discovered, now);
+    node.gpus = gpus;
+    node.cpu_model = get(K_CPU);
+    node.cpu_cores = get(K_CORES).parse().unwrap_or(0);
+    node.ram_total_mb = get(K_RAM).parse().unwrap_or(0);
+    node.engines = decode_engines(&get(K_ENGINES));
+    node.version = get(K_VERSION);
+    Some(node)
 }
 
 /// The TXT properties this machine advertises right now.

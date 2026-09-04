@@ -27,6 +27,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub mod discovery;
+pub mod node_info;
+pub mod proxy;
+pub mod schedule;
 pub mod telemetry;
 
 /// Samples kept per metric: one a second, so a minute of history, which is
@@ -43,12 +46,16 @@ pub const SERVICE_TYPE: &str = "_kmplify-node._tcp.local.";
 /// leave the screen rather than sit there looking routable.
 pub const PEER_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// Where the router's own surfaces will listen (phase 2). Chosen apart from
-/// the engines' defaults and from PAIR's `143xx` band so a machine running
-/// both is not a port fight.
+/// Where the router's own surfaces listen. Chosen apart from the engines'
+/// defaults and from PAIR's `143xx` band so a machine running both is not
+/// a port fight.
 pub const NODE_INFO_PORT: u16 = 14418;
 pub const PROXY_OLLAMA_PORT: u16 = 11440;
 pub const PROXY_OPENAI_PORT: u16 = 11441;
+
+/// A GPU sample older than this is not evidence of anything; the scheduler
+/// treats the node as neutral rather than idle.
+pub const TELEMETRY_STALE: Duration = Duration::from_secs(10);
 
 /// A minute of one measurement, 0–100.
 ///
@@ -118,6 +125,29 @@ pub struct Metrics {
     pub sampled: bool,
     pub vram_used_mb: u64,
     pub ram_used_mb: u64,
+    /// When the GPU figure was last a real reading, for the scheduler's
+    /// staleness rule.
+    pub gpu_sampled_at: Option<Instant>,
+    /// The busiest GPU's utilisation, smoothed, and the pressure unit it
+    /// maps to. See [`schedule`].
+    pub gpu_smoothed: f32,
+    pub pressure: u8,
+}
+
+impl Metrics {
+    /// Fold in a GPU utilisation reading, keeping the smoothed figure and
+    /// pressure unit the scheduler ranks by.
+    pub fn observe_gpu(&mut self, pct: f32, now: Instant) {
+        self.gpu.push(pct);
+        self.gpu_smoothed = if self.gpu_known {
+            schedule::smooth(self.gpu_smoothed, pct)
+        } else {
+            pct
+        };
+        self.gpu_known = true;
+        self.gpu_sampled_at = Some(now);
+        self.pressure = schedule::pressure_step(self.pressure, self.gpu_smoothed);
+    }
 }
 
 /// An inference engine on a node, as the router understands it.
@@ -160,11 +190,53 @@ pub struct Node {
     pub metrics: Metrics,
     pub version: String,
     pub last_seen: Instant,
+    /// Queued plus running work the node itself reports, the scheduler's
+    /// first input. Zero for this machine; its own jobs are counted live.
+    pub reported_pending: u32,
+    /// The proxy ports the node says it listens on, so a peer request goes
+    /// where that node actually serves rather than to an assumed default.
+    pub proxy_ports: (u16, u16),
+    /// Peer polling: consecutive failures and when to try next. Healthy
+    /// nodes are sampled every two seconds; failures back off to thirty.
+    pub poll_failures: u32,
+    pub next_poll: Instant,
 }
 
 impl Node {
     pub fn is_local(&self) -> bool {
         self.source == Source::Local
+    }
+
+    /// The card a peer sees before any HTTP round trip: what the
+    /// announcement carried, and polling due immediately.
+    pub fn new_peer(id: String, name: String, address: String, source: Source, now: Instant) -> Self {
+        Self {
+            id,
+            name,
+            address,
+            source,
+            gpus: vec![],
+            cpu_model: String::new(),
+            cpu_cores: 0,
+            ram_total_mb: 0,
+            engines: vec![],
+            metrics: Metrics::default(),
+            version: String::new(),
+            last_seen: now,
+            reported_pending: 0,
+            proxy_ports: (PROXY_OLLAMA_PORT, PROXY_OPENAI_PORT),
+            poll_failures: 0,
+            next_poll: now,
+        }
+    }
+
+    /// Does a running engine here advertise `model`? Ollama's implicit
+    /// `:latest` is normalised so `qwen3` and `qwen3:latest` are one model.
+    pub fn serves(&self, model: &str, api: proxy::Api) -> Option<&Engine> {
+        let want = normalize_model(model);
+        self.running_engines().find(|e| {
+            api.accepts(&e.id) && e.models.iter().any(|m| normalize_model(m) == want)
+        })
     }
 
     pub fn online(&self, now: Instant) -> bool {
@@ -181,7 +253,8 @@ impl Node {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum JobState {
     Queued,
     Running,
@@ -203,16 +276,57 @@ impl JobState {
 /// One request the router saw, for the jobs column. Never the prompt, never
 /// the answer: model, engine, where it came from, where it ran, and when.
 /// That rule is the desktop app's and PAIR's alike, and it has no switch.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Job {
     pub id: String,
     pub model: String,
     pub engine: String,
     pub requested_from: String,
     pub ran_on: String,
+    /// The node it ran on, by id, so pending counts attribute correctly
+    /// even when two nodes share a hostname.
+    #[serde(default)]
+    pub node_id: String,
     pub state: JobState,
     pub at_ms: u64,
     pub error: String,
+    /// Dispatched by this machine's proxy (as opposed to learned from a
+    /// peer's report). Never on the wire: a peer's copy is a copy.
+    #[serde(skip)]
+    pub local_origin: bool,
+}
+
+impl Job {
+    pub fn is_pending(&self) -> bool {
+        matches!(self.state, JobState::Queued | JobState::Running)
+    }
+
+    pub fn requested_from_here(&self) -> bool {
+        self.local_origin
+    }
+
+    /// An id unique across the cluster without coordination: the node id,
+    /// the clock, and a counter for two dispatches in one millisecond.
+    pub fn new_id(node_id: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "{}-{}-{}",
+            &node_id[..8.min(node_id.len())],
+            crate::status::now_ms(),
+            N.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+}
+
+/// Ollama's implicit tag, made explicit so inventories compare.
+pub fn normalize_model(name: &str) -> String {
+    let n = name.trim();
+    if n.contains(':') {
+        n.to_string()
+    } else {
+        format!("{n}:latest")
+    }
 }
 
 /// Everything the GUI draws, behind one lock. Samplers write, the frame
@@ -229,6 +343,12 @@ pub struct Router {
     pub log: VecDeque<String>,
     /// Discovery's own state, for the cluster screen: browsing, or why not.
     pub discovery: String,
+    /// Accept requests from other nodes on this network at the proxies.
+    /// On by default while the router runs; off makes this machine a
+    /// consumer of the cluster that serves nothing to it.
+    pub lan_ingress: bool,
+    /// What the listeners report: bound, or why not.
+    pub listeners: String,
 }
 
 pub const MAX_JOBS: usize = 500;
@@ -262,6 +382,67 @@ impl Router {
         }
     }
 
+    /// A job reported by a peer: update the entry if it is known, else add
+    /// it, so every window shows work running anywhere in the cluster.
+    pub fn merge_job(&mut self, job: Job) {
+        match self.jobs.iter_mut().find(|j| j.id == job.id) {
+            Some(existing) => {
+                existing.state = job.state;
+                existing.error = job.error;
+                existing.at_ms = job.at_ms;
+            }
+            None => self.push_job(job),
+        }
+    }
+
+    pub fn set_job_state(&mut self, id: &str, state: JobState, error: impl Into<String>) {
+        if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
+            j.state = state;
+            j.error = error.into();
+            j.at_ms = crate::status::now_ms();
+        }
+    }
+
+    /// Queued plus running work attributed to a node: what it reports about
+    /// itself, plus what this machine has dispatched to it and not yet seen
+    /// reported back — the reservation that spreads a burst.
+    pub fn pending_for(&self, node_id: &str) -> u32 {
+        let local: u32 = self
+            .jobs
+            .iter()
+            .filter(|j| j.is_pending() && j.node_id == node_id && j.requested_from_here())
+            .count() as u32;
+        let reported = self.nodes.get(node_id).map(|n| n.reported_pending).unwrap_or(0);
+        if node_id == self.self_id {
+            // This machine's own count is live; the reported figure is what
+            // it tells peers, derived from the same jobs.
+            self.jobs
+                .iter()
+                .filter(|j| j.is_pending() && j.node_id == node_id)
+                .count() as u32
+        } else {
+            reported.max(local)
+        }
+    }
+
+    /// Every model some online node can serve through `api`, with the
+    /// nodes that have it. The cluster's inventory, for the fan-out lists
+    /// and the chat pane's model picker.
+    pub fn inventory(&self, api: proxy::Api, now: Instant) -> BTreeMap<String, Vec<String>> {
+        let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for n in self.nodes.values().filter(|n| n.online(now)) {
+            for e in n.running_engines().filter(|e| api.accepts(&e.id)) {
+                for m in &e.models {
+                    if m.is_empty() {
+                        continue;
+                    }
+                    out.entry(m.clone()).or_default().push(n.name.clone());
+                }
+            }
+        }
+        out
+    }
+
     pub fn push_log(&mut self, line: impl Into<String>) {
         let stamp = crate::status::clock_hms(crate::status::now_ms());
         self.log.push_back(format!("{stamp} {}", line.into()));
@@ -271,17 +452,26 @@ impl Router {
     }
 
     /// Fold a peer announcement in: refresh an existing card in place so its
-    /// chart history survives, or create one.
+    /// chart history survives, or create one. An announcement never
+    /// overwrites what node-info already told us in more detail (model
+    /// names), only what it knows better (address, liveness).
     pub fn upsert_peer(&mut self, peer: Node) {
         match self.nodes.get_mut(&peer.id) {
             Some(existing) => {
                 existing.name = peer.name;
                 existing.address = peer.address;
-                existing.gpus = peer.gpus;
-                existing.cpu_model = peer.cpu_model;
-                existing.cpu_cores = peer.cpu_cores;
-                existing.ram_total_mb = peer.ram_total_mb;
-                existing.engines = peer.engines;
+                if existing.gpus.is_empty() {
+                    existing.gpus = peer.gpus;
+                }
+                if existing.cpu_model.is_empty() {
+                    existing.cpu_model = peer.cpu_model;
+                    existing.cpu_cores = peer.cpu_cores;
+                    existing.ram_total_mb = peer.ram_total_mb;
+                }
+                let announced_more = existing.engines.iter().all(|e| e.models.iter().all(String::is_empty));
+                if announced_more {
+                    existing.engines = peer.engines;
+                }
                 existing.version = peer.version;
                 existing.last_seen = peer.last_seen;
                 if existing.source == Source::Manual && peer.source == Source::Discovered {
@@ -363,32 +553,43 @@ pub fn new_shared(
     // costs nothing.
     crate::hostcpu::start();
     let cpu = crate::hostcpu::snapshot();
-    let local = Node {
-        id: id.clone(),
-        name: hostname(),
-        address,
-        source: Source::Local,
-        gpus: gpus
-            .iter()
-            .map(|g| GpuInfo {
-                name: g.name.clone(),
-                total_mb: g.total_mb,
-            })
-            .collect(),
-        cpu_model: cpu.model,
-        cpu_cores: cpu.logical_cores,
-        ram_total_mb: crate::hostcpu::read_ram_total_mb_now(),
-        engines: Vec::new(),
-        metrics: Metrics::default(),
-        version: crate::version_string().to_string(),
-        last_seen: Instant::now(),
-    };
+    let mut local = Node::new_peer(id.clone(), hostname(), address, Source::Local, Instant::now());
+    local.gpus = gpus
+        .iter()
+        .map(|g| GpuInfo {
+            name: g.name.clone(),
+            total_mb: g.total_mb,
+        })
+        .collect();
+    local.cpu_model = cpu.model;
+    local.cpu_cores = cpu.logical_cores;
+    local.ram_total_mb = crate::hostcpu::read_ram_total_mb_now();
+    local.version = crate::version_string().to_string();
     let mut router = Router {
         self_id: id,
+        lan_ingress: true,
         ..Default::default()
     };
     router.nodes.insert(local.id.clone(), local);
     router.discovery = "starting".into();
+    router.listeners = "starting".into();
+    Arc::new(Mutex::new(router))
+}
+
+/// A router with only a bare local node, for tests that need `self_id`
+/// resolved without touching the filesystem or probing hardware.
+#[cfg(test)]
+pub fn new_shared_for_tests(self_id: &str) -> Shared {
+    let now = Instant::now();
+    let mut router = Router {
+        self_id: self_id.to_string(),
+        lan_ingress: true,
+        ..Default::default()
+    };
+    router.nodes.insert(
+        self_id.to_string(),
+        Node::new_peer(self_id.to_string(), "me".into(), "127.0.0.1".into(), Source::Local, now),
+    );
     Arc::new(Mutex::new(router))
 }
 
@@ -413,6 +614,10 @@ pub fn spawn(shared: Shared, accel: crate::gpu::Backend) {
     tokio::spawn(telemetry::sample_local(shared.clone(), accel));
     tokio::spawn(telemetry::scan_engines(shared.clone()));
     tokio::spawn(telemetry::expire_peers(shared.clone()));
+    tokio::spawn(node_info::serve(shared.clone()));
+    tokio::spawn(node_info::poll_peers(shared.clone()));
+    tokio::spawn(proxy::serve(shared.clone(), proxy::Api::Ollama, PROXY_OLLAMA_PORT));
+    tokio::spawn(proxy::serve(shared.clone(), proxy::Api::OpenAi, PROXY_OPENAI_PORT));
     discovery::spawn(shared);
 }
 
@@ -438,19 +643,21 @@ mod tests {
     }
 
     fn node(id: &str, name: &str, source: Source, seen: Instant) -> Node {
-        Node {
+        Node::new_peer(id.into(), name.into(), "10.0.0.1".into(), source, seen)
+    }
+
+    fn job(id: &str, node_id: &str, state: JobState, local: bool) -> Job {
+        Job {
             id: id.into(),
-            name: name.into(),
-            address: "10.0.0.1".into(),
-            source,
-            gpus: vec![],
-            cpu_model: String::new(),
-            cpu_cores: 0,
-            ram_total_mb: 0,
-            engines: vec![],
-            metrics: Metrics::default(),
-            version: String::new(),
-            last_seen: seen,
+            model: "m".into(),
+            engine: "ollama".into(),
+            requested_from: String::new(),
+            ran_on: String::new(),
+            node_id: node_id.into(),
+            state,
+            at_ms: 0,
+            error: String::new(),
+            local_origin: local,
         }
     }
 
@@ -505,18 +712,81 @@ mod tests {
     fn jobs_are_newest_first_and_capped() {
         let mut r = Router::default();
         for i in 0..(MAX_JOBS + 5) {
-            r.push_job(Job {
-                id: i.to_string(),
-                model: "m".into(),
-                engine: "ollama".into(),
-                requested_from: String::new(),
-                ran_on: String::new(),
-                state: JobState::Completed,
-                at_ms: i as u64,
-                error: String::new(),
-            });
+            r.push_job(job(&i.to_string(), "n", JobState::Completed, true));
         }
         assert_eq!(r.jobs.len(), MAX_JOBS);
         assert_eq!(r.jobs.front().unwrap().id, (MAX_JOBS + 4).to_string());
+    }
+
+    #[test]
+    fn a_peer_report_updates_a_known_job_and_adds_an_unknown_one() {
+        let mut r = Router::default();
+        r.push_job(job("a", "n", JobState::Running, true));
+        r.merge_job(job("a", "n", JobState::Completed, false));
+        r.merge_job(job("b", "n", JobState::Running, false));
+        assert_eq!(r.jobs.len(), 2);
+        let a = r.jobs.iter().find(|j| j.id == "a").unwrap();
+        assert_eq!(a.state, JobState::Completed);
+        assert!(a.local_origin, "a merge never demotes a local job to a copy");
+    }
+
+    #[test]
+    fn pending_counts_own_dispatches_and_trusts_the_larger_figure_for_peers() {
+        let now = Instant::now();
+        let mut r = Router {
+            self_id: "me".into(),
+            ..Default::default()
+        };
+        r.nodes.insert("me".into(), node("me", "me", Source::Local, now));
+        let mut peer = node("p", "p", Source::Discovered, now);
+        peer.reported_pending = 3;
+        r.nodes.insert("p".into(), peer);
+        r.push_job(job("1", "me", JobState::Running, true));
+        r.push_job(job("2", "me", JobState::Completed, true));
+        r.push_job(job("3", "p", JobState::Running, true));
+        assert_eq!(r.pending_for("me"), 1);
+        assert_eq!(r.pending_for("p"), 3, "the peer's own count wins while it is larger");
+        for i in 4..9 {
+            r.push_job(job(&i.to_string(), "p", JobState::Running, true));
+        }
+        assert_eq!(r.pending_for("p"), 6, "a burst dispatched here is reserved before the peer reports it");
+    }
+
+    #[test]
+    fn serves_normalises_ollamas_implicit_tag() {
+        let now = Instant::now();
+        let mut n = node("n", "n", Source::Local, now);
+        n.engines.push(Engine {
+            id: "ollama".into(),
+            name: "Ollama".into(),
+            base: "http://127.0.0.1:11434".into(),
+            models: vec!["qwen3:latest".into(), "bge-m3:567m".into()],
+            running: true,
+        });
+        assert!(n.serves("qwen3", proxy::Api::Ollama).is_some());
+        assert!(n.serves("qwen3:latest", proxy::Api::OpenAi).is_some());
+        assert!(n.serves("bge-m3", proxy::Api::Ollama).is_none(), "a different tag is a different model");
+        n.engines[0].running = false;
+        assert!(n.serves("qwen3", proxy::Api::Ollama).is_none(), "a model on a stopped engine does not count");
+    }
+
+    #[test]
+    fn the_inventory_lists_who_has_what() {
+        let now = Instant::now();
+        let mut r = Router::default();
+        for (id, model) in [("a", "x:latest"), ("b", "x:latest"), ("c", "y:7b")] {
+            let mut n = node(id, id, Source::Discovered, now);
+            n.engines.push(Engine {
+                id: "ollama".into(),
+                name: "Ollama".into(),
+                base: String::new(),
+                models: vec![model.into()],
+                running: true,
+            });
+            r.nodes.insert(id.into(), n);
+        }
+        let inv = r.inventory(proxy::Api::Ollama, now);
+        assert_eq!(inv["x:latest"], vec!["a", "b"]);
+        assert_eq!(inv["y:7b"], vec!["c"]);
     }
 }

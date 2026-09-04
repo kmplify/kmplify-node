@@ -36,19 +36,32 @@ window) is a separate feature for a future headless router mode.
 
 The fabric worker never listens on a port, and that stays true: nothing in
 `kmplify-node`, `run`, `tui`, `check` or `set` binds anything. The router is
-a separate, opt-in mode, and only it will:
+a separate, opt-in mode, and only it:
 
-- send and receive **multicast DNS on the local link** (this phase);
-- bind the **node-info surface** and the **two routing proxies** on this
-  machine's interfaces (phase 2), loopback for local applications, mutual
-  TLS for paired peers, nothing for anyone else.
+- sends and receives **multicast DNS on the local link**;
+- binds the **node-info surface** (`14418`) and the **two routing proxies**
+  (`11440`, `11441`) on this machine's interfaces.
 
-Everything the router puts on the network is listed on its settings screen:
-hostname, node id, GPU model, core and memory counts, which engines answer
-and how many models each serves. Never a model name in the announcement,
-never a request, never a response. Nothing is logged that a request
-contained; the jobs column shows model, engine, origin, destination and time,
-exactly as PAIR's does, and there is no switch that adds more.
+Who may talk to the proxies is decided per connection:
+
+| Caller | Treatment |
+|---|---|
+| this machine, on loopback | routed anywhere on the network |
+| a node in this machine's directory, while *LAN ingress* is on | served by this node's own engine, never routed on |
+| anything else | `403` |
+
+"In the directory" means discovered over mDNS or added by address and
+answering node-info. Until pairing and mutual TLS land (phase 3) that list is
+the whole gate, and the node-info surface itself is plain HTTP readable by
+anything on the subnet — the same trade PAIR makes for its telemetry. Both
+facts are stated on the settings screen, which is also where LAN ingress is
+switched off to make a machine a pure consumer of the cluster.
+
+Everything the router puts on the network: hostname, node id, hardware,
+which engines answer and their model names, how busy the machine is, which
+jobs ran where. Never a request, never a response. Nothing is logged that a
+request contained; the jobs column shows model, engine, origin, destination
+and time, exactly as PAIR's does, and there is no switch that adds more.
 
 This is local-first and stays local-first. No part of the router talks to
 `fabric.kmplify.io` or any other cloud; a machine with the router on and the
@@ -58,28 +71,69 @@ fabric worker paused is a purely on-premises cluster.
 
 | PAIR component | Here | Phase |
 |---|---|---|
-| `nvpair-node-scanner` (mDNS, directory, enrichment, eviction) | `router::discovery` + `Router::expire` | 1 (done) |
-| `nvpair-node-info` (GPU/CPU/RAM telemetry, `/v1/node-info`) | `router::telemetry` (local sampling) · HTTP surface | 1 · 2 |
-| `nvpair-engine-manager` (detect, inventory) | `engines::scan` via `telemetry::scan_engines` | 1 (detect, inventory) · 3 (install, start, stop, pull) |
-| `nvpair-manual-nodes` | `Router::manual` + probing | 1 (list) · 2 (probe) |
-| `nvpair-node-settings` | `settings::Settings` (existing) | 1 |
-| `ollama-proxy`, `lmstudio-proxy` (routing, owner failover, fan-out `/v1/models`) | `router::proxy` | 2 |
-| `nvpair-job-scheduler` (pending + smoothed GPU pressure) | `router::schedule` | 2 |
-| `nvpair-workload-manager` (jobs replicated cluster-wide) | `Router::jobs` + peer replication | 1 (local) · 2 (replicated) |
+| `nvpair-node-scanner` (mDNS, directory, enrichment, eviction) | `router::discovery` + `node_info::poll_peers` + `Router::expire` | done |
+| `nvpair-node-info` (GPU/CPU/RAM telemetry, `/v1/node-info`) | `router::telemetry` (sampling) + `router::node_info` (surface and polling) | done |
+| `nvpair-engine-manager` (detect, inventory) | `engines::scan` via `telemetry::scan_engines` | detect, inventory done · 3 (install, start, stop, pull) |
+| `nvpair-manual-nodes` | `Router::manual` + `node_info::poll_peers` (re-keyed to the real id on first answer) | done |
+| `nvpair-node-settings` | `settings::Settings` (existing) | done |
+| `ollama-proxy`, `lmstudio-proxy` (routing, owner failover, fan-out listings) | `router::proxy` | done |
+| `nvpair-job-scheduler` (pending + smoothed GPU pressure) | `router::schedule` | done |
+| `nvpair-workload-manager` (jobs replicated cluster-wide) | `Router::jobs`, carried in every node-info report and merged by id | done |
 | `nvpair-cluster-manager` + `eap-noob` (identity, PIN pairing, pinned certs, mTLS) | `router::cluster` | 3 |
-| `nvpair-errors` | log ring + peer sync | 1 (local) · 3 |
+| `nvpair-errors` | log ring + peer sync | local done · 3 |
 | `nvpair-ui-broker` (supervision, JSON-RPC relay) | not needed: one process, one `Router` behind a mutex | — |
 | `nvpair-tui` | `kmplify-node tui` gains the router screens | 3 |
-| Electron `desktop/` | `src/gui` (egui, native) | 1 (Overview, Jobs, Settings, Endpoints, Add node) · 2 (Chat) · 3 (Model hub, Welcome, Tray) |
+| Electron `desktop/` | `src/gui` (egui, native) | Overview, Jobs, Settings, Endpoints, Add node, Chat done · 3 (Model hub, Welcome, Tray) |
 
 Ports, chosen apart from the engines' defaults and from PAIR's `143xx` band
 so both can run on one machine:
 
-| Port | Listener | Phase |
-|---|---|---|
-| `14418` | node-info: hardware, meters, model inventory (plain HTTP, LAN) | 2 |
-| `11440` | Ollama-compatible routing proxy | 2 |
-| `11441` | OpenAI-compatible routing proxy | 2 |
+| Port | Listener |
+|---|---|
+| `14418` | node-info: hardware, meters, engines with model names, pending work, recent jobs (plain HTTP, LAN) |
+| `11440` | Ollama-compatible routing proxy (`/api/*`, and the `/v1/*` Ollama serves) |
+| `11441` | OpenAI-compatible routing proxy (`/v1/*`, every engine) |
+
+### `GET /v1/node-info`
+
+```json
+{
+  "id": "9a708f66…", "name": "King", "version": "0.6.1+…",
+  "gpus": [{"name": "NVIDIA GeForce RTX 4090", "total_mb": 24564, "used_mb": 1950, "utilization_percent": 23}],
+  "cpu": {"model": "13th Gen Intel(R) Core(TM) i9-13900K", "cores": 32, "utilization_percent": 7.8},
+  "memory": {"total_mb": 64832, "used_mb": 41600},
+  "engines": [{"id": "ollama", "name": "Ollama", "base": "http://127.0.0.1:11434", "models": ["qwen3:14b", "…"], "running": true}],
+  "sampled": true, "vram_known": true,
+  "pending": 0, "proxy_ports": [11440, 11441], "lan_ingress": true,
+  "jobs": [{"id": "…", "model": "qwen2.5:7b-instruct", "engine": "ollama", "requested_from": "King", "ran_on": "King", "node_id": "…", "state": "completed", "at_ms": 0, "error": ""}]
+}
+```
+
+`utilization_percent` fields are absent where the platform gives no
+reading (Apple Silicon exposes GPU load to privileged tools only), and a
+consumer charts nothing rather than a zero. `jobs` carries the last fifty;
+a peer merges them by id, so every window shows work running anywhere.
+
+### How a request is routed
+
+1. The caller is classified (table above). A peer's request, or one carrying
+   `X-KMPLIFY-Hop`, is served by this node's own engine only.
+2. `GET /api/tags` and `GET /v1/models` fan out to every online node's
+   engines concurrently and merge by name, first answer keeping the
+   metadata and every owner listed under `kmplify_nodes`.
+3. Otherwise the `model` is read from the JSON body. The candidates are the
+   online nodes whose *running* engine advertises it — Ollama's implicit
+   `:latest` normalised, other ids exact — and `router::schedule` orders
+   them: pending work plus GPU pressure, then pressure, then id.
+4. Candidates are tried in order. This machine's engine is called directly;
+   a peer through its proxy with the hop header. A `404` (stale inventory)
+   or `5xx` moves to the next owner; a `400`/`422` is returned as is. The
+   response streams back untouched.
+5. A job card is opened at dispatch and closed when the response body ends,
+   which for a streamed generation is the only moment it is finished.
+
+No candidate at all is an immediate `502` naming the model; the request is
+never sent to an engine that does not have it.
 
 PAIR takes over the engines' own ports (`11434`, `1234`) so unmodified clients
 gain the cluster. That is a real convenience and a real surprise; this router
@@ -106,23 +160,33 @@ at the router's port, and the Endpoints window is where it copies that from.
 Fabric jobs appear in the jobs column as they finish, from the node's own
 counters; nothing about their content is available to the window, by design.
 
-## Phase 2 — routing
+## Phase 2 — routing (on this branch)
 
-- `router::node_info`: serve `GET /v1/node-info` (hardware, meters, per-engine
-  inventory, loaded models) on `14418`; the discovery side fetches it for
-  each peer every two seconds with backoff on failure, so a peer's card gets
-  live meters and model names. Manual nodes are probed the same way.
-- `router::proxy`: the two compatibility proxies. Model-bearing requests go
-  only to nodes whose inventory advertises the model (Ollama's implicit
-  `:latest` normalised; LM Studio ids exact); `/v1/models` and `/api/tags`
-  fan out and merge; `404` from an advertised owner fails over to the next,
-  `4xx` client errors do not. Streaming passes through untouched.
-- `router::schedule`: pending work per node plus the busiest GPU smoothed
-  into pressure 0–3 (40/70/85 % up, lower on the way down), neutral 1 when
-  telemetry is missing or older than ten seconds; ranking published only
-  when it changes; per-proxy reservations so a burst spreads.
-- Jobs replicated between nodes so every window shows work running anywhere.
-- Chat: a pane that talks to the router's own endpoint.
+- `router::node_info`: `GET /v1/node-info` on `14418`, and the poll of every
+  peer's copy: two seconds while it answers, 4/8/16/30 while it does not,
+  last good value kept. A node added by address is re-keyed to its real id
+  on its first answer; typing this machine's own address adds nothing.
+- `router::proxy`: the two compatibility proxies, routing as described
+  above, with the caller gate and the hop rule.
+- `router::schedule`: pending work per node (what it reports, or what this
+  machine has dispatched to it and not yet seen reported — the reservation
+  that spreads a burst) plus the busiest GPU smoothed into pressure 0–3
+  (40/70/85 % up, ten points lower on the way down, one step per sample),
+  neutral 1 when the GPU sample is missing or older than ten seconds.
+  Computed at request time from the shared state; nothing to publish.
+- Jobs travel in node-info reports and merge by id.
+- Chat: a pane on the router's own OpenAI endpoint with a model picker fed
+  by the network's inventory, so a message typed there is routed exactly
+  like an application's request and shows up in the jobs column.
+- LAN ingress switch on the settings screen.
+
+Verified on one Windows node: node-info answers with live meters; the two
+listings merge Ollama's and LM Studio's inventories (5 + 8 models); a chat
+completion and a native `/api/generate` route to the local engine and appear
+as completed jobs; an unknown model is a `502` naming it; a request from a
+non-loopback, non-directory address is a `403`. Two-node routing, failover
+and the scheduler's ordering are unit-tested but have not yet run against a
+second physical machine.
 
 ## Phase 3 — trust and lifecycle
 

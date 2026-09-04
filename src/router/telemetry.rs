@@ -50,8 +50,7 @@ pub async fn sample_local(shared: Shared, accel: Backend) {
         m.ram_used_mb = cpu.ram_used_mb;
         m.ram.push(percent(cpu.ram_used_mb, cpu.ram_total_mb.max(me.ram_total_mb)));
         if let Some(p) = gpu_pct {
-            m.gpu.push(p as f32);
-            m.gpu_known = true;
+            m.observe_gpu(p as f32, Instant::now());
         }
         // Unified memory has no distinct "used VRAM"; the same rule as the
         // dashboard's meters, so the two never disagree about a Mac.

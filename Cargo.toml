@@ -78,6 +78,10 @@ wasmtime-wasi = { version = "48", optional = true, default-features = false, fea
 # network. Its own mDNS responder rather than the system's, because Windows
 # ships none; shares UDP 5353 with Bonjour and Avahi where they exist.
 mdns-sd = { version = "0.21", optional = true }
+# The router's listeners (src/router/node_info.rs, proxy.rs): the node-info
+# surface peers read, and the two routing proxies. Shares hyper 1 with the
+# reqwest already in the tree.
+axum = { version = "0.8", optional = true }
 # The desktop window (src/gui): the router's screens, drawn natively.
 # Opt-in at build time because a GPU-backed window toolkit is a large
 # dependency a headless service binary has no use for. The OpenGL backend
@@ -111,7 +115,7 @@ tui = ["dep:ratatui"]
 wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
 # The LAN router: discovery, per-node telemetry and (phase 2) the routing
 # proxies. Headless-capable; the window below is one client of it.
-router = ["dep:mdns-sd"]
+router = ["dep:mdns-sd", "dep:axum"]
 # `kmplify-node gui`: the desktop window for the router, on Linux, macOS
 # and Windows. See docs/ROUTER.md.
 gui = ["router", "dep:eframe"]
