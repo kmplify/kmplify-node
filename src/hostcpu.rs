@@ -57,16 +57,7 @@ fn cell() -> &'static Arc<Mutex<HostCpu>> {
 
 /// Start the sampler. Idempotent — safe to call on every reconcile.
 pub fn start() {
-    static STARTED: OnceLock<()> = OnceLock::new();
-    if STARTED.set(()).is_err() {
-        return;
-    }
     use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
-    let mut sys = System::new_with_specifics(
-        RefreshKind::new()
-            .with_cpu(CpuRefreshKind::everything())
-            .with_memory(MemoryRefreshKind::everything()),
-    );
 
     // Static facts, read once — and read HERE, before the sampler thread
     // exists. The wizard's "this machine" mirror and the worker's first
@@ -74,13 +65,27 @@ pub fn start() {
     // has not run yet left them the default: no model name and 0 cores for
     // exactly the caller that asked first. A CPU does not grow cores at
     // runtime, so reading synchronously is also simply correct.
-    let model = sys
-        .cpus()
-        .first()
-        .map(|c| c.brand().trim().to_string())
-        .unwrap_or_default();
-    let logical = sys.cpus().len();
-    let physical = sys.physical_core_count().unwrap_or(logical).max(1);
+    //
+    // A OnceLock rather than a flag, because two callers can arrive at
+    // once (the worker and a dashboard in the same process): get_or_init
+    // makes the second WAIT for the first's answer instead of returning
+    // to read zeros while the first is still asking the OS.
+    static FACTS: OnceLock<(String, usize, usize)> = OnceLock::new();
+    let (model, logical, physical) = FACTS
+        .get_or_init(|| {
+            let sys = System::new_with_specifics(
+                RefreshKind::new().with_cpu(CpuRefreshKind::everything()),
+            );
+            let model = sys
+                .cpus()
+                .first()
+                .map(|c| c.brand().trim().to_string())
+                .unwrap_or_default();
+            let logical = sys.cpus().len();
+            let physical = sys.physical_core_count().unwrap_or(logical).max(1);
+            (model, logical, physical)
+        })
+        .clone();
     {
         let mut w = cell().lock().unwrap();
         w.model = model;
@@ -88,7 +93,16 @@ pub fn start() {
         w.physical_cores = physical;
     }
 
+    static STARTED: OnceLock<()> = OnceLock::new();
+    if STARTED.set(()).is_err() {
+        return;
+    }
     std::thread::spawn(move || {
+        let mut sys = System::new_with_specifics(
+            RefreshKind::new()
+                .with_cpu(CpuRefreshKind::everything())
+                .with_memory(MemoryRefreshKind::everything()),
+        );
         let mut warmed = false;
         loop {
             std::thread::sleep(SAMPLE_INTERVAL);

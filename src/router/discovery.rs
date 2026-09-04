@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use super::{lock, Engine, GpuInfo, Node, Shared, Source, NODE_INFO_PORT, SERVICE_TYPE};
+use super::{lock, node_info_port, Engine, GpuInfo, Node, Shared, Source, SERVICE_TYPE};
 
 /// TXT keys, short because a TXT record is byte-budgeted.
 const K_ID: &str = "id";
@@ -31,6 +31,9 @@ const K_CORES: &str = "cores";
 const K_RAM: &str = "ram";
 const K_ENGINES: &str = "eng";
 const K_VERSION: &str = "v";
+/// The cluster the node belongs to, so a card can say "paired" or "other
+/// cluster" before any handshake. Display only; trust is the certificate.
+const K_CLUSTER: &str = "cl";
 
 /// The engines part of the record: `id:models,id:models` for the ones that
 /// answer, so a peer's card can show badges before any HTTP round trip.
@@ -102,6 +105,7 @@ pub fn node_from_txt(
     node.ram_total_mb = get(K_RAM).parse().unwrap_or(0);
     node.engines = decode_engines(&get(K_ENGINES));
     node.version = get(K_VERSION);
+    node.cluster_id = get(K_CLUSTER);
     Some(node)
 }
 
@@ -128,6 +132,7 @@ fn own_txt(shared: &Shared) -> Vec<(String, String)> {
         (K_RAM.into(), me.ram_total_mb.to_string()),
         (K_ENGINES.into(), encode_engines(&me.engines)),
         (K_VERSION.into(), me.version.clone()),
+        (K_CLUSTER.into(), r.cluster.cluster_id.clone()),
     ]
 }
 
@@ -170,7 +175,7 @@ fn run(shared: Shared) {
             &instance,
             &host_fqdn,
             "",
-            NODE_INFO_PORT,
+            node_info_port(),
             &props[..],
         )
         .map_err(|e| e.to_string())?
@@ -230,12 +235,18 @@ fn run(shared: Shared) {
                     .iter()
                     .map(|p| (p.key().to_string(), p.val_str().to_string()))
                     .collect();
-                // Prefer an IPv4 address: it is what an operator recognises
-                // on the card and what the engines bind by default.
+                // Prefer a routable IPv4 address: it is what an operator
+                // recognises on the card and what the engines bind by
+                // default. A host with an idle adapter also announces its
+                // 169.254.x link-local address, which nobody else can reach.
                 let addrs = info.get_addresses();
                 let address = addrs
                     .iter()
-                    .find(|a| a.is_ipv4())
+                    .find(|a| match a.to_string().parse::<std::net::IpAddr>() {
+                        Ok(std::net::IpAddr::V4(v4)) => !v4.is_link_local() && !v4.is_loopback(),
+                        _ => false,
+                    })
+                    .or_else(|| addrs.iter().find(|a| a.is_ipv4()))
                     .or_else(|| addrs.iter().next())
                     .map(|a| a.to_string())
                     .unwrap_or_default();

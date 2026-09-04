@@ -266,6 +266,10 @@ struct GuiApp {
     chat_open: bool,
     chat: Chat,
     notice: Option<(String, Color32, Instant)>,
+    /// The join form on the cluster card, and the attempt in flight.
+    join_addr: String,
+    join_pin: String,
+    join_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Result<String, String>>>,
 }
 
 impl GuiApp {
@@ -305,6 +309,9 @@ impl GuiApp {
             chat_open: false,
             chat: Chat::default(),
             notice: None,
+            join_addr: String::new(),
+            join_pin: String::new(),
+            join_rx: None,
         }
     }
 
@@ -414,13 +421,9 @@ impl GuiApp {
         }
         r.manual.push(address.clone());
         let id = format!("manual:{address}");
-        let mut node = Node::new_peer(
-            id.clone(),
-            address.clone(),
-            address.clone(),
-            Source::Manual,
-            Instant::now(),
-        );
+        let (host, port) = Node::parse_address(&address);
+        let mut node = Node::new_peer(id.clone(), address.clone(), host, Source::Manual, Instant::now());
+        node.info_port = port;
         // Offline until it answers a node-info poll, which is due at once.
         node.last_seen = Instant::now() - router::PEER_TIMEOUT;
         r.upsert_peer(node);
@@ -709,7 +712,8 @@ impl GuiApp {
                 .show(ui, |ui| {
                     let now = Instant::now();
                     for node in view.ordered() {
-                        self.node_card(ui, node, now);
+                        let paired = view.is_member(&node.id);
+                        self.node_card(ui, node, now, paired);
                         ui.add_space(10.0);
                     }
                     if view.nodes.len() == 1 {
@@ -725,7 +729,7 @@ impl GuiApp {
         });
     }
 
-    fn node_card(&mut self, ui: &mut egui::Ui, node: &Node, now: Instant) {
+    fn node_card(&mut self, ui: &mut egui::Ui, node: &Node, now: Instant, paired: bool) {
         let online = node.online(now);
         let m = &node.metrics;
         let has_gpu = !node.gpus.is_empty();
@@ -772,10 +776,18 @@ impl GuiApp {
                         );
                         if node.is_local() {
                             theme::pill(ui, "LOCAL", theme::OK);
-                        } else if !online {
-                            theme::pill(ui, "OFFLINE", theme::TEXT_MUTED);
-                        } else if node.source == Source::Manual {
-                            theme::pill(ui, "MANUAL", theme::PRIMARY);
+                        } else if paired {
+                            theme::pill(ui, "PAIRED", theme::PRIMARY);
+                        } else if !node.cluster_id.is_empty() {
+                            theme::pill(ui, "OTHER CLUSTER", theme::WARN);
+                        } else {
+                            theme::pill(ui, "UNPAIRED", theme::TEXT_MUTED);
+                        }
+                        if !online && !node.is_local() {
+                            theme::pill(ui, "OFFLINE", theme::TEXT_DIM);
+                        }
+                        if node.source == Source::Manual {
+                            theme::pill(ui, "BY ADDRESS", theme::TEXT_DIM);
                         }
                         ui.label(theme::muted(format!("· {}", node.address)));
                         if let Some(g) = gpu {
@@ -1063,6 +1075,11 @@ impl GuiApp {
                         .map(|n| (n.ram_total_mb, n.cpu_cores))
                         .unwrap_or((0, 0));
 
+                    // Pairing first: on this screen it is the action a new
+                    // install is looking for.
+                    self.cluster_card(ui, view);
+                    ui.add_space(10.0);
+
                     theme::card().show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.label(theme::heading("What this machine lends to the fabric"));
@@ -1155,10 +1172,7 @@ impl GuiApp {
                         )));
                         let mut ingress = view.lan_ingress;
                         if ui
-                            .checkbox(
-                                &mut ingress,
-                                "Serve requests from the other nodes on this network",
-                            )
+                            .checkbox(&mut ingress, "Serve requests from paired nodes")
                             .changed()
                         {
                             let mut r = router::lock(&self.shared);
@@ -1172,10 +1186,10 @@ impl GuiApp {
                         ui.label(theme::dim(
                             "What crosses the network: hostname, node id, hardware, which engines \
                              answer and their model names, how busy the machine is, and which jobs \
-                             ran where. Never a request or a response. Peers are the nodes on this \
-                             list; until pairing lands (phase 3) that list is the whole gate, and \
-                             anything on this subnet can read the node-info surface — which is why \
-                             this mode is opt-in.",
+                             ran where. Never a request or a response. Requests between machines \
+                             travel only between paired nodes, over mutual TLS. While this node is \
+                             in no cluster its report is readable by anything on the subnet, so \
+                             strangers can find each other to pair; once paired, only members read it.",
                         ));
                         if !view.manual.is_empty() {
                             ui.add_space(4.0);
@@ -1240,6 +1254,166 @@ fn slider_gb(mb: u64) -> String {
         "no ceiling".into()
     } else {
         gb(mb)
+    }
+}
+
+// ------------------------------------------------------------------ cluster
+
+impl GuiApp {
+    /// Pairing and membership: the card PAIR puts under Settings → Cluster.
+    fn cluster_card(&mut self, ui: &mut egui::Ui, view: &Router) {
+        if let Some(rx) = &mut self.join_rx {
+            if let Ok(result) = rx.try_recv() {
+                match result {
+                    Ok(msg) => {
+                        self.join_pin.clear();
+                        self.notify(msg, theme::OK);
+                    }
+                    Err(e) => self.notify(format!("pairing failed: {e}"), theme::ERR),
+                }
+                self.join_rx = None;
+            }
+        }
+        let now = Instant::now();
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(theme::heading("Cluster"));
+            let Some(identity) = &view.identity else {
+                ui.label(RichText::new(
+                    "This node has no certificate, so it cannot pair. The log says why.",
+                ).color(theme::ERR).size(12.5));
+                return;
+            };
+            ui.label(theme::muted(format!(
+                "This node's certificate fingerprint: {}…",
+                kmplify_node::router::cluster::short_fp(&identity.fingerprint)
+            )));
+            if view.cluster.is_clustered() {
+                ui.label(theme::muted(format!(
+                    "Cluster {}… · {} paired node(s)",
+                    &view.cluster.cluster_id[..8.min(view.cluster.cluster_id.len())],
+                    view.cluster.members.len()
+                )));
+                let mut remove: Option<String> = None;
+                for m in view.cluster.members.values() {
+                    ui.horizontal(|ui| {
+                        let online = view.nodes.get(&m.id).is_some_and(|n| n.online(now));
+                        let (r, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
+                        ui.painter().circle_filled(
+                            r.center(),
+                            4.0,
+                            if online { theme::OK } else { theme::TEXT_DIM },
+                        );
+                        ui.label(RichText::new(&m.name).strong().size(12.5));
+                        ui.label(theme::dim(format!(
+                            "{}… · {}…",
+                            &m.id[..8.min(m.id.len())],
+                            kmplify_node::router::cluster::short_fp(&m.fingerprint)
+                        )));
+                        if ui.small_button("remove").clicked() {
+                            remove = Some(m.id.clone());
+                        }
+                    });
+                }
+                if let Some(id) = remove {
+                    let mut r = router::lock(&self.shared);
+                    r.remove_member(&id);
+                    r.push_log(format!("removed {} from the cluster", &id[..8.min(id.len())]));
+                }
+            } else {
+                ui.label(theme::muted(
+                    "Not in a cluster. Invite another node, or join one with the PIN it shows.",
+                ));
+            }
+            ui.add_space(6.0);
+
+            // ---- invite
+            match &view.invite {
+                Some(inv) if !inv.expired() => {
+                    ui.horizontal(|ui| {
+                        ui.label(theme::muted("Invitation PIN"));
+                        ui.label(
+                            RichText::new(&inv.pin)
+                                .size(26.0)
+                                .strong()
+                                .color(theme::PRIMARY)
+                                .monospace(),
+                        );
+                        if let Some(me) = view.local() {
+                            ui.label(theme::muted(format!(
+                                "enter it on the other machine with this address: {}:{}",
+                                me.address,
+                                router::node_info_port()
+                            )));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(theme::dim(format!(
+                            "valid for {} more second(s), {} wrong attempt(s) so far",
+                            inv.remaining().as_secs(),
+                            inv.wrong_attempts
+                        )));
+                        if ui.small_button("cancel invitation").clicked() {
+                            router::lock(&self.shared).invite = None;
+                        }
+                    });
+                }
+                _ => {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("Invite a node").color(Color32::WHITE).strong())
+                                .fill(theme::PRIMARY),
+                        )
+                        .clicked()
+                    {
+                        let pin = router::lock(&self.shared).open_invite();
+                        self.notify(format!("invitation open: PIN {pin}"), theme::OK);
+                    }
+                }
+            }
+            ui.add_space(6.0);
+
+            // ---- join
+            ui.horizontal(|ui| {
+                ui.label(theme::muted("Join"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.join_addr)
+                        .hint_text("address of the inviting node")
+                        .desired_width(220.0),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.join_pin)
+                        .hint_text("PIN")
+                        .desired_width(70.0),
+                );
+                let can = self.join_rx.is_none()
+                    && !self.join_addr.trim().is_empty()
+                    && self.join_pin.trim().len() == 6;
+                if ui.add_enabled(can, egui::Button::new("Join")).clicked() {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    self.join_rx = Some(rx);
+                    let shared = self.shared.clone();
+                    let addr = self.join_addr.trim().to_string();
+                    let pin = self.join_pin.trim().to_string();
+                    let ctx = ui.ctx().clone();
+                    tokio::spawn(async move {
+                        let _ = tx.send(kmplify_node::router::cluster::join(shared, addr, pin).await);
+                        ctx.request_repaint();
+                    });
+                }
+                if self.join_rx.is_some() {
+                    ui.label(theme::muted("pairing…"));
+                }
+            });
+            if view.cluster.is_clustered() {
+                ui.add_space(4.0);
+                if ui.small_button("Leave cluster").clicked() {
+                    let mut r = router::lock(&self.shared);
+                    r.leave_cluster();
+                    r.push_log("left the cluster; every pin dropped");
+                }
+            }
+        });
     }
 }
 
@@ -1338,8 +1512,8 @@ impl GuiApp {
                      whole network's inventory.",
                 ));
                 for (label, port) in [
-                    ("Ollama-compatible", router::PROXY_OLLAMA_PORT),
-                    ("OpenAI-compatible", router::PROXY_OPENAI_PORT),
+                    ("Ollama-compatible", router::proxy_ollama_port()),
+                    ("OpenAI-compatible", router::proxy_openai_port()),
                 ] {
                     let url = format!("http://127.0.0.1:{port}");
                     ui.horizontal(|ui| {
@@ -1480,7 +1654,7 @@ impl GuiApp {
                 tokio::spawn(async move {
                     let url = format!(
                         "http://127.0.0.1:{}/v1/chat/completions",
-                        router::PROXY_OPENAI_PORT
+                        router::proxy_openai_port()
                     );
                     let result = async {
                         let resp = reqwest::Client::new()

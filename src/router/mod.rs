@@ -22,11 +22,13 @@
 //! and it is multicast on the local link, nothing more.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub mod cluster;
 pub mod discovery;
+pub mod listen;
 pub mod node_info;
 pub mod proxy;
 pub mod schedule;
@@ -46,12 +48,40 @@ pub const SERVICE_TYPE: &str = "_kmplify-node._tcp.local.";
 /// leave the screen rather than sit there looking routable.
 pub const PEER_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// Where the router's own surfaces listen. Chosen apart from the engines'
-/// defaults and from PAIR's `143xx` band so a machine running both is not
-/// a port fight.
+/// Where the router's own surfaces listen by default. Chosen apart from
+/// the engines' defaults and from PAIR's `143xx` band so a machine running
+/// both is not a port fight. `KMPLIFY_ROUTER_PORTS=info,ollama,openai`
+/// overrides all three, which is what lets two nodes share one machine for
+/// a test.
 pub const NODE_INFO_PORT: u16 = 14418;
 pub const PROXY_OLLAMA_PORT: u16 = 11440;
 pub const PROXY_OPENAI_PORT: u16 = 11441;
+
+fn ports() -> (u16, u16, u16) {
+    static P: std::sync::OnceLock<(u16, u16, u16)> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        let parsed: Option<Vec<u16>> = std::env::var("KMPLIFY_ROUTER_PORTS")
+            .ok()
+            .map(|s| s.split(',').map(|p| p.trim().parse::<u16>()).collect::<Result<_, _>>().ok())
+            .flatten();
+        match parsed.as_deref() {
+            Some([a, b, c]) => (*a, *b, *c),
+            _ => (NODE_INFO_PORT, PROXY_OLLAMA_PORT, PROXY_OPENAI_PORT),
+        }
+    })
+}
+
+pub fn node_info_port() -> u16 {
+    ports().0
+}
+
+pub fn proxy_ollama_port() -> u16 {
+    ports().1
+}
+
+pub fn proxy_openai_port() -> u16 {
+    ports().2
+}
 
 /// A GPU sample older than this is not evidence of anything; the scheduler
 /// treats the node as neutral rather than idle.
@@ -190,12 +220,19 @@ pub struct Node {
     pub metrics: Metrics,
     pub version: String,
     pub last_seen: Instant,
+    /// The cluster the node says it belongs to (its announcement or its
+    /// report), empty for none. Display only; trust is the pinned
+    /// certificate, never this string.
+    pub cluster_id: String,
     /// Queued plus running work the node itself reports, the scheduler's
     /// first input. Zero for this machine; its own jobs are counted live.
     pub reported_pending: u32,
     /// The proxy ports the node says it listens on, so a peer request goes
     /// where that node actually serves rather than to an assumed default.
     pub proxy_ports: (u16, u16),
+    /// Where its node-info answers: the default unless the node said
+    /// otherwise (a typed `host:port`, or the port it named when pairing).
+    pub info_port: u16,
     /// Peer polling: consecutive failures and when to try next. Healthy
     /// nodes are sampled every two seconds; failures back off to thirty.
     pub poll_failures: u32,
@@ -223,10 +260,24 @@ impl Node {
             metrics: Metrics::default(),
             version: String::new(),
             last_seen: now,
+            cluster_id: String::new(),
             reported_pending: 0,
-            proxy_ports: (PROXY_OLLAMA_PORT, PROXY_OPENAI_PORT),
+            proxy_ports: (proxy_ollama_port(), proxy_openai_port()),
+            info_port: node_info_port(),
             poll_failures: 0,
             next_poll: now,
+        }
+    }
+
+    /// Split a typed `host[:port]` into the card's address and info port.
+    pub fn parse_address(typed: &str) -> (String, u16) {
+        let t = typed.trim().trim_end_matches('/');
+        match t.rsplit_once(':') {
+            Some((host, port)) if !t.starts_with('[') && !host.contains(':') => match port.parse() {
+                Ok(p) => (host.to_string(), p),
+                Err(_) => (t.to_string(), node_info_port()),
+            },
+            _ => (t.to_string(), node_info_port()),
         }
     }
 
@@ -343,12 +394,25 @@ pub struct Router {
     pub log: VecDeque<String>,
     /// Discovery's own state, for the cluster screen: browsing, or why not.
     pub discovery: String,
-    /// Accept requests from other nodes on this network at the proxies.
-    /// On by default while the router runs; off makes this machine a
-    /// consumer of the cluster that serves nothing to it.
+    /// Accept requests from paired nodes at the proxies. On by default
+    /// while the router runs; off makes this machine a consumer of the
+    /// cluster that serves nothing to it.
     pub lan_ingress: bool,
     /// What the listeners report: bound, or why not.
     pub listeners: String,
+    /// Where cluster.json and the certificate live.
+    pub node_dir: PathBuf,
+    /// This node's certificate; None when it could not be minted, in which
+    /// case the peer surfaces stay plaintext-only and pairing is refused.
+    pub identity: Option<Arc<cluster::Identity>>,
+    pub cluster: cluster::ClusterFile,
+    /// The live pin set every TLS verifier consults.
+    pub pins: cluster::Pins,
+    pub tls_server: Option<Arc<rustls::ServerConfig>>,
+    /// An HTTP client that speaks the cluster's mutual TLS.
+    pub tls_client: Option<reqwest::Client>,
+    /// The invitation open on this node, if any.
+    pub invite: Option<cluster::Invite>,
 }
 
 pub const MAX_JOBS: usize = 500;
@@ -473,6 +537,7 @@ impl Router {
                     existing.engines = peer.engines;
                 }
                 existing.version = peer.version;
+                existing.cluster_id = peer.cluster_id;
                 existing.last_seen = peer.last_seen;
                 if existing.source == Source::Manual && peer.source == Source::Discovered {
                     // A typed address that then announces itself is simply a
@@ -515,8 +580,15 @@ pub fn lock(shared: &Shared) -> std::sync::MutexGuard<'_, Router> {
 }
 
 /// What this machine calls itself on the network. Display only; the id is
-/// the key.
+/// the key. `KMPLIFY_NODE_NAME` overrides the hostname, for a machine whose
+/// hostname is not what its owner calls it — or for two nodes on one box.
 pub fn hostname() -> String {
+    if let Ok(n) = std::env::var("KMPLIFY_NODE_NAME") {
+        let n = n.trim().to_string();
+        if !n.is_empty() {
+            return n;
+        }
+    }
     sysinfo::System::host_name()
         .map(|h| h.trim().to_string())
         .filter(|h| !h.is_empty())
@@ -565,14 +637,42 @@ pub fn new_shared(
     local.cpu_cores = cpu.logical_cores;
     local.ram_total_mb = crate::hostcpu::read_ram_total_mb_now();
     local.version = crate::version_string().to_string();
+    let cluster = cluster::ClusterFile::load(node_dir);
+    local.cluster_id = cluster.cluster_id.clone();
     let mut router = Router {
-        self_id: id,
+        self_id: id.clone(),
         lan_ingress: true,
+        node_dir: node_dir.to_path_buf(),
+        cluster,
         ..Default::default()
     };
     router.nodes.insert(local.id.clone(), local);
     router.discovery = "starting".into();
     router.listeners = "starting".into();
+    router.pins.set(router.cluster.fingerprints());
+    match cluster::Identity::load_or_create(node_dir, &id) {
+        Ok(identity) => {
+            let identity = Arc::new(identity);
+            match (
+                cluster::server_config(&identity, &router.pins),
+                cluster::tls_client(&identity, &router.pins),
+            ) {
+                (Ok(server), Ok(client)) => {
+                    router.tls_server = Some(server);
+                    router.tls_client = Some(client);
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    router.push_log(format!("cluster TLS unavailable: {e}"));
+                }
+            }
+            router.identity = Some(identity);
+        }
+        Err(e) => router.push_log(format!("no node certificate, pairing is off: {e}")),
+    }
+    if router.cluster.is_clustered() {
+        let n = router.cluster.members.len();
+        router.push_log(format!("in a cluster with {n} pinned node(s)"));
+    }
     Arc::new(Mutex::new(router))
 }
 
@@ -584,6 +684,7 @@ pub fn new_shared_for_tests(self_id: &str) -> Shared {
     let mut router = Router {
         self_id: self_id.to_string(),
         lan_ingress: true,
+        node_dir: std::env::temp_dir().join(format!("kmplify-router-test-{}", std::process::id())),
         ..Default::default()
     };
     router.nodes.insert(
@@ -616,8 +717,8 @@ pub fn spawn(shared: Shared, accel: crate::gpu::Backend) {
     tokio::spawn(telemetry::expire_peers(shared.clone()));
     tokio::spawn(node_info::serve(shared.clone()));
     tokio::spawn(node_info::poll_peers(shared.clone()));
-    tokio::spawn(proxy::serve(shared.clone(), proxy::Api::Ollama, PROXY_OLLAMA_PORT));
-    tokio::spawn(proxy::serve(shared.clone(), proxy::Api::OpenAi, PROXY_OPENAI_PORT));
+    tokio::spawn(proxy::serve(shared.clone(), proxy::Api::Ollama, proxy_ollama_port()));
+    tokio::spawn(proxy::serve(shared.clone(), proxy::Api::OpenAi, proxy_openai_port()));
     discovery::spawn(shared);
 }
 
@@ -750,6 +851,13 @@ mod tests {
             r.push_job(job(&i.to_string(), "p", JobState::Running, true));
         }
         assert_eq!(r.pending_for("p"), 6, "a burst dispatched here is reserved before the peer reports it");
+    }
+
+    #[test]
+    fn a_typed_address_may_carry_its_info_port() {
+        assert_eq!(Node::parse_address("10.0.0.5"), ("10.0.0.5".into(), NODE_INFO_PORT));
+        assert_eq!(Node::parse_address("10.0.0.5:24418/"), ("10.0.0.5".into(), 24418));
+        assert_eq!(Node::parse_address("spark.local:x"), ("spark.local:x".into(), NODE_INFO_PORT));
     }
 
     #[test]

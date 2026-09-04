@@ -420,8 +420,8 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
     {
         return Err("--json applies to `check`, `status`, `peers` and `engines`".into());
     }
-    if (cli.attach || cli.standalone) && cli.cmd != Cmd::Tui {
-        return Err("--attach and --standalone apply to `tui`".into());
+    if (cli.attach || cli.standalone) && !matches!(cli.cmd, Cmd::Tui | Cmd::Gui) {
+        return Err("--attach and --standalone apply to `tui` and `gui`".into());
     }
     let touches_settings = !cli.assignments.is_empty() || !cli.clear.is_empty() || cli.clear_all;
     if (touches_settings || cli.list) && cli.cmd != Cmd::Set {

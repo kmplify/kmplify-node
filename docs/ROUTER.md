@@ -46,16 +46,67 @@ Who may talk to the proxies is decided per connection:
 
 | Caller | Treatment |
 |---|---|
-| this machine, on loopback | routed anywhere on the network |
-| a node in this machine's directory, while *LAN ingress* is on | served by this node's own engine, never routed on |
-| anything else | `403` |
+| this machine, on loopback | routed anywhere in the cluster |
+| a paired node, over mutual TLS, while *LAN ingress* is on | served by this node's own engine, never routed on |
+| anything else — plaintext from the network included | `403` |
 
-"In the directory" means discovered over mDNS or added by address and
-answering node-info. Until pairing and mutual TLS land (phase 3) that list is
-the whole gate, and the node-info surface itself is plain HTTP readable by
-anything on the subnet — the same trade PAIR makes for its telemetry. Both
-facts are stated on the settings screen, which is also where LAN ingress is
-switched off to make a machine a pure consumer of the cluster.
+A request only ever goes *out* to a paired node too, over the same mutual
+TLS. The node-info surface follows a slightly different rule so that two
+strangers can find each other before they pair: while a node is in no
+cluster its report is plain HTTP readable by anything on the subnet (the
+trade PAIR makes for its telemetry); once it is in a cluster, only loopback
+and paired nodes over mutual TLS may read it. Pairing itself is plaintext,
+authenticated by the PIN. All of this is stated on the settings screen,
+which is also where LAN ingress is switched off to make a machine a pure
+consumer of the cluster.
+
+## Trust: certificates, pairing, mutual TLS
+
+Every node mints one self-signed certificate on first start
+(`<node dir>/router/node.crt.der`, `node.key.der`, owner-only) and keeps
+it: the fingerprint peers pin would change otherwise and every pairing
+would be undone. A **cluster** is the set of nodes that have pinned each
+other's fingerprints, in `router/cluster.json`, plus a cluster id and a
+tombstone list of nodes removed on purpose. There is no authority and no
+primary; membership is symmetric.
+
+**Pairing** (Settings → Cluster) is one machine showing a six-digit PIN and
+another typing it with the first machine's address:
+
+1. The joiner sends its certificate and a SPAKE2 message to
+   `POST /v1/pair` (plaintext, port 14418) on the inviter.
+2. The inviter, holding an open invitation, finishes the SPAKE2 exchange
+   under the PIN, answers with its own certificate and message, the cluster
+   id, and an HMAC over the transcript (both fingerprints and the cluster
+   id) under the agreed key.
+3. The joiner finishes the exchange, checks that HMAC — a wrong PIN on
+   either side gives a different key, so this is where a mismatch shows —
+   and sends its own HMAC.
+4. The inviter checks it, pins the joiner, and answers with the whole
+   member list; the joiner pins everyone. Each side opens a card for the
+   other at the address the exchange came from and polls it at once.
+
+SPAKE2 is what makes a six-digit PIN sufficient: a listener on the network
+gets nothing it can brute-force offline, and an active man in the middle
+gets one online guess per attempt. An invitation allows three wrong PINs
+and lasts five minutes, then closes. PAIR uses EAP-NOOB for the same step.
+
+**Mutual TLS** is then used on every peer surface. Each side presents its
+certificate and checks the other's fingerprint against its pins, nothing
+else: no CA, no hostname check, no clock. A node learns about members it
+did not pair with directly from any member's node-info report — accepted
+only when that report arrived over mutual TLS and names the same cluster,
+and never for a node on the tombstone list. Leave drops every pin; Remove
+drops one and tombstones it.
+
+One port carries both personalities: a connection whose first byte is
+`0x16` is a TLS handshake and goes to the acceptor, anything else is
+plaintext HTTP. The handler learns the caller's address and, for a pinned
+handshake, its node id, and decides from that.
+
+Two environment overrides exist for running two nodes on one machine (a
+test) or naming a machine: `KMPLIFY_ROUTER_PORTS=info,ollama,openai` and
+`KMPLIFY_NODE_NAME`.
 
 Everything the router puts on the network: hostname, node id, hardware,
 which engines answer and their model names, how busy the machine is, which
@@ -79,7 +130,7 @@ fabric worker paused is a purely on-premises cluster.
 | `ollama-proxy`, `lmstudio-proxy` (routing, owner failover, fan-out listings) | `router::proxy` | done |
 | `nvpair-job-scheduler` (pending + smoothed GPU pressure) | `router::schedule` | done |
 | `nvpair-workload-manager` (jobs replicated cluster-wide) | `Router::jobs`, carried in every node-info report and merged by id | done |
-| `nvpair-cluster-manager` + `eap-noob` (identity, PIN pairing, pinned certs, mTLS) | `router::cluster` | 3 |
+| `nvpair-cluster-manager` + `eap-noob` (identity, PIN pairing, pinned certs, mTLS) | `router::cluster` (SPAKE2 pairing, pinned-fingerprint verifiers) + `router::listen` (one port, two personalities) | done |
 | `nvpair-errors` | log ring + peer sync | local done · 3 |
 | `nvpair-ui-broker` (supervision, JSON-RPC relay) | not needed: one process, one `Router` behind a mutex | — |
 | `nvpair-tui` | `kmplify-node tui` gains the router screens | 3 |
@@ -190,9 +241,24 @@ second physical machine.
 
 ## Phase 3 — trust and lifecycle
 
-- Pairing with a six-digit PIN (PAIR uses EAP-NOOB), pinned self-signed leaf
-  certificates per node, mutual TLS on every peer surface but pairing and
-  telemetry, a cluster id, leave and remove.
+Done on this branch: pairing with a six-digit PIN over SPAKE2, one pinned
+self-signed certificate per node, mutual TLS on every peer surface but
+pairing, the cluster id, member replication through trusted reports, leave
+and remove with tombstones, and the cluster card in Settings.
+
+Verified with two nodes on one Windows machine (a second instance under
+`KMPLIFY_ROUTER_PORTS` and `KMPLIFY_NODE_NAME`, pointed at a dead gateway):
+an invitation on one, the PIN typed on the other; both ended with the
+other's fingerprint pinned and the same cluster id; each polled the other
+over mutual TLS and drew its live meters; `/v1/models` through one node's
+proxy listed both nodes as owners of every model, fetched from the peer
+over TLS; a chat completion routed and completed; a plaintext request from
+the LAN address to a proxy was refused with `403`, and so was a plaintext
+node-info read once the node was clustered. mDNS does not let two nodes on
+one host see each other, so that path used the address typed at pairing.
+
+Still to do:
+
 - Engine lifecycle: install, start, stop, update Ollama and LM Studio;
   adopt an instance the user started; model pulls with progress.
 - Terminal screens for the same, so a headless router is operated fully.

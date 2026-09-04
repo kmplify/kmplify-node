@@ -11,17 +11,16 @@
 //! and is returned as is. Streaming responses pass through untouched.
 //!
 //! Who may ask: the machine itself on loopback, and — while the operator
-//! leaves LAN ingress on — nodes that are in this machine's directory. A
-//! peer's request is **served, never re-routed**: it goes to this node's
-//! own engine or fails, so a request cannot chain through a third machine.
-//! Anything else on the network is refused. Until pairing and mutual TLS
-//! land (phase 3, docs/ROUTER.md) that directory check is the whole gate,
-//! which is why the router is opt-in and says so.
+//! leaves LAN ingress on — paired nodes over mutual TLS, whose certificate
+//! the handshake checked against this node's pins. A peer's request is
+//! **served, never re-routed**: it goes to this node's own engine or fails,
+//! so a request cannot chain through a third machine. Anything else,
+//! plaintext from the network included, is refused. And a request only
+//! ever goes *out* to a paired node, over the same mutual TLS.
 //!
 //! What is logged: model, engine, origin, destination, state, time. Never a
 //! prompt, never a response, and there is no flag that changes that.
 
-use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -30,6 +29,7 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode}
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 
+use super::listen::{self, PeerInfo};
 use super::{lock, schedule, Job, JobState, Shared};
 
 /// A request from a peer carries this so the receiving proxy serves it
@@ -87,31 +87,11 @@ pub async fn serve(shared: Shared, api: Api, port: u16) {
         .fallback(handle)
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(ctx);
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            let mut r = lock(&shared);
-            r.listeners = format!("{} proxy: cannot bind :{port}: {e}", api.name());
-            r.push_log(format!("{} proxy unavailable on :{port}: {e}", api.name()));
-            return;
-        }
+    let label = match api {
+        Api::Ollama => "ollama-compatible proxy",
+        Api::OpenAi => "openai-compatible proxy",
     };
-    {
-        let mut r = lock(&shared);
-        r.push_log(format!("{} proxy on :{port}", api.name()));
-        if r.listeners == "starting" || r.listeners.is_empty() {
-            r.listeners = "listening".into();
-        }
-    }
-    if let Err(e) = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    {
-        lock(&shared).push_log(format!("{} proxy stopped: {e}", api.name()));
-    }
+    listen::serve(shared, port, app, label).await;
 }
 
 fn client() -> &'static reqwest::Client {
@@ -130,15 +110,15 @@ fn client() -> &'static reqwest::Client {
 pub enum Caller {
     /// This machine: may be routed anywhere.
     Local,
-    /// A node in the directory: served here, never routed on.
+    /// A paired node, over mutual TLS: served here, never routed on.
     Peer,
     Refused,
 }
 
-pub fn classify(ip: IpAddr, lan_ingress: bool, directory: &[IpAddr]) -> Caller {
-    if ip.is_loopback() {
+pub fn classify(info: &PeerInfo, lan_ingress: bool) -> Caller {
+    if info.is_loopback() {
         Caller::Local
-    } else if lan_ingress && directory.contains(&ip) {
+    } else if lan_ingress && info.is_member() {
         Caller::Peer
     } else {
         Caller::Refused
@@ -164,23 +144,14 @@ fn is_listing(method: &Method, path: &str) -> bool {
 
 async fn handle(
     State(ctx): State<Ctx>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ConnectInfo(info): ConnectInfo<PeerInfo>,
     req: axum::http::Request<Body>,
 ) -> Response {
-    let caller = {
-        let r = lock(&ctx.shared);
-        let directory: Vec<IpAddr> = r
-            .nodes
-            .values()
-            .filter(|n| !n.is_local())
-            .filter_map(|n| n.address.parse().ok())
-            .collect();
-        classify(addr.ip(), r.lan_ingress, &directory)
-    };
+    let caller = classify(&info, lock(&ctx.shared).lan_ingress);
     if caller == Caller::Refused {
         return error(
             StatusCode::FORBIDDEN,
-            "this proxy serves the machine it runs on and the nodes it has paired with",
+            "this proxy serves the machine it runs on and, over mutual TLS, the nodes it has paired with",
         );
     }
     let (parts, body) = req.into_parts();
@@ -198,7 +169,8 @@ async fn handle(
     let path = parts.uri.path().to_string();
     let query = parts.uri.query().map(str::to_string);
 
-    if is_listing(&parts.method, &path) && !serve_here {
+    let listing = is_listing(&parts.method, &path);
+    if listing && !serve_here {
         return fan_out(&ctx, &path).await;
     }
 
@@ -210,10 +182,16 @@ async fn handle(
         let r = lock(&ctx.shared);
         let self_id = r.self_id.clone();
         let self_name = r.local().map(|n| n.name.clone()).unwrap_or_default();
+        // Only this machine and the nodes it has paired with can take a
+        // request: an unpaired node would refuse it anyway, and the
+        // routing decision should say so up front.
         let pool: Vec<&super::Node> = if serve_here {
             r.local().into_iter().collect()
         } else {
-            r.nodes.values().filter(|n| n.online(now)).collect()
+            r.nodes
+                .values()
+                .filter(|n| n.online(now) && (n.is_local() || r.is_member(&n.id)))
+                .collect()
         };
         let capable: Vec<String> = pool
             .iter()
@@ -242,11 +220,12 @@ async fn handle(
     if order.is_empty() {
         let what = match &model {
             Some(m) if serve_here => format!("this node does not serve {m}"),
-            Some(m) => format!("no node on this network serves {m}"),
-            None => "no engine on this network answers this API".to_string(),
+            Some(m) => format!("no paired node serves {m}"),
+            None => "no engine on this node or a paired one answers this API".to_string(),
         };
         return error(StatusCode::BAD_GATEWAY, &what);
     }
+    let tls_client = lock(&ctx.shared).tls_client.clone();
 
     let requested_from = origin.clone().unwrap_or_else(|| self_name.clone());
     let mut last_err = String::new();
@@ -255,7 +234,10 @@ async fn handle(
             continue;
         };
         let job_id = Job::new_id(&self_id);
-        {
+        // A model listing is bookkeeping, not work: a peer's fan-out lands
+        // here once per refresh and would fill the jobs column with
+        // entries nobody asked about.
+        if !listing {
             let mut r = lock(&ctx.shared);
             r.push_job(Job {
                 id: job_id.clone(),
@@ -271,9 +253,20 @@ async fn handle(
             });
         }
         let is_peer = node_id != self_id;
-        let mut upstream = client()
+        let http = if is_peer {
+            match &tls_client {
+                Some(c) => c,
+                // No certificate here means no way to reach a peer; the
+                // next candidate may be this machine.
+                None => continue,
+            }
+        } else {
+            client()
+        };
+        let mut upstream = http
             .request(parts.method.clone(), &target)
             .headers(forward_headers(&parts.headers))
+            .timeout(UPSTREAM_TOTAL)
             .body(body.clone());
         if is_peer {
             upstream = upstream
@@ -328,7 +321,7 @@ fn target_for(
             None => String::new(),
         };
         Some((
-            format!("http://{}:{port}{path}{q}", n.address),
+            format!("https://{}:{port}{path}{q}", n.address),
             engine,
             n.name.clone(),
         ))
@@ -410,29 +403,34 @@ impl Drop for JobGuard {
 /// own engines only.
 async fn fan_out(ctx: &Ctx, path: &str) -> Response {
     let now = Instant::now();
-    let targets: Vec<(String, String, bool)> = {
+    let (targets, self_name, tls_client) = {
         let r = lock(&ctx.shared);
-        let mut t = Vec::new();
+        let mut t: Vec<(String, String, bool)> = Vec::new();
         for n in r.nodes.values().filter(|n| n.online(now)) {
             if n.is_local() {
                 for e in n.running_engines().filter(|e| ctx.api.accepts(&e.id)) {
                     t.push((format!("{}{path}", e.base.trim_end_matches('/')), n.name.clone(), false));
                 }
-            } else if n.running_engines().any(|e| ctx.api.accepts(&e.id)) {
+            } else if r.is_member(&n.id) && n.running_engines().any(|e| ctx.api.accepts(&e.id)) {
                 let port = match ctx.api {
                     Api::Ollama => n.proxy_ports.0,
                     Api::OpenAi => n.proxy_ports.1,
                 };
-                t.push((format!("http://{}:{port}{path}", n.address), n.name.clone(), true));
+                t.push((format!("https://{}:{port}{path}", n.address), n.name.clone(), true));
             }
         }
-        t
+        (
+            t,
+            r.local().map(|n| n.name.clone()).unwrap_or_default(),
+            r.tls_client.clone(),
+        )
     };
-    let self_name = lock(&ctx.shared).local().map(|n| n.name.clone()).unwrap_or_default();
     let fetches = targets.into_iter().map(|(url, node, peer)| {
         let self_name = self_name.clone();
+        let tls_client = tls_client.clone();
         async move {
-            let mut req = client().get(&url).timeout(FANOUT_TIMEOUT);
+            let http = if peer { tls_client.as_ref()? } else { client() };
+            let mut req = http.get(&url).timeout(FANOUT_TIMEOUT);
             if peer {
                 req = req.header(HOP_HEADER, "1").header(ORIGIN_HEADER, self_name);
             }
@@ -504,13 +502,26 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn loopback_routes_peers_are_served_strangers_are_refused() {
-        let dir: Vec<IpAddr> = vec!["192.168.1.25".parse().unwrap()];
-        assert_eq!(classify("127.0.0.1".parse().unwrap(), true, &dir), Caller::Local);
-        assert_eq!(classify("::1".parse().unwrap(), false, &dir), Caller::Local);
-        assert_eq!(classify("192.168.1.25".parse().unwrap(), true, &dir), Caller::Peer);
-        assert_eq!(classify("192.168.1.25".parse().unwrap(), false, &dir), Caller::Refused);
-        assert_eq!(classify("192.168.1.99".parse().unwrap(), true, &dir), Caller::Refused);
+    fn loopback_routes_paired_nodes_are_served_everyone_else_is_refused() {
+        use crate::router::listen::TlsPeer;
+        let lan: std::net::SocketAddr = "192.168.1.25:4".parse().unwrap();
+        let local = PeerInfo { addr: "127.0.0.1:4".parse().unwrap(), tls: None };
+        let local6 = PeerInfo { addr: "[::1]:4".parse().unwrap(), tls: None };
+        let plain = PeerInfo { addr: lan, tls: None };
+        let member = PeerInfo {
+            addr: lan,
+            tls: Some(TlsPeer { node_id: "n".into(), fingerprint: "f".into() }),
+        };
+        let pinned_unlisted = PeerInfo {
+            addr: lan,
+            tls: Some(TlsPeer { node_id: String::new(), fingerprint: "f".into() }),
+        };
+        assert_eq!(classify(&local, true), Caller::Local);
+        assert_eq!(classify(&local6, false), Caller::Local);
+        assert_eq!(classify(&plain, true), Caller::Refused, "plaintext from the network is never served");
+        assert_eq!(classify(&member, true), Caller::Peer);
+        assert_eq!(classify(&member, false), Caller::Refused, "LAN ingress off");
+        assert_eq!(classify(&pinned_unlisted, true), Caller::Refused);
     }
 
     #[test]
