@@ -1,0 +1,11 @@
+kmplify-node (0.6.1-1) unstable; urgency=medium
+
+  * First Debian package. The binary with the desktop window (kmplify-node
+    gui), the desktop entry and icon, the systemd unit for a headless node
+    (installed, not enabled), the environment template and the docs.
+  * LAN router: mDNS discovery, PIN pairing with SPAKE2, mutual TLS between
+    paired nodes, Ollama- and OpenAI-compatible routing proxies on 11440 and
+    11441, node-info on 14418; one router per machine that every view attaches
+    to (gui, tui --router, run --router).
+
+ -- KMPLIFY <hallo@kmplify.de>  Sat, 05 Sep 2026 09:41:41 +0200

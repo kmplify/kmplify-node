@@ -1,0 +1,202 @@
+.TH KMPLIFY-NODE 1 "2026-09-05" "kmplify-node 0.6.1" "User Commands"
+.SH NAME
+kmplify-node \- lend a machine's GPU, CPU and local models to a KMPLIFY
+compute fabric
+.SH SYNOPSIS
+.B kmplify-node
+.RI [ run ]
+.RI [ options ]
+.br
+.B kmplify-node
+.I command
+.RI [ options ]
+.SH DESCRIPTION
+.B kmplify-node
+is the provider agent for the KMPLIFY Compute Fabric. It joins a fabric over
+one outbound connection, advertises the machine's hardware and the models its
+local inference engine serves, and delivers the jobs the fabric sends. Nothing
+listens on the network unless the LAN router is switched on.
+.PP
+The same binary carries a terminal dashboard
+.RB ( tui ),
+a desktop window
+.RB ( gui )
+and the LAN router, which turns the kmplify-nodes on one local network into a
+personal inference cluster.
+.SH COMMANDS
+.TP
+.BR run " [" \-\-router ]
+Join the fabric and serve, logging to standard output. This is the default
+when no command is given. With
+.B \-\-router
+also run the LAN router in this process.
+.TP
+.BR tui " [" \-\-router "] [" \-\-attach "|" \-\-standalone ]
+Live dashboard. Attaches to the node already running here and drives it, or
+starts one when none runs.
+.TP
+.BR gui " [" \-\-attach "|" \-\-standalone ]
+Desktop window: this node, the LAN router and the other nodes on this network.
+Attaches like
+.B tui
+does.
+.TP
+.BR check " [" \-\-json "] [" \-\-timeout " \fISECS\fR]"
+Preflight this host (engines, GPU, Docker), then exit.
+.TP
+.BR status " [" \-\-json ]
+One-shot report of the running node.
+.TP
+.B id
+Print this install's node id.
+.TP
+.BI set " KEY=VALUE" \|...
+Change what this machine lends, durably and without a restart.
+.B "set \-\-list"
+shows the keys,
+.B "set \-\-clear"
+.I KEY
+returns one to the environment's value.
+.TP
+.B init
+First-run wizard: engine, sharing, preflight.
+.TP
+.B engines
+Scan localhost for inference engines.
+.TP
+.BR peers " [" \fIVERB\fR " \|...]"
+Who may use this machine: list, approve, block, invite.
+.TP
+.B rewards
+Delivered work, and an optional payout companion.
+.TP
+.BR version ", " help
+Version with build stamp; this text.
+.SH OPTIONS
+.TP
+.B \-\-json
+Machine-readable output for
+.BR check ", " status " and " peers .
+.TP
+.BI \-\-timeout " SECS"
+Per-probe ceiling in
+.B check
+(default 5).
+.TP
+.B \-\-attach
+For
+.BR tui " and " gui :
+require a running node, never start one.
+.TP
+.B \-\-standalone
+For
+.BR tui " and " gui :
+run the node (and the router) in this process.
+.TP
+.B \-\-router
+For
+.BR run " and " tui :
+also run the LAN router.
+.TP
+.BR \-h ", " \-\-help
+Print the built-in help.
+.TP
+.BR \-V ", " \-\-version
+Version and build stamp.
+.PP
+Every configuration flag below sets the environment variable beside it; a
+flag overrides what a unit file sets:
+.BR \-\-gateway ", " \-\-ollama ", " \-\-colibri ", " \-\-node\-dir ", "
+.BR \-\-country ", " \-\-workloads ", " \-\-max\-cpus ", " \-\-max\-vram\-mb ", "
+.BR \-\-max\-ram\-mb ", " \-\-max\-disk\-gb ", " \-\-approval\-mode ", "
+.BR \-\-gpu\-backend ", " \-\-[no\-]share\-inference ", " \-\-[no\-]share\-cpu ", "
+.BR \-\-[no\-]functions ", " \-\-[no\-]share\-vectors .
+.SH ENVIRONMENT
+.TP
+.B PROVIDER_GATEWAY_URL
+URL of the fabric to join.
+.TP
+.B OLLAMA_BASE
+Local model server (Ollama, vLLM, LiteLLM, TGI). Default localhost.
+.TP
+.B COLIBRI_BASE
+Optional colibri gateway for frontier models.
+.TP
+.B KMPLIFY_NODE_DIR
+Identity, settings, status and control directory. Default
+.IR $XDG_CONFIG_HOME/kmplify-node ,
+falling back to
+.IR ~/.config/kmplify-node .
+.TP
+.B PROVIDER_COUNTRY
+ISO alpha-2 country declared to the fabric; empty means undeclared.
+.TP
+.B PROVIDER_WORKLOADS
+Template ids to host as container sessions.
+.TP
+.BR PROVIDER_MAX_CPUS ", " PROVIDER_MAX_VRAM_MB ", " PROVIDER_MAX_RAM_MB ", " PROVIDER_MAX_DISK_GB
+Ceilings on what sessions may use and on what is advertised.
+.TP
+.B PROVIDER_APPROVAL_MODE
+.BR auto " or " manual
+consumer admission.
+.TP
+.BR PROVIDER_SHARE_INFERENCE ", " PROVIDER_SHARE_CPU ", " PROVIDER_FUNCTIONS ", " PROVIDER_SHARE_VECTORS
+Switches for serving inference jobs (default on), lending CPU threads and RAM,
+hosting signed Wasm functions and hosting vector collections (default off).
+.TP
+.B KMPLIFY_GPU_BACKEND
+Force the accelerator:
+.BR cuda ", " rocm ", " oneapi ", " metal " or " cpu .
+.TP
+.B KMPLIFY_ROUTER_PORTS
+The router's ports as
+.IR info,ollama,openai
+(default 14418,11440,11441).
+.TP
+.B KMPLIFY_NODE_NAME
+The name the router announces (default: the hostname).
+.PP
+A malformed value is a startup error, never a silent fallback.
+.SH THE LAN ROUTER
+Opt-in per machine and off by default, because it is the one part of the
+program that listens on the network. It announces one
+.B _kmplify-node._tcp
+record on the local link and binds three ports:
+.B 14418
+(node-info, pairing, engine control),
+.B 11440
+(Ollama-compatible routing proxy) and
+.B 11441
+(OpenAI-compatible routing proxy). Pairing is a six-digit PIN authenticating
+a SPAKE2 exchange; paired nodes talk over mutual TLS pinned to each other's
+certificate fingerprints. Requests from this machine are routed anywhere in
+the cluster; paired nodes are served by this node's own engine; anything
+else is refused.
+.SH FILES
+.TP
+.I /usr/lib/systemd/system/kmplify-node.service
+Unit for a headless node, installed but not enabled. It runs as the
+.B kmplify
+user with
+.I /var/lib/kmplify-node
+as the node directory; see
+.IR /usr/share/doc/kmplify-node/docs/HEADLESS-NODE.md .
+.TP
+.I /etc/kmplify-node.env
+Environment for the unit; a template is at
+.IR /usr/share/doc/kmplify-node/kmplify-node.env.example .
+.TP
+.IR "<node dir>/status.json" ", " "<node dir>/control/"
+What the running node publishes and where a dashboard leaves its orders.
+.TP
+.IR "<node dir>/router.json" ", " "<node dir>/control/router/" ", " "<node dir>/router/"
+The router's published state, its orders, and its certificate and cluster.
+.SH SEE ALSO
+.IR /usr/share/doc/kmplify-node/README.md ,
+.IR /usr/share/doc/kmplify-node/docs/ROUTER.md ,
+.UR https://github.com/kmplify/kmplify-node
+the repository
+.UE .
+.SH LICENSE
+Apache License 2.0.

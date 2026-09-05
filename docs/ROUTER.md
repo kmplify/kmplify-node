@@ -385,7 +385,9 @@ job list both moved), after which the setting was put back.
 - **Debian/Ubuntu**: `[package.metadata.deb]` in `Cargo.toml` for
   `cargo deb`: the binary with the window, `packaging/kmplify-node.desktop`,
   the icon, the systemd unit (installed, not enabled: it runs as the
-  `kmplify` user the operator creates), the docs. Built for amd64 and arm64.
+  `kmplify` user the operator creates), the man page
+  (`packaging/kmplify-node.1`), the Debian changelog
+  (`packaging/debian/changelog`, one entry per version) and the docs. Built for amd64 and arm64.
 - **macOS**: `scripts/bundle-macos.sh` wraps the binary into
   `KMPLIFY Node.app` (a two-line launcher runs it with `gui`; the binary
   inside stays the full CLI), renders the `.icns` from

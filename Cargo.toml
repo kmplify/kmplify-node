@@ -170,6 +170,10 @@ wat = "1.243.0"
 [package.metadata.deb]
 name = "kmplify-node"
 maintainer = "KMPLIFY <hallo@kmplify.de>"
+# Debian-format changelog, gzipped into usr/share/doc/kmplify-node/. Its top
+# entry must carry the version below (lintian checks), so every version bump
+# here gets an entry there.
+changelog = "packaging/debian/changelog"
 copyright = "KMPLIFY"
 license-file = ["LICENSE", "0"]
 extended-description = """\
@@ -185,6 +189,7 @@ features = ["gui"]
 assets = [
     ["target/release/kmplify-node", "usr/bin/", "755"],
     ["packaging/kmplify-node.desktop", "usr/share/applications/", "644"],
+    ["packaging/kmplify-node.1", "usr/share/man/man1/", "644"],
     ["packaging/icons/kmplify-node.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
     ["packaging/kmplify-node.service", "usr/lib/systemd/system/", "644"],
     ["packaging/kmplify-node.env.example", "usr/share/doc/kmplify-node/", "644"],
