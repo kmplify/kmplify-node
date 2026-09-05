@@ -67,8 +67,10 @@ Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; Value
 Filename: "{app}\kmplify-node.exe"; Parameters: "gui"; Description: "Open KMPLIFY Node now"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-; A window hidden in the tray would otherwise keep the binary locked.
-Filename: "{sys}\taskkill.exe"; Parameters: "/IM kmplify-node.exe /F"; Flags: runhidden; RunOnceId: "stopnode"
+; A window hidden in the tray would otherwise keep the binary locked. Only
+; the processes running THIS install's binary: a node built from source
+; (cargo install) on the same machine is somebody else's and stays up.
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Get-Process kmplify-node -ErrorAction SilentlyContinue | Where-Object {{ $_.Path -like '{app}\*' }} | Stop-Process -Force"""; Flags: runhidden; RunOnceId: "stopnode"
 
 [Code]
 function NeedsAddPath(Param: string): boolean;
@@ -81,4 +83,26 @@ begin
     exit;
   end;
   Result := Pos(';' + Uppercase(Param) + ';', ';' + Uppercase(OrigPath) + ';') = 0;
+end;
+
+// The PATH entry the addtopath task appended is removed again on
+// uninstall; Inno does not undo an expandsz append by itself.
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Path, App: string;
+  P: Integer;
+begin
+  if CurUninstallStep = usPostUninstall then
+  begin
+    if RegQueryStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', Path) then
+    begin
+      App := ';' + ExpandConstant('{app}');
+      P := Pos(Uppercase(App), Uppercase(Path));
+      if P > 0 then
+      begin
+        Delete(Path, P, Length(App));
+        RegWriteExpandStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', Path);
+      end;
+    end;
+  end;
 end;
