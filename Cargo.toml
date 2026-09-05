@@ -169,7 +169,7 @@ wat = "1.243.0"
 # not start lending before its settings exist.
 [package.metadata.deb]
 name = "kmplify-node"
-maintainer = "KMPLIFY"
+maintainer = "KMPLIFY <hallo@kmplify.de>"
 copyright = "KMPLIFY"
 license-file = ["LICENSE", "0"]
 extended-description = """\
@@ -186,7 +186,7 @@ assets = [
     ["target/release/kmplify-node", "usr/bin/", "755"],
     ["packaging/kmplify-node.desktop", "usr/share/applications/", "644"],
     ["packaging/icons/kmplify-node.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
-    ["packaging/kmplify-node.service", "lib/systemd/system/", "644"],
+    ["packaging/kmplify-node.service", "usr/lib/systemd/system/", "644"],
     ["packaging/kmplify-node.env.example", "usr/share/doc/kmplify-node/", "644"],
     ["README.md", "usr/share/doc/kmplify-node/", "644"],
     ["NOTICE", "usr/share/doc/kmplify-node/", "644"],
