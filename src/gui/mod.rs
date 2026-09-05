@@ -111,6 +111,7 @@ pub async fn main(
     // other workers keep the samplers and the fabric worker running
     // meanwhile; block_in_place tells tokio this thread is gone for a while
     // so it does not wait on it.
+    #[cfg(any(windows, target_os = "macos"))]
     let tray_title = title.clone();
     let result = tokio::task::block_in_place(|| {
         eframe::run_native(
@@ -309,6 +310,7 @@ struct GuiApp {
     #[cfg(any(windows, target_os = "macos"))]
     tray: Option<tray::Tray>,
     /// Set by the tray's Quit: the next close request is a real one.
+    #[cfg(any(windows, target_os = "macos"))]
     quit: bool,
     /// Whether the window is hidden in the tray right now.
     hidden: bool,
@@ -360,6 +362,7 @@ impl GuiApp {
             join_pin: String::new(),
             #[cfg(any(windows, target_os = "macos"))]
             tray: None,
+            #[cfg(any(windows, target_os = "macos"))]
             quit: false,
             hidden: false,
             autostart: autostart::enabled(),
@@ -368,6 +371,7 @@ impl GuiApp {
 
     /// Does closing this window stop something? True when the node or the
     /// router runs in this process rather than being attached to.
+    #[cfg(any(windows, target_os = "macos"))]
     fn hosts_something(&self) -> bool {
         !self.attached || !self.handle.attached()
     }

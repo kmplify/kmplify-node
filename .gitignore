@@ -17,3 +17,6 @@ fabric_node.json
 # here is the source that produces it.
 /functions/*/target
 /functions/dist
+
+# Local packaging output (cargo deb --output out/, scripts/bundle-macos.sh).
+/out
