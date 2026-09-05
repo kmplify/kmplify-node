@@ -32,6 +32,29 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(10);
 /// Session error that means "the operator asked for this": reconnect at once
 /// and say nothing alarming, rather than logging a lost connection and
 /// sitting out the backoff.
+/// The gateway's close code 4003 means a second process connected with this
+/// node's identity (docs/PROTOCOL.md): the two evict each other for as long
+/// as both run, so the message names the cure rather than the symptom.
+pub const SUPERSEDED_CLOSE_CODE: u16 = 4003;
+
+fn describe_close(frame: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame>) -> String {
+    match frame {
+        Some(f) if u16::from(f.code) == SUPERSEDED_CLOSE_CODE => {
+            "another process connected with this node's identity and took the link over (gateway close 4003) — two kmplify-nodes are running from one node directory; stop one of them, or give it its own KMPLIFY_NODE_DIR"
+                .to_string()
+        }
+        Some(f) => {
+            let reason = f.reason.trim();
+            if reason.is_empty() {
+                format!("gateway closed the connection ({})", u16::from(f.code))
+            } else {
+                format!("gateway closed the connection ({}: {reason})", u16::from(f.code))
+            }
+        }
+        None => "connection closed".to_string(),
+    }
+}
+
 const RECONNECT_REQUESTED: &str = "reconnect requested";
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// The gateway pings every 10s, so a healthy link is never silent for long.
@@ -4345,7 +4368,16 @@ async fn session(
                 last_rx = tokio::time::Instant::now();
                 let Some(msg) = msg else { break Err("connection closed".into()) };
                 let msg = match msg { Ok(m) => m, Err(e) => break Err(e.to_string()) };
-                let Message::Text(text) = msg else { continue };
+                // A close frame says WHY the gateway hung up, and the one
+                // reason an operator can act on is 4003: another process
+                // presented this node's identity and took the link over.
+                // Reported as such rather than as a bare "connection closed"
+                // followed by an endless reconnect duel.
+                let text = match msg {
+                    Message::Text(t) => t,
+                    Message::Close(frame) => break Err(describe_close(frame.as_ref())),
+                    _ => continue,
+                };
                 let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue };
                 match frame["type"].as_str() {
                     Some("ping") => {

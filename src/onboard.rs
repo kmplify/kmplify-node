@@ -742,6 +742,13 @@ async fn walk(io: &Io, cfg: &WorkerConfig, dir: &std::path::Path) -> Result<i32,
     println!("   {}", io.dim("preflight…"));
     let mut effective = cfg.clone();
     stored.apply(&mut effective);
+    // main() skips hardware detection for `init` (the wizard probes on its
+    // own at step 1), so the config it handed over still says cpu. The
+    // preflight and the node started below must advertise what step 1 found,
+    // or every CUDA template is warned about and the node lends a 4090 as
+    // a CPU box.
+    effective.accelerator = accel;
+    effective.cuda = accel == gpu::Backend::Cuda;
     // The worker's own log lines belong in journald, not in the middle of a
     // conversation; the ring still records them.
     kmplify_node::status::set_quiet(true);
@@ -779,6 +786,34 @@ async fn walk(io: &Io, cfg: &WorkerConfig, dir: &std::path::Path) -> Result<i32,
             io.dim("saved anyway — fix the above, then `kmplify-node check`")
         );
         return Ok(1);
+    }
+
+    // A node already lending from this directory re-reads the settings file
+    // on its next session; nudge it and stop here. Starting a second one
+    // would present the same identity, and the gateway keeps one connection
+    // per node: the two would evict each other every few seconds.
+    if let Some(live) = kmplify_node::status::other_node_running(dir) {
+        match kmplify_node::control::request(dir, &kmplify_node::control::Command::Reload) {
+            Ok(()) => println!(
+                "   {}",
+                io.good(&format!(
+                    "a node is already lending from here (pid {}) — it re-advertises these settings within a second; nothing to start",
+                    live.pid
+                ))
+            ),
+            Err(e) => println!(
+                "   {}",
+                io.warn(&format!(
+                    "a node is already lending from here (pid {}) but could not be told ({e}); restart it to apply these settings",
+                    live.pid
+                ))
+            ),
+        }
+        println!(
+            "   {}",
+            io.dim("watch it with `kmplify-node tui` or `kmplify-node gui`")
+        );
+        return Ok(0);
     }
 
     if io.ask_yn("start lending now?", true)? {

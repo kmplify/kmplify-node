@@ -1480,6 +1480,19 @@ impl Node {
 
 /// Join the fabric and serve until told to stop. Returns the exit code.
 async fn serve(cfg: WorkerConfig, dir: PathBuf, router: bool, gpus: Vec<gpu::Gpu>) -> i32 {
+    // One node per node directory. A second process would present the same
+    // identity, and the gateway keeps one connection per node, so the two
+    // would evict each other every few seconds and lend nothing between
+    // them. A stale status.json (the previous node crashed) is not fresh
+    // and does not count.
+    if let Some(live) = status::other_node_running(&dir) {
+        eprintln!(
+            "[kmplify-node] a node is already running from {} (pid {}). Attach to it with `kmplify-node tui` or `kmplify-node gui`, stop it first, or give this one its own KMPLIFY_NODE_DIR.",
+            dir.display(),
+            live.pid
+        );
+        return 1;
+    }
     println!("[kmplify-node] joining {}", cfg.gateway_url);
     let accel = cfg.accel();
     let node = start_node(cfg, dir.clone()).await;

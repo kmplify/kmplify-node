@@ -754,6 +754,25 @@ pub fn read_published_result(node_dir: &Path) -> std::io::Result<Option<Snapshot
     }
 }
 
+/// Is ANOTHER process publishing from this directory right now?
+///
+/// The file is rewritten once a second by whoever publishes, and a read
+/// that lands mid-replace fails (or parses as nothing) for a moment,
+/// which on Windows is easy to hit with two writers. One transient miss
+/// must not turn into a second node with the same identity, so the read
+/// is tried a few times before "nobody is running here" is believed.
+pub fn other_node_running(node_dir: &Path) -> Option<Snapshot> {
+    for attempt in 0..5 {
+        match read_published_result(node_dir) {
+            Ok(Some(s)) if s.is_fresh() && s.pid != std::process::id() => return Some(s),
+            Ok(Some(_)) => return None,
+            Ok(None) if attempt == 0 && !status_path(node_dir).exists() => return None,
+            _ => std::thread::sleep(Duration::from_millis(120)),
+        }
+    }
+    None
+}
+
 /// Remove a stale `status.json` on a clean exit, so the next reader is not
 /// told a node is running when none is.
 pub fn clear_published(node_dir: &Path) {
