@@ -187,7 +187,11 @@ kmplify-nodes on one local network into a personal inference cluster with a \
 desktop window (kmplify-node gui) or a terminal dashboard (kmplify-node tui)."""
 section = "net"
 priority = "optional"
-depends = "$auto, libgl1"
+# $auto finds only what is linked (libc6). The window toolkit loads the
+# display libraries with dlopen at runtime, so they are named here: what
+# `strings` on the gui binary shows it opening, one Debian package each.
+# Both display servers are listed because the toolkit picks at runtime.
+depends = "$auto, libgl1, libegl1, libxkbcommon0, libxkbcommon-x11-0, libx11-6, libx11-xcb1, libxcb1, libxcursor1, libxi6, libxrender1, libwayland-client0, libwayland-egl1"
 recommends = "docker.io | docker-ce"
 features = ["gui"]
 assets = [
