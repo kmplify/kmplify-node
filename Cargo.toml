@@ -174,8 +174,12 @@ maintainer = "KMPLIFY <hallo@kmplify.de>"
 # entry must carry the version below (lintian checks), so every version bump
 # here gets an entry there.
 changelog = "packaging/debian/changelog"
-copyright = "KMPLIFY"
-license-file = ["LICENSE", "0"]
+# cargo-deb writes usr/share/doc/kmplify-node/copyright itself and appends
+# license-file below its header. Handing it LICENSE embedded the whole Apache
+# text, which lintian rejects; Debian wants the short grant plus a pointer to
+# /usr/share/common-licenses/Apache-2.0, which is what this file is.
+copyright = "2026 KMPLIFY"
+license-file = ["packaging/debian/copyright-license", "0"]
 extended-description = """\
 Provider agent for the KMPLIFY Compute Fabric: lends a machine's GPU, CPU and \
 locally served models to a fabric over one outbound connection, and turns the \
