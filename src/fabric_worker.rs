@@ -1205,6 +1205,129 @@ async fn docker_ok() -> bool {
     )
 }
 
+/// Container runtimes this Docker daemon can run a session under (protocol
+/// v3.5). "container" is plain docker and always present; "gvisor" is
+/// advertised only when `runsc` is registered as a runtime, because the
+/// gateway will only ever schedule a template that REQUIRES that level here
+/// if we say so, and saying so falsely would run it in a plain container.
+async fn docker_runtimes() -> Vec<String> {
+    let probe = crate::proc::command("docker")
+        .args(["info", "--format", "{{json .Runtimes}}"])
+        .output();
+    match tokio::time::timeout(DOCKER_PROBE_TIMEOUT, probe).await {
+        Ok(Ok(o)) if o.status.success() => runtimes_from_info(&String::from_utf8_lossy(&o.stdout)),
+        _ => vec!["container".to_string()],
+    }
+}
+
+/// Pure parser behind `docker_runtimes`: the `.Runtimes` JSON object's keys.
+pub fn runtimes_from_info(json_text: &str) -> Vec<String> {
+    let mut out = vec!["container".to_string()];
+    if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(json_text.trim()) {
+        if map.contains_key("runsc") {
+            out.push("gvisor".to_string());
+        }
+    }
+    out
+}
+
+/// Sandbox level a `workload_start` asks for (protocol v3.5). Absent means
+/// plain container, exactly the pre-v3.5 meaning; unknown names fail closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Isolation {
+    Container,
+    Gvisor,
+    Microvm,
+}
+
+impl Isolation {
+    pub fn from_frame(v: Option<&str>) -> Option<Self> {
+        match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("container") => Some(Self::Container),
+            Some("gvisor") => Some(Self::Gvisor),
+            Some("microvm") => Some(Self::Microvm),
+            Some(_) => None,
+        }
+    }
+}
+
+/// Docker label every session container carries, so an orphan sweep can
+/// tell THIS node's containers from a sibling worker's on the same machine
+/// (the desktop app and a headless node coexist by design).
+const NODE_LABEL: &str = "kmplify.fabric.node";
+
+static NODE_LABEL_VALUE: std::sync::OnceLock<Mutex<String>> = std::sync::OnceLock::new();
+
+async fn set_node_label(node_id: &str) {
+    let cell = NODE_LABEL_VALUE.get_or_init(|| Mutex::new(String::new()));
+    *cell.lock().await = node_id[..8.min(node_id.len())].to_string();
+}
+
+async fn node_label() -> String {
+    match NODE_LABEL_VALUE.get() {
+        Some(cell) => cell.lock().await.clone(),
+        None => String::new(),
+    }
+}
+
+/// Which of the containers docker lists under our label are orphans: named
+/// like a session container, not a prefetch helper, and not a session this
+/// process knows. Pure, so it is testable without docker.
+pub fn orphan_names(listed: &[String], live: &[String]) -> Vec<String> {
+    listed
+        .iter()
+        .filter(|n| n.starts_with("kmplify-fabric-"))
+        .filter(|n| !n.starts_with("kmplify-fabric-prefetch-"))
+        .filter(|n| !live.iter().any(|l| l == *n))
+        .cloned()
+        .collect()
+}
+
+/// Remove session containers a previous incarnation of THIS node left
+/// behind. `cleanup_sessions` runs on every exit path of the connection
+/// loop, but a SIGKILLed worker never reaches it, and the container then
+/// holds the provider's GPU with nobody coming back for it. Scoped by label
+/// so a sibling worker on the same machine is never reaped; containers from
+/// builds predating the label are left alone (documented manual repair).
+async fn sweep_orphans(sessions: &Sessions) {
+    let label = node_label().await;
+    if label.is_empty() {
+        return;
+    }
+    let out = crate::proc::command("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("label={NODE_LABEL}={label}"),
+            "--format",
+            "{{.Names}}",
+        ])
+        .output()
+        .await;
+    let Ok(out) = out else { return };
+    if !out.status.success() {
+        return;
+    }
+    let listed: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let live: Vec<String> = sessions
+        .lock()
+        .await
+        .values()
+        .map(|(n, _)| n.clone())
+        .collect();
+    for name in orphan_names(&listed, &live) {
+        match remove_container(&name).await {
+            Ok(()) => log(format!("removed orphaned session container {name}")),
+            Err(e) => log(format!("could not remove orphaned container {name}: {e}")),
+        }
+    }
+}
+
 /// What this node offers as container sessions.
 ///
 /// Gated on a live Docker daemon. Advertising templates while Docker is down
@@ -1220,10 +1343,14 @@ fn workload_capability(
     disk_used_mb: Option<u64>,
     images: &[String],
     inventory_error: Option<&str>,
+    runtimes: &[String],
 ) -> Value {
     let usable = docker_ok && !cfg.workload_templates.is_empty();
     let accel = cfg.accel();
     let mut caps = json!({
+        // Protocol v3.5: sandbox levels this daemon can run a session under.
+        // Plain "container" always; "gvisor" only when runsc is installed.
+        "runtimes": if usable { runtimes.to_vec() } else { vec!["container".to_string()] },
         "enabled": usable,
         // Legacy shape: gateways predating multi-vendor read only this, and
         // for them "GPU" has always meant CUDA. Keep it exactly that narrow
@@ -2881,6 +3008,51 @@ async fn start_workload(
         }
     }
 
+    // Protocol v3.5: the sandbox level the template needs. Refused, never
+    // downgraded: a gateway asking for gVisor on a node without runsc gets
+    // an error, not a plain container wearing the wrong label.
+    let isolation = match Isolation::from_frame(frame["isolation"].as_str()) {
+        Some(i) => i,
+        None => {
+            workload_status(
+                &sink,
+                &session,
+                "error",
+                &format!(
+                    "template requires isolation {:?}, which this node does not understand",
+                    frame["isolation"].as_str().unwrap_or("")
+                ),
+            )
+            .await;
+            return;
+        }
+    };
+    match isolation {
+        Isolation::Container => {}
+        Isolation::Gvisor => {
+            if !docker_runtimes().await.iter().any(|r| r == "gvisor") {
+                workload_status(
+                    &sink,
+                    &session,
+                    "error",
+                    "template requires gvisor isolation but runsc is not a runtime on this node",
+                )
+                .await;
+                return;
+            }
+        }
+        Isolation::Microvm => {
+            workload_status(
+                &sink,
+                &session,
+                "error",
+                "template requires microvm isolation, which this node does not offer",
+            )
+            .await;
+            return;
+        }
+    }
+
     let name = container_name(&session);
     // Settled here rather than at `docker run` because the session is
     // announced below and the owner is shown what it holds from that moment:
@@ -3088,7 +3260,14 @@ async fn start_workload(
         "512".into(),
         "-p".into(),
         format!("127.0.0.1:0:{port}"),
+        // Protocol v3.5: owned-by label for the startup orphan sweep.
+        "--label".into(),
+        format!("{NODE_LABEL}={}", node_label().await),
     ];
+    if isolation == Isolation::Gvisor {
+        args.push("--runtime".into());
+        args.push("runsc".into());
+    }
     // Protocol v3.2. `--network none` leaves the container loopback only: it
     // cannot reach the provider's LAN, cannot call home, cannot exfiltrate
     // what it was given. Most of the catalog cannot run this way because it
@@ -4060,6 +4239,16 @@ async fn session(
     // capability it cannot honour. Safe to block here — nothing is connected
     // yet, so there is no read loop to stall.
     let docker_live = docker_ok().await;
+    let runtimes_live = if docker_live {
+        docker_runtimes().await
+    } else {
+        vec!["container".to_string()]
+    };
+    set_node_label(&creds.node_id).await;
+    if docker_live {
+        // Containers a killed predecessor of this node left holding the GPU.
+        sweep_orphans(&sessions_cell().clone()).await;
+    }
     let (disk_live, images_live, inventory_err) = sample_inventory().await;
     if let Some(e) = &inventory_err {
         log(format!("inventory unavailable at connect: {e}"));
@@ -4087,7 +4276,7 @@ async fn session(
         "engines": engines,
         "gpu": gpu_info(cfg.accel(), cfg.max_shared_vram_mb).await,
         "workloads": workload_capability(
-            cfg, docker_live, disk_live, &images_live, inventory_err.as_deref(),
+            cfg, docker_live, disk_live, &images_live, inventory_err.as_deref(), &runtimes_live,
         ),
         // Which build is this? Compiled in, so it cannot disagree with what
         // was installed. Costs one field and removes a whole class of
@@ -4488,7 +4677,7 @@ async fn session(
                                 "type": "workloads",
                                 "workloads": workload_capability(
                                     cfg, docker_now, snapshot.0, &snapshot.1,
-                                    snapshot.2.as_deref(),
+                                    snapshot.2.as_deref(), &runtimes_live,
                                 ),
                             });
                             if let Err(e) = sink.lock().await.send(Message::Text(frame.to_string())).await {
@@ -5780,5 +5969,52 @@ mod model_manifest_tests {
         assert_eq!(pct(0, 0), 100.0);
         assert_eq!(pct(5, 10), 50.0);
         assert_eq!(pct(20, 10), 100.0); // a file larger than declared never overflows the bar
+    }
+}
+
+#[cfg(test)]
+mod isolation_and_sweep_tests {
+    use super::{orphan_names, runtimes_from_info, Isolation};
+
+    #[test]
+    fn runtimes_are_read_from_docker_info_and_container_is_always_first() {
+        assert_eq!(runtimes_from_info(""), vec!["container"]);
+        assert_eq!(runtimes_from_info("not json"), vec!["container"]);
+        let plain = r#"{"io.containerd.runc.v2":{"path":"runc"},"runc":{"path":"runc"}}"#;
+        assert_eq!(runtimes_from_info(plain), vec!["container"]);
+        let with_runsc = r#"{"runc":{"path":"runc"},"runsc":{"path":"/usr/local/bin/runsc"}}"#;
+        assert_eq!(runtimes_from_info(with_runsc), vec!["container", "gvisor"]);
+    }
+
+    #[test]
+    fn isolation_absent_means_container_and_unknown_fails_closed() {
+        assert_eq!(Isolation::from_frame(None), Some(Isolation::Container));
+        assert_eq!(Isolation::from_frame(Some("")), Some(Isolation::Container));
+        assert_eq!(
+            Isolation::from_frame(Some("container")),
+            Some(Isolation::Container)
+        );
+        assert_eq!(
+            Isolation::from_frame(Some("GVisor")),
+            Some(Isolation::Gvisor)
+        );
+        assert_eq!(
+            Isolation::from_frame(Some("microvm")),
+            Some(Isolation::Microvm)
+        );
+        assert_eq!(Isolation::from_frame(Some("firecracker")), None);
+    }
+
+    #[test]
+    fn orphan_sweep_only_reaps_session_containers_this_process_does_not_own() {
+        let listed = vec![
+            "kmplify-fabric-aaaa".to_string(),
+            "kmplify-fabric-bbbb".to_string(),
+            "kmplify-fabric-prefetch-cccc".to_string(),
+            "unrelated".to_string(),
+        ];
+        let live = vec!["kmplify-fabric-bbbb".to_string()];
+        assert_eq!(orphan_names(&listed, &live), vec!["kmplify-fabric-aaaa"]);
+        assert!(orphan_names(&[], &live).is_empty());
     }
 }

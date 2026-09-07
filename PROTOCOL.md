@@ -421,3 +421,30 @@ before and the app reports its own missing files.
 
 Still on the optimization path: an optional P2P data channel (WebRTC/QUIC)
 for heavy image/video traffic.
+
+## Protocol v3.5 — isolation levels, runtimes, owned-by label
+
+- The hello's `workloads` block carries `runtimes`: the sandbox levels this
+  Docker daemon can run a session under. `"container"` (plain docker) is
+  always present; `"gvisor"` is added only when `runsc` is registered as a
+  Docker runtime on the host (`docker info` `.Runtimes`); `"microvm"` is
+  reserved. The gateway only schedules a template whose `isolation` is
+  stronger than `container` onto a node that advertised that level.
+- `workload_start` may carry `isolation` (`container` | `gvisor` |
+  `microvm`; absent = `container`). The node refuses, never downgrades: a
+  `gvisor` request without runsc answers `workload_status: error`; an
+  unknown name fails closed; `microvm` is refused by this build. A `gvisor`
+  session runs with `--runtime runsc` on top of every existing hardening
+  flag.
+- Every session container carries the Docker label
+  `kmplify.fabric.node=<8-char node id>`. On connect, before the hello, the
+  node lists containers under its own label and removes any session
+  container it does not know (a predecessor of this node that was
+  SIGKILLed never reached `cleanup_sessions`). Containers of a sibling
+  worker on the same machine carry a different label and are untouched;
+  containers from builds predating the label are left alone and remain a
+  manual repair.
+- Operator facts (peer/managed, operator, region) are set by the gateway's
+  deployer through its admin API and are never part of this protocol's
+  node-side frames: a node cannot declare itself KMPLIFY-managed.
+
