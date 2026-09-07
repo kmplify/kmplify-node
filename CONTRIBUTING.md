@@ -45,6 +45,13 @@ kmplify-node check   # resolves config and probes, connects to nothing
 CI runs `fmt`, `clippy -D warnings` and `test` on Linux, macOS and Windows.
 Keep it green.
 
+`make help` lists the same commands as make targets, plus spin-up targets
+that run a dev node out of `./.kmplify-node` (never your real node directory)
+against a local gateway: `make ci` is everything CI checks, `make router`,
+`make tui-router` and `make gui` are the three views of one router, and
+`make node-a` / `make node-b` are two routers on one machine for pairing
+and routing tests. Packaging is `make package`.
+
 Tests should be able to run on a laptop with no GPU and no Docker. The rules
 worth testing here (image pins, volume shapes, clamps, telemetry maths) are all
 pure functions on purpose. Keep them that way.
