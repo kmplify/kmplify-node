@@ -8,6 +8,12 @@
 use std::path::Path;
 use std::process::Command;
 
+/// The paths whose contents reach the binary: the crate's sources, its
+/// manifests, this script, and NOTICE, which `src/lib.rs` embeds with
+/// `include_str!`. Everything else in the repository can be edited without
+/// changing a single byte of the output, so it must not flip the stamp.
+const BUILD_INPUTS: [&str; 5] = ["Cargo.toml", "Cargo.lock", "build.rs", "src", "NOTICE"];
+
 fn main() {
     // Emitting ANY rerun-if directive replaces Cargo's default "rerun when
     // any file in the package changed" — rerun-if-env-changed included,
@@ -43,7 +49,7 @@ fn main() {
     // worktree or submodule .git is a FILE, and declaring a path that never
     // exists made cargo rerun the script every single build, which is the
     // trap the old always-default behaviour fell into from the other side.
-    if let Some(gitdir) = git(&dir, &["rev-parse", "--absolute-git-dir"]) {
+    if let Some(gitdir) = git(&dir, &["rev-parse", "--absolute-git-dir"], &[]) {
         let head = Path::new(&gitdir).join("HEAD");
         if head.exists() {
             println!("cargo:rerun-if-changed={}", head.display());
@@ -51,7 +57,7 @@ fn main() {
         // The branch ref HEAD names advances on every commit. It can be
         // missing as a loose file (packed refs after a gc) — committing
         // recreates it, and the HEAD/source watches cover until then.
-        if let Some(refname) = git(&dir, &["symbolic-ref", "-q", "HEAD"]) {
+        if let Some(refname) = git(&dir, &["symbolic-ref", "-q", "HEAD"], &[]) {
             let r = Path::new(&gitdir).join(&refname);
             if r.exists() {
                 println!("cargo:rerun-if-changed={}", r.display());
@@ -59,22 +65,33 @@ fn main() {
         }
     }
 
-    let Some(short) = git(&dir, &["rev-parse", "--short", "HEAD"]) else {
+    let Some(short) = git(&dir, &["rev-parse", "--short", "HEAD"], &[]) else {
         return;
     };
     // An uncommitted tree matches no commit at all, so say so rather than
     // claiming the commit it was branched from.
-    let dirty = match git(&dir, &["status", "--porcelain"]) {
+    //
+    // Only the files this binary is COMPILED FROM count. A whole-tree
+    // `git status` is wrong wherever the build sees a partial checkout of
+    // the repository: packaging/Dockerfile.node-build copies exactly these
+    // paths plus .git into the image, so git found the other 38 tracked
+    // files "deleted" and every containerised build stamped -dirty on a
+    // pristine commit (seen on the EX44 node: 0.6.1+1d40365-dirty from a
+    // tree with nothing modified). A stamp nobody can trust is worse than
+    // no stamp, because "which build is that peer running" is answered
+    // from it. Editing a README genuinely does not change the binary.
+    let dirty = match git(&dir, &["status", "--porcelain", "--"], &BUILD_INPUTS) {
         Some(s) if !s.is_empty() => "-dirty",
         _ => "",
     };
     println!("cargo:rustc-env=KMPLIFY_BUILD={short}{dirty}");
 }
 
-fn git(dir: &str, args: &[&str]) -> Option<String> {
+fn git(dir: &str, args: &[&str], paths: &[&str]) -> Option<String> {
     let out = Command::new("git")
         .args(["-C", dir])
         .args(args)
+        .args(paths)
         .output()
         .ok()?;
     if !out.status.success() {
