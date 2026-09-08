@@ -1847,7 +1847,7 @@ pub struct TemplatePin {
 /// volume inherits writable ownership from the image on first mount.
 pub(crate) fn run_as_user(template: &str) -> Option<&'static str> {
     match template {
-        "floci" => Some("1001:0"),
+        "floci" | "floci-azure" | "floci-gcp" | "floci-oci" => Some("1001:0"),
         _ => None,
     }
 }
@@ -1954,6 +1954,26 @@ pub const IMAGE_PINS: &[TemplatePin] = &[
     TemplatePin {
         template: "floci",
         repository: "floci/floci",
+        accelerator: Backend::Cpu,
+        network: Network::None,
+    },
+    // The same emulator family for the other three clouds: Azure, Google
+    // Cloud and Oracle. Identical contract (uid 1001, /app/data, sealed).
+    TemplatePin {
+        template: "floci-azure",
+        repository: "floci/floci-az",
+        accelerator: Backend::Cpu,
+        network: Network::None,
+    },
+    TemplatePin {
+        template: "floci-gcp",
+        repository: "floci/floci-gcp",
+        accelerator: Backend::Cpu,
+        network: Network::None,
+    },
+    TemplatePin {
+        template: "floci-oci",
+        repository: "floci/floci-oci",
         accelerator: Backend::Cpu,
         network: Network::None,
     },
@@ -5911,7 +5931,9 @@ mod template_accelerator_tests {
     fn floci_runs_as_its_service_user_never_root() {
         // cap-drop ALL breaks root-then-switch entrypoints; floci starts as
         // uid 1001 directly and every other template keeps the image default.
-        assert_eq!(super::run_as_user("floci"), Some("1001:0"));
+        for t in ["floci", "floci-azure", "floci-gcp", "floci-oci"] {
+            assert_eq!(super::run_as_user(t), Some("1001:0"), "{t}");
+        }
         for t in ["ollama-cpu", "n8n", "jupyter", "echo-test", "speaches-cpu"] {
             assert_eq!(super::run_as_user(t), None, "{t}");
         }
