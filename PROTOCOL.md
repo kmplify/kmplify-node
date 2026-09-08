@@ -476,3 +476,32 @@ for heavy image/video traffic.
   from operator facts; the node's pin table lists their repositories so a
   mis-tagged node still cannot run them under another image.
 
+
+
+## Protocol v3.7 — node identity keys
+
+A node carries an Ed25519 **identity key** (`src/identity.rs`), generated
+before it first registers and kept as a hex seed in `fabric_node.json` beside
+the token. The public half is a `kmpn1…` bech32m address, published in
+`identity.json` and printed by `kmplify-node id`. Contract:
+`kmplify-infrastructure/docs/IDENTITY_KEYS.md` (KIP-1).
+
+* `POST /fabric/register` carries `{ "pubkey", "gateway", "ts", "sig" }`
+  where `sig` is the Ed25519 signature over
+  `"KMPLIFY-ID-v1/node-register\n" + {"gateway":…,"pubkey":…,"ts":…}`
+  (canonical JSON: sorted keys, no whitespace). `ts` must be within 300 s.
+  The response gains `address`. A KNOWN key gets its `node_id` back with a
+  fresh token even without `previous_token` — the signature is the proof.
+  A known `node_id` presented with a *different* key is never re-adopted.
+* The hello frame carries `{ "pubkey", "ts", "sig" }` with `sig` over
+  `"KMPLIFY-ID-v1/node-hello\n" + {"node_id":…,"pubkey":…,"ts":…}`. The
+  first signed hello under a valid token **binds** the key to the node.
+  From then on a hello without a valid signature closes with 4001, exactly
+  like a bad token, so the worker re-registers (with its key) instead of
+  retrying forever.
+* Workers predating v3.7 send none of these fields and keep working
+  token-only; on upgrade they add a seed to their credential file and bind
+  the key at the next hello. Gateways predating v3.7 ignore the fields.
+* The key is not a wallet and never leaves the credential file; the rewards
+  boundary in `docs/REWARDS.md` is unchanged. Claiming a node as "mine" is a
+  signed statement in the operator's KMPLIFY account, not on the fabric.
