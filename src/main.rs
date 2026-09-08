@@ -1400,7 +1400,13 @@ fn print_peers_json(p: &kmplify_node::peers::Peers, cfg: &WorkerConfig) {
 async fn run_id(cfg: &WorkerConfig) -> i32 {
     match fabric_worker::ensure_identity(&cfg.gateway_url, &cfg.creds_path).await {
         Ok(c) => {
+            // The id on its own line first, exactly as before, so scripts that
+            // read `kmplify-node id` keep working; the address (v3.7) follows
+            // for a person claiming this node from their KMPLIFY account.
             println!("{}", c.node_id);
+            if let Some(key) = c.key() {
+                println!("address: {}", key.address());
+            }
             EXIT_OK
         }
         Err(e) => {
@@ -1431,7 +1437,7 @@ pub(crate) async fn start_node(cfg: WorkerConfig, dir: PathBuf) -> Node {
             status::update(move |s| s.node_id = id);
             // The PUBLIC half, in its own file, so a companion never has to
             // open the credential to learn the node id — see identity.rs.
-            kmplify_node::identity::publish_for(&dir, &c.node_id, &cfg.gateway_url);
+            kmplify_node::identity::publish_for(&dir, &c.node_id, &cfg.gateway_url, c.key().as_ref());
             status::push_log(format!(
                 "node identity {}…",
                 &c.node_id[..8.min(c.node_id.len())]
