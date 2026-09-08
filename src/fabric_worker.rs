@@ -1831,6 +1831,27 @@ pub struct TemplatePin {
     pub network: Network,
 }
 
+/// The uid:gid a template's container runs as, when the image cannot be left
+/// to pick its own.
+///
+/// Sessions run with every capability dropped and `no-new-privileges`, so an
+/// entrypoint that starts as root and then switches to its service user
+/// (`chroot --userspec`, gosu, su-exec: all need CAP_SETUID/SETGID) dies at
+/// the switch instead of serving. floci is exactly that image: its
+/// entrypoint re-executes itself as uid 1001 and exits 1 under our flags
+/// ("failed switching to floci", seen live on EX44). Starting the container
+/// AS that user skips the switch: the entrypoint sees a non-root uid and
+/// falls straight through to the server. Strictly less privilege than the
+/// image asked for, never more. The state volume is mounted where the image
+/// already owns a directory for uid 1001 (`/app/data`), so a fresh named
+/// volume inherits writable ownership from the image on first mount.
+pub(crate) fn run_as_user(template: &str) -> Option<&'static str> {
+    match template {
+        "floci" => Some("1001:0"),
+        _ => None,
+    }
+}
+
 /// What a workload container may reach.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Network {
@@ -3457,6 +3478,10 @@ async fn start_workload(
         "--label".into(),
         format!("{NODE_LABEL}={}", node_label().await),
     ];
+    if let Some(user) = run_as_user(&template) {
+        args.push("--user".into());
+        args.push(user.into());
+    }
     if isolation == Isolation::Gvisor {
         args.push("--runtime".into());
         args.push("runsc".into());
@@ -5879,6 +5904,16 @@ mod template_accelerator_tests {
             for t in hostable_templates(b) {
                 assert!(IMAGE_PINS.iter().any(|p| p.template == t), "{t} unpinned");
             }
+        }
+    }
+
+    #[test]
+    fn floci_runs_as_its_service_user_never_root() {
+        // cap-drop ALL breaks root-then-switch entrypoints; floci starts as
+        // uid 1001 directly and every other template keeps the image default.
+        assert_eq!(super::run_as_user("floci"), Some("1001:0"));
+        for t in ["ollama-cpu", "n8n", "jupyter", "echo-test", "speaches-cpu"] {
+            assert_eq!(super::run_as_user(t), None, "{t}");
         }
     }
 }
