@@ -46,6 +46,32 @@ const PULL_HEARTBEAT: Duration = Duration::from_secs(20);
 /// Docker daemon liveness probe. Short: it runs on the telemetry path, and a
 /// daemon that cannot answer in this long is not one that can pull an image.
 const DOCKER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The gateway's close code 4003 means a second process connected with this
+/// node's identity (kmplify-gpu-fabric docs/PROTOCOL.md): the two evict each
+/// other for as long as both run, so the message names the cure rather than
+/// the symptom.
+pub const SUPERSEDED_CLOSE_CODE: u16 = 4003;
+
+fn describe_close(frame: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame>) -> String {
+    match frame {
+        Some(f) if u16::from(f.code) == SUPERSEDED_CLOSE_CODE => {
+            "another process connected with this node's identity and took the link over \
+             (gateway close 4003): two kmplify-nodes are running from one node directory, \
+             or KMPLIFY Desktop is lending the same fabric_node.json. Stop one of them, or \
+             give it its own KMPLIFY_NODE_DIR so it registers an identity of its own"
+                .to_string()
+        }
+        Some(f) => {
+            let reason = f.reason.trim();
+            if reason.is_empty() {
+                format!("gateway closed the connection ({})", u16::from(f.code))
+            } else {
+                format!("gateway closed the connection ({}: {reason})", u16::from(f.code))
+            }
+        }
+        None => "connection closed".to_string(),
+    }
+}
 /// Telemetry refreshes between disk/image inventory samples. At a 10s ping
 /// that is roughly once a minute — often enough to notice a large download,
 /// rare enough that `docker system df` is not scanning a provider's disk
@@ -4912,7 +4938,16 @@ async fn session(
                 last_rx = tokio::time::Instant::now();
                 let Some(msg) = msg else { break Err("connection closed".into()) };
                 let msg = match msg { Ok(m) => m, Err(e) => break Err(e.to_string()) };
-                let Message::Text(text) = msg else { continue };
+                // A close frame says WHY the gateway hung up, and the one
+                // reason an operator can act on is 4003: another process
+                // presented this node's identity and took the link over.
+                // Reported as such rather than as a bare "connection closed"
+                // followed by an endless reconnect duel.
+                let text = match msg {
+                    Message::Text(t) => t,
+                    Message::Close(frame) => break Err(describe_close(frame.as_ref())),
+                    _ => continue,
+                };
                 let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue };
                 match frame["type"].as_str() {
                     Some("ping") => {
@@ -6478,5 +6513,31 @@ mod disk_measure_tests {
         assert_eq!(parse_du_total_mb("1048576\n").unwrap(), 1074);
         assert!(parse_du_total_mb("du: cannot access").is_err());
         assert!(parse_du_total_mb("").is_err());
+    }
+}
+
+#[cfg(test)]
+mod close_frame_tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+
+    /// 4003 is the one close an operator can fix; it must be spelled out.
+    #[test]
+    fn superseded_close_names_the_duplicate_identity() {
+        let f = CloseFrame { code: CloseCode::from(SUPERSEDED_CLOSE_CODE), reason: "".into() };
+        let msg = describe_close(Some(&f));
+        assert!(msg.contains("identity"), "{msg}");
+        assert!(msg.contains("KMPLIFY_NODE_DIR"), "{msg}");
+    }
+
+    /// Every other close carries its code and reason through unchanged.
+    #[test]
+    fn other_closes_carry_code_and_reason() {
+        let f = CloseFrame { code: CloseCode::from(4002), reason: "no pong".into() };
+        assert_eq!(describe_close(Some(&f)), "gateway closed the connection (4002: no pong)");
+        let f = CloseFrame { code: CloseCode::from(4002), reason: "".into() };
+        assert_eq!(describe_close(Some(&f)), "gateway closed the connection (4002)");
+        assert_eq!(describe_close(None), "connection closed");
     }
 }
