@@ -54,13 +54,23 @@ fn main() {
         if head.exists() {
             println!("cargo:rerun-if-changed={}", head.display());
         }
-        // The branch ref HEAD names advances on every commit. It can be
-        // missing as a loose file (packed refs after a gc) — committing
-        // recreates it, and the HEAD/source watches cover until then.
+        // The branch ref HEAD names advances on every commit. Ask git where
+        // that ref's file IS rather than joining it onto the gitdir: in a
+        // linked worktree the gitdir is .git/worktrees/<name>, while refs
+        // live in the COMMON dir, so the joined path never existed and the
+        // watch was silently dropped — a commit made in a worktree then
+        // changed no watched file and the next build stamped the PREVIOUS
+        // commit. `--git-path` knows the split; its answer can be relative
+        // to the crate root, so resolve it there.
         if let Some(refname) = git(&dir, &["symbolic-ref", "-q", "HEAD"], &[]) {
-            let r = Path::new(&gitdir).join(&refname);
-            if r.exists() {
-                println!("cargo:rerun-if-changed={}", r.display());
+            if let Some(p) = git(&dir, &["rev-parse", "--git-path", &refname], &[]) {
+                let r = Path::new(&dir).join(p);
+                // Can be absent when refs are packed (after a gc);
+                // committing writes the loose file again, and the HEAD and
+                // source watches cover until then.
+                if r.exists() {
+                    println!("cargo:rerun-if-changed={}", r.display());
+                }
             }
         }
     }
