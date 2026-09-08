@@ -448,3 +448,31 @@ for heavy image/video traffic.
   deployer through its admin API and are never part of this protocol's
   node-side frames: a node cannot declare itself KMPLIFY-managed.
 
+## Protocol v3.6 — no-egress guard, consumer env, per-consumer volumes
+
+- A `network: none` session used to be unhostable on this node: Docker
+  publishes no host port for a container on `--network none`, and none for
+  one on an `--internal` network either, so `-p` was silently ignored and
+  the session died with "could not resolve the container's host port".
+  Now such a session runs on an internal Docker network of its own,
+  `<container>-net`, and the node starts a guard, `<container>-guard`
+  (`alpine/socat:1.8.0.0`, `--cap-drop ALL`, `no-new-privileges`,
+  read-only, 64 MB, a quarter core), on the default bridge that publishes
+  the port and forwards it to the session's address on that network. The
+  workload keeps no route to the internet or the provider's LAN; the guard
+  forwards one listening port back to it and nothing else. Two sessions on
+  one machine never share a network. The host port is resolved from the
+  guard, the readiness probe and the relay are unchanged, and the guard and
+  the network are removed with the session. Guards carry the owned-by label
+  and are swept with the session they belong to.
+- `workload_start.env` may carry entries the CONSUMER set, already checked
+  by the gateway against the template's `consumer_env` allow-list. The node
+  applies the same key rule it always did (`env_key_ok`), so the frame
+  shape is unchanged.
+- Volume names arrive rendered: the gateway replaced `{consumer}` before
+  sending. The node's rule is unchanged: fabric-namespaced named volumes
+  only.
+- Managed-only templates (`n8n`, `jupyter`) are decided on the gateway
+  from operator facts; the node's pin table lists their repositories so a
+  mis-tagged node still cannot run them under another image.
+

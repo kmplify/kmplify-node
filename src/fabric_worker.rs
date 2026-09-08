@@ -1256,6 +1256,160 @@ impl Isolation {
 /// (the desktop app and a headless node coexist by design).
 const NODE_LABEL: &str = "kmplify.fabric.node";
 
+/// No-egress sessions and how their port still gets published.
+///
+/// Docker publishes no host port for a container on `--network none` and
+/// none for one on an `--internal` network either: `-p` is silently
+/// ignored in both cases (docker 29, Linux and Docker Desktop, measured).
+/// So every no-egress template used to die on this node with "could not
+/// resolve the container's host port" while the reference worker, which
+/// never isolated the network, served it. The portable answer is a guard:
+/// the workload lives on an internal network of its own, with no route
+/// out, and a socat sidecar on the default bridge publishes the port and
+/// forwards it across. The workload can reach the guard, but the guard
+/// forwards one listening port back to the workload and nothing else, so
+/// there is still no path to the internet or to the provider's LAN.
+///
+/// One network PER SESSION, not one shared network: two consumers' no-egress
+/// containers on the same machine must not be able to see each other, and
+/// on a shared internal network they could.
+pub fn noegress_network_name(container: &str) -> String {
+    format!("{container}-net")
+}
+/// The guard image. Pinned by tag, tiny, pulled once per node.
+pub const GUARD_IMAGE: &str = "alpine/socat:1.8.0.0";
+
+/// The guard container that publishes a no-egress session's port.
+pub fn guard_name(container: &str) -> String {
+    format!("{container}-guard")
+}
+
+/// `docker run` arguments for a guard: hardened like a session (no caps,
+/// no privilege escalation, read-only, small ceilings), on the default
+/// bridge so its `-p` is honoured, owned by the same label so the orphan
+/// sweep reaps it with the session. Pure, so the shape is testable.
+pub fn guard_run_args(container: &str, port: u64, ip: &str, label: &str) -> Vec<String> {
+    vec![
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        guard_name(container),
+        "--cap-drop".into(),
+        "ALL".into(),
+        "--security-opt".into(),
+        "no-new-privileges".into(),
+        "--read-only".into(),
+        "--memory".into(),
+        "64m".into(),
+        "--cpus".into(),
+        "0.25".into(),
+        "--pids-limit".into(),
+        "64".into(),
+        "--network".into(),
+        "bridge".into(),
+        "-p".into(),
+        format!("127.0.0.1:0:{port}"),
+        "--label".into(),
+        format!("{NODE_LABEL}={label}"),
+        GUARD_IMAGE.into(),
+        format!("TCP-LISTEN:{port},fork,reuseaddr"),
+        format!("TCP:{ip}:{port}"),
+    ]
+}
+
+async fn ensure_noegress_network(container: &str) -> Result<(), String> {
+    let net = noegress_network_name(container);
+    let inspect = crate::proc::command("docker")
+        .args(["network", "inspect", &net])
+        .output()
+        .await
+        .map_err(|e| format!("docker unavailable: {e}"))?;
+    if inspect.status.success() {
+        return Ok(());
+    }
+    let out = crate::proc::command("docker")
+        .args(["network", "create", "--internal", &net])
+        .output()
+        .await
+        .map_err(|e| format!("docker unavailable: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if err.contains("already exists") {
+        return Ok(());
+    }
+    Err(format!("could not create the no-egress network: {err}"))
+}
+
+/// Start the guard for a running no-egress session container and return
+/// its name. The caller resolves the published host port from the guard.
+async fn start_guard(container: &str, port: u64) -> Result<String, String> {
+    let net = noegress_network_name(container);
+    let ip = crate::proc::command("docker")
+        .args([
+            "inspect",
+            "-f",
+            &format!("{{{{(index .NetworkSettings.Networks \"{net}\").IPAddress}}}}"),
+            container,
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("docker unavailable: {e}"))?;
+    let ip = String::from_utf8_lossy(&ip.stdout).trim().to_string();
+    if ip.is_empty() || ip.contains("no value") {
+        return Err("the session container has no address on the no-egress network".into());
+    }
+    let present = crate::proc::command("docker")
+        .args(["image", "inspect", GUARD_IMAGE])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !present {
+        let pull = tokio::time::timeout(
+            Duration::from_secs(180),
+            crate::proc::command("docker").args(["pull", GUARD_IMAGE]).output(),
+        )
+        .await
+        .map_err(|_| "pulling the guard image timed out".to_string())?
+        .map_err(|e| format!("docker unavailable: {e}"))?;
+        if !pull.status.success() {
+            return Err(format!(
+                "could not pull the guard image: {}",
+                String::from_utf8_lossy(&pull.stderr).trim()
+            ));
+        }
+    }
+    let guard = guard_name(container);
+    let _ = remove_container(&guard).await;
+    let args = guard_run_args(container, port, &ip, &node_label().await);
+    let out = crate::proc::command("docker")
+        .args(&args)
+        .output()
+        .await
+        .map_err(|e| format!("docker unavailable: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "could not start the guard: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let out = crate::proc::command("docker")
+        .args(["network", "connect", &net, &guard])
+        .output()
+        .await
+        .map_err(|e| format!("docker unavailable: {e}"))?;
+    if !out.status.success() {
+        let _ = remove_container(&guard).await;
+        return Err(format!(
+            "could not attach the guard to the no-egress network: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(guard)
+}
+
 static NODE_LABEL_VALUE: std::sync::OnceLock<Mutex<String>> = std::sync::OnceLock::new();
 
 async fn set_node_label(node_id: &str) {
@@ -1278,7 +1432,7 @@ pub fn orphan_names(listed: &[String], live: &[String]) -> Vec<String> {
         .iter()
         .filter(|n| n.starts_with("kmplify-fabric-"))
         .filter(|n| !n.starts_with("kmplify-fabric-prefetch-"))
-        .filter(|n| !live.iter().any(|l| l == *n))
+        .filter(|n| !live.iter().any(|l| l == *n || guard_name(l).as_str() == n.as_str()))
         .cloned()
         .collect()
 }
@@ -1758,6 +1912,21 @@ pub const IMAGE_PINS: &[TemplatePin] = &[
         accelerator: Backend::Cpu,
         network: Network::None,
     },
+    // Managed-only app templates (gateway v3.6). The gateway never schedules
+    // them on a peer; the pin keeps a mis-tagged node from running them
+    // under a different image.
+    TemplatePin {
+        template: "n8n",
+        repository: "n8nio/n8n",
+        accelerator: Backend::Cpu,
+        network: Network::Egress,
+    },
+    TemplatePin {
+        template: "jupyter",
+        repository: "quay.io/jupyter/scipy-notebook",
+        accelerator: Backend::Cpu,
+        network: Network::Egress,
+    },
     // Speech: one OpenAI-compatible server for BOTH directions, speech to
     // text (/v1/audio/transcriptions, faster-whisper) and text to speech
     // (/v1/audio/speech, Kokoro). Two template ids for the same publisher,
@@ -2017,6 +2186,23 @@ fn trim_log_tail(txt: &str, max_chars: usize) -> String {
 }
 
 async fn remove_container(name: &str) -> Result<(), String> {
+    // A session container may have a guard (no-egress sessions); it goes
+    // with it. Guards end in "-guard" themselves, so this never recurses.
+    if name.starts_with("kmplify-fabric-") && !name.ends_with("-guard") {
+        let _ = docker_rm(&guard_name(name)).await;
+        let res = docker_rm(name).await;
+        // The session's private network goes last, once nothing is on it.
+        // A network that never existed (egress session) is not an error.
+        let _ = crate::proc::command("docker")
+            .args(["network", "rm", &noegress_network_name(name)])
+            .output()
+            .await;
+        return res;
+    }
+    docker_rm(name).await
+}
+
+async fn docker_rm(name: &str) -> Result<(), String> {
     let out = crate::proc::command("docker")
         .args(["rm", "-f", "-v", name])
         .output()
@@ -3258,8 +3444,6 @@ async fn start_workload(
         format!("{cpus:.2}"),
         "--pids-limit".into(),
         "512".into(),
-        "-p".into(),
-        format!("127.0.0.1:0:{port}"),
         // Protocol v3.5: owned-by label for the startup orphan sweep.
         "--label".into(),
         format!("{NODE_LABEL}={}", node_label().await),
@@ -3274,10 +3458,20 @@ async fn start_workload(
     // downloads model weights on first use, so the catalog says which do, and
     // this node's own pin caps that. The published port is a host-side
     // mapping and keeps working either way.
+    // Docker honours `-p` on the default bridge only; a no-egress session
+    // gets its port published by a guard sidecar instead (NOEGRESS_NETWORK).
     let net = network_for(&template, Network::from_frame(frame["network"].as_str()));
     if net == Network::None {
+        if let Err(e) = ensure_noegress_network(&name).await {
+            hosted_remove(&session).await;
+            workload_status(&sink, &session, "error", &e).await;
+            return;
+        }
         args.push("--network".into());
-        args.push("none".into());
+        args.push(noegress_network_name(&name));
+    } else {
+        args.push("-p".into());
+        args.push(format!("127.0.0.1:0:{port}"));
     }
     // Protocol v3.3. A read-only rootfs means a workload cannot rewrite its
     // own image at run time, so whatever it pulls in cannot persist into the
@@ -3371,9 +3565,24 @@ async fn start_workload(
         }
     }
 
+    // No-egress: the guard publishes the port, so the port lookup asks it.
+    let port_owner = if net == Network::None {
+        match start_guard(&name, port).await {
+            Ok(guard) => guard,
+            Err(e) => {
+                let _ = remove_container(&name).await;
+                hosted_remove(&session).await;
+                workload_status(&sink, &session, "error", &e).await;
+                return;
+            }
+        }
+    } else {
+        name.clone()
+    };
+
     // The ephemeral port docker actually bound (127.0.0.1:0 above).
     let host_port = match crate::proc::command("docker")
-        .args(["port", &name, &format!("{port}/tcp")])
+        .args(["port", &port_owner, &format!("{port}/tcp")])
         .output()
         .await
     {
@@ -5975,6 +6184,7 @@ mod model_manifest_tests {
 #[cfg(test)]
 mod isolation_and_sweep_tests {
     use super::{orphan_names, runtimes_from_info, Isolation};
+    use super::{guard_run_args, noegress_network_name};
 
     #[test]
     fn runtimes_are_read_from_docker_info_and_container_is_always_first() {
@@ -6016,5 +6226,29 @@ mod isolation_and_sweep_tests {
         let live = vec!["kmplify-fabric-bbbb".to_string()];
         assert_eq!(orphan_names(&listed, &live), vec!["kmplify-fabric-aaaa"]);
         assert!(orphan_names(&[], &live).is_empty());
+    }
+
+    #[test]
+    fn orphan_sweep_keeps_the_guard_of_a_live_session_and_reaps_a_dead_ones() {
+        let listed = vec![
+            "kmplify-fabric-bbbb".to_string(),
+            "kmplify-fabric-bbbb-guard".to_string(),
+            "kmplify-fabric-aaaa-guard".to_string(),
+        ];
+        let live = vec!["kmplify-fabric-bbbb".to_string()];
+        assert_eq!(orphan_names(&listed, &live), vec!["kmplify-fabric-aaaa-guard"]);
+    }
+
+    #[test]
+    fn guard_publishes_on_the_bridge_and_forwards_to_the_session_address() {
+        let args = guard_run_args("kmplify-fabric-abc", 80, "172.30.0.2", "node-x");
+        let joined = args.join(" ");
+        assert!(joined.contains("--name kmplify-fabric-abc-guard"));
+        assert!(joined.contains("--network bridge -p 127.0.0.1:0:80"));
+        assert!(joined.contains("--cap-drop ALL"));
+        assert!(joined.contains("--label kmplify.fabric.node=node-x"));
+        assert!(joined.ends_with("TCP-LISTEN:80,fork,reuseaddr TCP:172.30.0.2:80"));
+        assert!(!joined.contains(&noegress_network_name("kmplify-fabric-abc")));
+        assert_eq!(noegress_network_name("kmplify-fabric-abc"), "kmplify-fabric-abc-net");
     }
 }
