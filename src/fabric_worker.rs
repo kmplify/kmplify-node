@@ -543,6 +543,20 @@ impl WorkerConfig {
 pub struct Credentials {
     pub node_id: String,
     pub token: String,
+    /// The node's identity key seed, hex (protocol v3.7, see identity.rs).
+    /// Absent in files written by older builds; `ensure_identity` adds one
+    /// on the next start and the gateway binds it at the next signed hello.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_hex: Option<String>,
+}
+
+impl Credentials {
+    /// The identity key, when the credential carries a usable seed.
+    pub fn key(&self) -> Option<crate::identity::NodeKey> {
+        self.seed_hex
+            .as_deref()
+            .and_then(|s| crate::identity::NodeKey::from_seed_hex(s).ok())
+    }
 }
 
 fn log(msg: impl std::fmt::Display) {
@@ -602,7 +616,19 @@ use std::os::unix::fs::PermissionsExt;
 /// Idempotent: safe to call on every boot.
 pub async fn ensure_identity(gateway_url: &str, creds_path: &Path) -> Result<Credentials, String> {
     if let Ok(bytes) = tokio::fs::read(creds_path).await {
-        if let Ok(c) = serde_json::from_slice::<Credentials>(&bytes) {
+        if let Ok(mut c) = serde_json::from_slice::<Credentials>(&bytes) {
+            if c.key().is_none() {
+                // A credential from before identity keys (v3.7): give it one.
+                // The id and token stay; the gateway binds this key the first
+                // time it sees a signed hello under the still-valid token.
+                c.seed_hex = Some(crate::identity::NodeKey::generate().seed_hex());
+                if let Err(e) = write_private(creds_path, serde_json::to_vec(&c).unwrap()).await {
+                    log(format!(
+                        "could not persist the node's new identity key at {}: {e}",
+                        creds_path.display()
+                    ));
+                }
+            }
             return Ok(c);
         }
     }
@@ -610,14 +636,19 @@ pub async fn ensure_identity(gateway_url: &str, creds_path: &Path) -> Result<Cre
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| e.to_string())?;
+    // The key exists before the node does: registration is signed with it,
+    // so the gateway never has to take "this key is mine" on faith later.
+    let key = crate::identity::NodeKey::generate();
     let resp = client
         .post(format!("{gateway_url}/fabric/register"))
+        .json(&key.register_fields(gateway_url, crate::identity::now_s()))
         .send()
         .await
         .map_err(|e| e.to_string())?
         .error_for_status()
         .map_err(|e| e.to_string())?;
-    let creds: Credentials = resp.json().await.map_err(|e| e.to_string())?;
+    let mut creds: Credentials = resp.json().await.map_err(|e| e.to_string())?;
+    creds.seed_hex = Some(key.seed_hex());
     if let Some(parent) = creds_path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
@@ -658,14 +689,20 @@ pub async fn register_identity(
         Ok(bytes) => serde_json::from_slice(&bytes).ok(),
         Err(_) => None,
     };
-    let body = match &previous {
-        Some(c) => serde_json::json!({
-            "previous_node_id": c.node_id,
-            "previous_token": c.token,
-        }),
-        None => serde_json::json!({}),
-    };
-    let creds: Credentials = client
+    // The identity key survives a re-registration: a key the gateway already
+    // knows is what lets it hand the SAME node id back even when the token
+    // was lost (v3.7 continuity), and a key nobody knows yet is still this
+    // machine's, so there is no reason to mint another.
+    let key = previous
+        .as_ref()
+        .and_then(Credentials::key)
+        .unwrap_or_else(crate::identity::NodeKey::generate);
+    let mut body = key.register_fields(gateway_url, crate::identity::now_s());
+    if let Some(c) = &previous {
+        body["previous_node_id"] = serde_json::json!(c.node_id);
+        body["previous_token"] = serde_json::json!(c.token);
+    }
+    let mut creds: Credentials = client
         .post(format!("{gateway_url}/fabric/register"))
         .json(&body)
         .send()
@@ -676,6 +713,7 @@ pub async fn register_identity(
         .json()
         .await
         .map_err(|e| e.to_string())?;
+    creds.seed_hex = Some(key.seed_hex());
     if let Some(parent) = creds_path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
@@ -4475,10 +4513,21 @@ async fn session(
     // an earlier one still reach the gateway (see current_sink_cell).
     *current_sink_cell().write().await = Some(sink.clone());
 
+    // Protocol v3.7: the node's identity key signs the hello, so a gateway
+    // can tell this node from a copy of its token. Older gateways ignore the
+    // three keys; a v3.7 gateway that has bound this key refuses a hello
+    // without them.
+    let identity_fields = creds
+        .key()
+        .map(|k| k.hello_fields(&creds.node_id, crate::identity::now_s()))
+        .unwrap_or(Value::Null);
     let hello = json!({
         "type": "hello",
         "node_id": creds.node_id,
         "token": creds.token,
+        "pubkey": identity_fields.get("pubkey").cloned().unwrap_or(Value::Null),
+        "ts": identity_fields.get("ts").cloned().unwrap_or(Value::Null),
+        "sig": identity_fields.get("sig").cloned().unwrap_or(Value::Null),
         "models": models,
         // Per-model upstream overrides ({model: "colibri"}, protocol v2.5).
         // Empty for single-upstream nodes; older gateways ignore the key.
