@@ -1927,6 +1927,15 @@ pub const IMAGE_PINS: &[TemplatePin] = &[
         accelerator: Backend::Cpu,
         network: Network::Egress,
     },
+    // AWS-compatible services in one container (floci). In-process only,
+    // sealed: no egress, the guard publishes 4566, state in a per-consumer
+    // volume. Runs no consumer code, so peers may host it.
+    TemplatePin {
+        template: "floci",
+        repository: "floci/floci",
+        accelerator: Backend::Cpu,
+        network: Network::None,
+    },
     // Speech: one OpenAI-compatible server for BOTH directions, speech to
     // text (/v1/audio/transcriptions, faster-whisper) and text to speech
     // (/v1/audio/speech, Kokoro). Two template ids for the same publisher,
