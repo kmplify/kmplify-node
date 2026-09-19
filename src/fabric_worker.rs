@@ -6527,10 +6527,7 @@ mod reconnect_backoff_tests {
 
     #[test]
     fn it_reaches_the_ceiling_and_stays_there() {
-        assert_eq!(
-            reconnect_delay(6, u64::MAX - 1).as_millis() as u64 <= 60_000,
-            true
-        );
+        assert!(reconnect_delay(6, u64::MAX - 1) <= RECONNECT_CEILING);
         assert!(reconnect_delay(30, 0) >= Duration::from_secs(30));
         assert!(reconnect_delay(u32::MAX, u64::MAX) <= RECONNECT_CEILING);
     }
