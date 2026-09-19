@@ -29,7 +29,142 @@ use tokio_tungstenite::{
     connect_async, connect_async_with_config, tungstenite::Message, MaybeTlsStream, WebSocketStream,
 };
 
-const RECONNECT_DELAY: Duration = Duration::from_secs(10);
+/// Reconnect backoff bounds (protocol v4). The delay doubles from the floor
+/// to the ceiling while connections keep failing, with jitter, and resets
+/// once a connection has stayed up for `RECONNECT_HEALTHY_AFTER`.
+///
+/// This was a flat 10 s. With a few hundred nodes, a gateway restart then
+/// produced a synchronised reconnect storm every ten seconds, each wave
+/// arriving in the same instant the previous one failed in. The flat delay
+/// was also the wrong number at both ends: too slow for the common case (a
+/// gateway redeploy is back within two seconds, and hosted sessions are
+/// waiting on the grace window) and too fast for the rare one (a gateway
+/// that is down for an hour gains nothing from 360 dials per node).
+const RECONNECT_FLOOR: Duration = Duration::from_secs(1);
+const RECONNECT_CEILING: Duration = Duration::from_secs(60);
+/// A connection that lived this long was a real one: the next failure starts
+/// the backoff from the floor again instead of inheriting an old penalty.
+const RECONNECT_HEALTHY_AFTER: Duration = Duration::from_secs(60);
+
+/// How long to wait before dial number `attempt` (0 = first retry).
+///
+/// "Equal jitter": half the exponential step is fixed and half is random.
+/// Full jitter can draw a delay near zero, which turns a backoff back into
+/// a hammer for the unlucky node; no jitter at all is the synchronised
+/// storm this exists to prevent. `entropy` is injected so the arithmetic
+/// is testable.
+fn reconnect_delay(attempt: u32, entropy: u64) -> Duration {
+    let floor = RECONNECT_FLOOR.as_millis() as u64;
+    let ceiling = RECONNECT_CEILING.as_millis() as u64;
+    let step = floor.saturating_mul(1u64 << attempt.min(16)).min(ceiling);
+    let half = step / 2;
+    Duration::from_millis(half + entropy % (half + 1))
+}
+
+fn reconnect_entropy() -> u64 {
+    use rand_core::RngCore;
+    rand_core::OsRng.next_u64()
+}
+
+/// How long hosted containers outlive a LOST gateway link (protocol v4).
+///
+/// The same number as the gateway's `NODE_RETURN_GRACE_S`: the gateway keeps
+/// a session "running" for this long while its node is absent, so a node
+/// that kept the container for any other span either throws away a session
+/// the gateway was still holding, or burns the owner's GPU for one the
+/// gateway already wrote off.
+///
+/// History, because it explains the shape. Retention was shipped once and
+/// reverted within hours (kmplify-desktop #87) as the SUSPECT in a reconnect
+/// flap that was never proven to be its fault. The revert's stated principle
+/// was sound and is kept: nothing may keep running on an owner's GPU with no
+/// link to stop it by. A grace the NODE enforces on its own clock satisfies
+/// that without the gateway's help: when the deadline passes with no link,
+/// the node removes every container itself. `KMPLIFY_SESSION_GRACE_S=0`
+/// restores the old tear-down-at-once behaviour.
+const SESSION_GRACE_DEFAULT: Duration = Duration::from_secs(180);
+/// An operator may shorten the grace, or lengthen it a little; they may not
+/// turn it into "forever".
+const SESSION_GRACE_MAX: Duration = Duration::from_secs(900);
+
+fn session_grace() -> Duration {
+    parse_session_grace(std::env::var("KMPLIFY_SESSION_GRACE_S").ok().as_deref())
+}
+
+fn parse_session_grace(raw: Option<&str>) -> Duration {
+    match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        None => SESSION_GRACE_DEFAULT,
+        Some(v) => match v.parse::<u64>() {
+            Ok(secs) => Duration::from_secs(secs).min(SESSION_GRACE_MAX),
+            // Unreadable is not "off" and not "forever": it is the default.
+            Err(_) => SESSION_GRACE_DEFAULT,
+        },
+    }
+}
+
+/// Whether the containers survive the end of this connection.
+///
+/// Only a LOST link qualifies. A stop signal, a clean end, and an operator's
+/// own reload all tear down at once, as they always have: those are
+/// decisions, and a decision to stop sharing must not leave a stranger's
+/// container running for three more minutes.
+fn keeps_sessions_across(
+    ended: &Result<(), String>,
+    stopping: bool,
+    grace: Duration,
+    hosted: usize,
+) -> bool {
+    match ended {
+        Ok(()) => false,
+        Err(_) if stopping || grace.is_zero() || hosted == 0 => false,
+        Err(e) => e != RECONNECT_REQUESTED,
+    }
+}
+
+/// The `sessions` list of the hello: what this node still runs, so the
+/// gateway keeps those sessions instead of writing them off, and tells this
+/// node to stop any it no longer knows.
+fn announced_sessions(hosted: &[HostedSession]) -> Value {
+    Value::Array(
+        hosted
+            .iter()
+            .map(|h| json!({"session": h.session_id, "state": h.state}))
+            .collect(),
+    )
+}
+
+fn grace_reaper_cell() -> &'static std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> {
+    static REAPER: std::sync::OnceLock<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
+        std::sync::OnceLock::new();
+    REAPER.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Start the node-side deadline for a lost link. If no gateway connection is
+/// re-established before it passes, every hosted container is removed.
+fn arm_grace_reaper(sessions: Sessions, grace: Duration) {
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+        log(format!(
+            "no gateway link for {}s — removing the sessions kept for its return",
+            grace.as_secs()
+        ));
+        cleanup_sessions(&sessions).await;
+    });
+    if let Ok(mut cell) = grace_reaper_cell().lock() {
+        if let Some(old) = cell.replace(handle) {
+            old.abort();
+        }
+    }
+}
+
+/// The link is back (or the worker is stopping and cleans up itself).
+fn disarm_grace_reaper() {
+    if let Ok(mut cell) = grace_reaper_cell().lock() {
+        if let Some(old) = cell.take() {
+            old.abort();
+        }
+    }
+}
 
 /// Session error that means "the operator asked for this": reconnect at once
 /// and say nothing alarming, rather than logging a lost connection and
@@ -3000,14 +3135,31 @@ fn env_key_ok(key: &str) -> bool {
 }
 
 async fn send_frame(sink: &Arc<Mutex<WsSink>>, msg: Value) {
-    let text = msg.to_string();
-    if sink
-        .lock()
-        .await
-        .send(Message::Text(text.clone()))
-        .await
-        .is_ok()
-    {
+    send_message(sink, Message::Text(msg.to_string())).await;
+}
+
+/// A bulk payload frame (protocol v4): binary when the gateway said it reads
+/// binary and the id fits the header, the JSON form otherwise. `json` is only
+/// built on the fallback path, which is the point: no base64 on the fast one.
+async fn send_payload(
+    sink: &Arc<Mutex<WsSink>>,
+    kind: u8,
+    flags: u8,
+    stream_id: &str,
+    payload: &[u8],
+    json: impl FnOnce() -> Value,
+) {
+    if crate::wire::peer_reads_binary() {
+        if let Some(frame) = crate::wire::pack(kind, flags, stream_id, payload) {
+            send_message(sink, Message::Binary(frame)).await;
+            return;
+        }
+    }
+    send_frame(sink, json()).await;
+}
+
+async fn send_message(sink: &Arc<Mutex<WsSink>>, msg: Message) {
+    if sink.lock().await.send(msg.clone()).await.is_ok() {
         return;
     }
     // The captured sink belongs to a connection that no longer exists — a
@@ -3019,7 +3171,7 @@ async fn send_frame(sink: &Arc<Mutex<WsSink>>, msg: Value) {
     let current = current_sink_cell().read().await.clone();
     if let Some(current) = current {
         if !Arc::ptr_eq(&current, sink) {
-            let _ = current.lock().await.send(Message::Text(text)).await;
+            let _ = current.lock().await.send(msg).await;
         }
     }
 }
@@ -3962,20 +4114,31 @@ async fn ws_open(sink: Arc<Mutex<WsSink>>, sessions: Sessions, relays: RelaySock
     let relays2 = relays.clone();
     let id2 = ws_id.clone();
     tokio::spawn(async move {
+        // v4: while this waits for credit it is not reading the container's
+        // socket, so a consumer that cannot keep up slows the container down
+        // instead of filling the gateway.
+        let credit = crate::flow::open(&id2);
         while let Some(Ok(msg)) = read.next().await {
-            let out = match msg {
-                Message::Text(t) => {
-                    json!({"type": "ws_recv", "ws_id": id2, "data_b64": b64_encode(t.as_bytes()), "binary": false})
-                }
-                Message::Binary(b) => {
-                    json!({"type": "ws_recv", "ws_id": id2, "data_b64": b64_encode(&b), "binary": true})
-                }
+            let (data, binary) = match msg {
+                Message::Text(t) => (t.into_bytes(), false),
+                Message::Binary(b) => (b, true),
                 Message::Close(_) => break,
                 // Ping/Pong are answered by tungstenite itself; forwarding
                 // them would only duplicate keepalives on the gateway link.
                 _ => continue,
             };
-            send_frame(&sink2, out).await;
+            if credit.acquire(data.len()).await.is_err() {
+                break;
+            }
+            send_payload(
+                &sink2,
+                crate::wire::KIND_WS_RECV,
+                if binary { crate::wire::FLAG_BINARY } else { 0 },
+                &id2,
+                &data,
+                || json!({"type": "ws_recv", "ws_id": id2, "data_b64": b64_encode(&data), "binary": binary}),
+            )
+            .await;
         }
         relays2.lock().await.remove(&id2);
         send_frame(&sink2, json!({"type": "ws_closed", "ws_id": id2})).await;
@@ -4020,8 +4183,22 @@ async fn relay_http(
     sessions: Sessions,
     client: reqwest::Client,
     frame: Value,
+    upload: Option<tokio::sync::mpsc::UnboundedReceiver<crate::flow::BodyItem>>,
 ) {
     let req_id = frame["req_id"].as_str().unwrap_or_default().to_string();
+    // 503 with Retry-After, answered at once: the consumer's client retries,
+    // which is better than queueing here while its own timeout runs.
+    let Some(_slot) = RelaySlot::take() else {
+        crate::flow::upload_end(&req_id, false);
+        send_frame(
+            &sink,
+            json!({"type": "http_resp", "req_id": req_id, "status": 503,
+            "headers": {"retry-after": "1"},
+            "body_b64": b64_encode(b"this provider is handling too many requests at once")}),
+        )
+        .await;
+        return;
+    };
     let session = frame["session"].as_str().unwrap_or_default().to_string();
     let Some((_, host_port)) = sessions.lock().await.get(&session).cloned() else {
         send_frame(
@@ -4063,7 +4240,37 @@ async fn relay_http(
             }
         }
     }
-    if let Some(body) = frame["body_b64"].as_str() {
+    if let Some(rx) = upload {
+        // v4 streamed upload. The body is pulled by the HTTP client as the
+        // CONTAINER reads it; each pull reports the bytes back as credit, so
+        // the consumer uploads exactly as fast as the container consumes.
+        if let Some(n) = frame["body_length"].as_u64() {
+            // A declared length keeps this a plain Content-Length upload;
+            // without it the client falls back to chunked encoding, which
+            // some upload handlers refuse.
+            req = req.header(reqwest::header::CONTENT_LENGTH, n);
+        }
+        let credit_sink = sink.clone();
+        let credit_id = req_id.clone();
+        let body = futures_util::stream::unfold(rx, move |mut rx| {
+            let sink = credit_sink.clone();
+            let id = credit_id.clone();
+            async move {
+                let item = rx.recv().await?;
+                if let Ok(bytes) = &item {
+                    if let Some(grant) = crate::flow::upload_consumed(&id, bytes.len()) {
+                        send_frame(
+                            &sink,
+                            json!({"type": "credit", "stream": id, "bytes": grant}),
+                        )
+                        .await;
+                    }
+                }
+                Some((item, rx))
+            }
+        });
+        req = req.body(reqwest::Body::wrap_stream(body));
+    } else if let Some(body) = frame["body_b64"].as_str() {
         if !body.is_empty() {
             if let Some(bytes) = b64_decode(body) {
                 req = req.body(bytes);
@@ -4071,7 +4278,11 @@ async fn relay_http(
         }
     }
 
-    match req.send().await {
+    let sent = req.send().await;
+    // Whatever happened, the upload is over from this side: late chunks for
+    // it are dropped instead of queued for a request that already ended.
+    crate::flow::upload_end(&req_id, false);
+    match sent {
         Ok(resp) => {
             let status = resp.status().as_u16();
             let mut headers = serde_json::Map::new();
@@ -4092,8 +4303,7 @@ async fn relay_http(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            let streaming =
-                ct.starts_with("text/event-stream") || ct.starts_with("application/x-ndjson");
+            let streaming = relay_streams(&ct, resp.content_length());
             if streaming {
                 send_frame(
                     &sink,
@@ -4101,18 +4311,32 @@ async fn relay_http(
                     "status": status, "headers": headers}),
                 )
                 .await;
+                let credit = crate::flow::open(&req_id);
                 let mut stream = resp.bytes_stream();
-                while let Some(chunk) = stream.next().await {
+                'body: while let Some(chunk) = stream.next().await {
                     let Ok(chunk) = chunk else { break };
-                    if chunk.is_empty() {
-                        continue;
+                    // Re-cut to CHUNK_BYTES: the HTTP client hands over
+                    // whatever the socket had, and one frame must neither
+                    // exceed a stream's window nor hog the shared socket.
+                    for piece in chunk.chunks(crate::flow::CHUNK_BYTES) {
+                        if credit.acquire(piece.len()).await.is_err() {
+                            // No reader, or the link went. Dropping `stream`
+                            // closes the container's connection.
+                            break 'body;
+                        }
+                        send_payload(
+                            &sink,
+                            crate::wire::KIND_HTTP_RESP_CHUNK,
+                            0,
+                            &req_id,
+                            piece,
+                            || {
+                                json!({"type": "http_resp_chunk", "req_id": req_id,
+                                "body_b64": b64_encode(piece)})
+                            },
+                        )
+                        .await;
                     }
-                    send_frame(
-                        &sink,
-                        json!({"type": "http_resp_chunk", "req_id": req_id,
-                        "body_b64": b64_encode(&chunk)}),
-                    )
-                    .await;
                 }
                 send_frame(&sink, json!({"type": "http_resp_end", "req_id": req_id})).await;
             } else {
@@ -4163,6 +4387,59 @@ async fn relay_http(
     }
 }
 
+/// Relayed requests this node will work on at once. Every `http` frame used to
+/// become a task with nothing counting them, so the only limit on how many
+/// connections, buffers and container sockets a gateway could make this
+/// process hold was the gateway's good behaviour. Generous on purpose: a page
+/// load is a burst of a hundred small requests.
+const MAX_RELAYS_IN_FLIGHT: usize = 256;
+
+static RELAYS_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A slot among `MAX_RELAYS_IN_FLIGHT`, given back when dropped.
+struct RelaySlot;
+
+impl RelaySlot {
+    fn take() -> Option<RelaySlot> {
+        use std::sync::atomic::Ordering;
+        RELAYS_IN_FLIGHT
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_RELAYS_IN_FLIGHT).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| RelaySlot)
+    }
+}
+
+impl Drop for RelaySlot {
+    fn drop(&mut self) {
+        RELAYS_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Bodies known to be at most this large still travel as one `http_resp`
+/// frame: a page load is dozens of small assets, and three frames each would
+/// be pure overhead.
+const RELAY_SINGLE_FRAME_MAX: u64 = 256 * 1024;
+
+/// Whether a relayed response is forwarded chunk by chunk.
+///
+/// Before v4 only SSE and NDJSON were, and everything else was read whole
+/// into memory and base64-encoded into one frame: a rendered video or a model
+/// file was held twice over, here and on the gateway, and past the frame cap
+/// it could not be delivered at all. Now everything streams unless it is
+/// KNOWN to be small. An unknown length streams, because "unknown" is exactly
+/// what a large generated download looks like.
+fn relay_streams(content_type: &str, content_length: Option<u64>) -> bool {
+    if content_type.starts_with("text/event-stream")
+        || content_type.starts_with("application/x-ndjson")
+    {
+        // Live streams, however short: buffering them defeats their purpose.
+        return true;
+    }
+    !matches!(content_length, Some(n) if n <= RELAY_SINGLE_FRAME_MAX)
+}
+
 /// Remove every container this node started for the fabric — run on
 /// disconnect and on stop, so nothing keeps burning the user's GPU after
 /// sharing ends. The gateway independently marks the sessions failed.
@@ -4176,7 +4453,24 @@ async fn cleanup_sessions(sessions: &Sessions) {
     // Anything still listed here was mid-pull when the connection died —
     // start_workload's own removal never ran, and leaving it published would
     // show the owner a session on their GPU that no longer exists.
-    hosted_cell().lock().await.clear();
+    //
+    // Tombstone each one first. The pull is a detached task and outlives
+    // this call; without the tombstone it finishes minutes later and launches
+    // a container for a session everyone has already written off, registered
+    // in the live map so not even the orphan sweep reaps it. Same mechanism a
+    // `workload_stop` that lands mid-pull has always used.
+    let pulling: Vec<String> = hosted_cell()
+        .lock()
+        .await
+        .drain(..)
+        .map(|h| h.session_id)
+        .collect();
+    if !pulling.is_empty() {
+        let mut stopped = stopped_cell().lock().await;
+        for session in pulling {
+            stopped.insert(session);
+        }
+    }
 }
 
 /// Translate an OpenAI-shaped chat request into Ollama's NATIVE /api/chat
@@ -4643,6 +4937,14 @@ async fn session(
         // own field rather than folded into `version` because the gateway
         // truncates that one to 32 chars; older gateways ignore this key.
         "worker_version": crate::version_string(),
+        // Node-link protocol level. 4 = this node paces each relayed stream
+        // by the credit the gateway grants (src/flow.rs), streams every large
+        // response instead of buffering it, and announces kept sessions. A
+        // gateway only sends `credit` frames to a node that says so.
+        "protocol": 4,
+        // Bulk payload frames may be sent to this node as WebSocket binary
+        // messages (src/wire.rs). The JSON forms stay valid.
+        "binary_frames": true,
         // Which SYSTEM this build runs on, from the compiler, not probed at
         // runtime: "macos"/"linux"/"windows" and "aarch64"/"x86_64". The
         // gateway keeps these per node for an anonymous install count by
@@ -4661,6 +4963,11 @@ async fn session(
         // Collections replicated here, so the gateway can tell this node to
         // drop any it no longer knows (same reconciliation as sessions).
         "collections": store.collection_ids().await,
+        // Sessions still running here from before this connection (v4). The
+        // gateway keeps the ones it knows and answers `workload_stop` for the
+        // rest; without this list it must assume every session died with
+        // the link. Older gateways ignore the key.
+        "sessions": announced_sessions(&hosted_sessions().await),
         // What this machine actually IS (v2.4): real CPU model, cores and
         // total RAM. Independent of cpu_share, which says only what was
         // volunteered — a GPU peer still has a CPU worth naming.
@@ -4708,6 +5015,13 @@ async fn session(
     if welcome["type"] != "welcome" {
         return Err(format!("gateway refused: {welcome}"));
     }
+    // The link is back inside the grace window: the sessions announced in
+    // the hello stay, and the deadline that would have removed them is off.
+    disarm_grace_reaper();
+    // v4 gateways name a per-stream window; older ones do not, and then
+    // nothing is paced. Also ends every stream of the previous connection.
+    crate::flow::connected(crate::flow::window_from_welcome(&welcome));
+    crate::wire::set_peer_reads_binary(welcome["binary_frames"].as_bool().unwrap_or(false));
     crate::status::set_link(crate::status::Link::Online, String::new());
     crate::status::set_models(&models, &engines);
     log(format!(
@@ -4883,6 +5197,33 @@ async fn session(
                 last_rx = tokio::time::Instant::now();
                 let Some(msg) = msg else { break Err("connection closed".into()) };
                 let msg = match msg { Ok(m) => m, Err(e) => break Err(e.to_string()) };
+                // v4 bulk frames: payload raw behind a fixed header, no JSON
+                // and no base64 (src/wire.rs). Same effect as the JSON arms
+                // `http_req_chunk` and `ws_send` further down.
+                if let Message::Binary(raw) = &msg {
+                    if let Some(f) = crate::wire::unpack(raw) {
+                        match f.kind {
+                            crate::wire::KIND_HTTP_REQ_CHUNK => {
+                                crate::flow::upload_push(&f.stream_id, f.payload.to_vec());
+                            }
+                            crate::wire::KIND_WS_SEND => {
+                                let out = if f.flags & crate::wire::FLAG_BINARY != 0 {
+                                    Message::Binary(f.payload.to_vec())
+                                } else {
+                                    Message::Text(String::from_utf8_lossy(f.payload).into_owned())
+                                };
+                                let mut map = relays.lock().await;
+                                if let Some(tx) = map.get(&f.stream_id) {
+                                    if tx.send(out).is_err() {
+                                        map.remove(&f.stream_id);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
                 let Message::Text(text) = msg else { continue };
                 let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue };
                 match frame["type"].as_str() {
@@ -5137,7 +5478,42 @@ async fn session(
                         ));
                     }
                     Some("http") => {
-                        tokio::spawn(relay_http(sink.clone(), sessions.clone(), client.clone(), frame));
+                        // v4 streamed upload: register the body channel HERE,
+                        // in the read loop, because the chunks follow this
+                        // frame immediately and a spawned task may not have
+                        // run yet when the first one arrives.
+                        let upload = frame["body_stream"]
+                            .as_bool()
+                            .unwrap_or(false)
+                            .then(|| crate::flow::upload_open(frame["req_id"].as_str().unwrap_or_default()));
+                        tokio::spawn(relay_http(sink.clone(), sessions.clone(), client.clone(), frame, upload));
+                    }
+                    Some("http_req_chunk") => {
+                        let id = frame["req_id"].as_str().unwrap_or_default();
+                        if let Some(bytes) = frame["body_b64"].as_str().and_then(b64_decode) {
+                            crate::flow::upload_push(id, bytes);
+                        }
+                    }
+                    Some("http_req_end") => {
+                        crate::flow::upload_end(
+                            frame["req_id"].as_str().unwrap_or_default(),
+                            frame["abort"].as_bool().unwrap_or(false),
+                        );
+                    }
+                    // Protocol v4: the consumer drained this much of a stream.
+                    // Handled inline: it is a map lookup and must never queue
+                    // behind the traffic it is there to unblock.
+                    Some("credit") => {
+                        if let (Some(stream), Some(bytes)) =
+                            (frame["stream"].as_str(), frame["bytes"].as_u64())
+                        {
+                            crate::flow::grant(stream, bytes);
+                        }
+                    }
+                    Some("stream_cancel") => {
+                        if let Some(stream) = frame["stream"].as_str() {
+                            crate::flow::cancel(stream);
+                        }
                     }
                     // Protocol v2.2 — see ws_open(). Spawned, never awaited
                     // here: dialling the container can block for seconds and
@@ -5196,9 +5572,22 @@ async fn session(
             }
         }
     };
-    // Whatever ended the session — graceful stop or a dropped gateway —
-    // nothing may keep running on the user's GPU afterwards.
-    cleanup_sessions(&sessions).await;
+    // A stop, a clean end or an operator's reload: nothing may keep running
+    // on the user's GPU afterwards. A LOST link is different (v4): the
+    // containers wait out the grace window for the gateway to return, and
+    // the reaper removes them on this node's own clock if it does not.
+    let grace = session_grace();
+    let hosted = hosted_sessions().await.len();
+    if keeps_sessions_across(&result, *stop.borrow(), grace, hosted) {
+        log(format!(
+            "gateway link lost with {hosted} session(s) hosted — keeping them for {}s",
+            grace.as_secs()
+        ));
+        arm_grace_reaper(sessions.clone(), grace);
+    } else {
+        disarm_grace_reaper();
+        cleanup_sessions(&sessions).await;
+    }
     result
 }
 
@@ -5287,8 +5676,18 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
     // change made while the gateway is unreachable would otherwise sit out
     // the full backoff before anyone noticed it.
     let mut wake = control().subscribe();
+    // Consecutive failed connections, for the backoff. Reset by a connection
+    // that stayed up long enough to count as one.
+    let mut failed_attempts: u32 = 0;
+    // Stopping while disconnected: sessions kept for the gateway's return
+    // have nobody coming back for them once this worker is gone.
+    async fn release_kept_sessions() {
+        disarm_grace_reaper();
+        cleanup_sessions(sessions_cell()).await;
+    }
     loop {
         if *stop.borrow() {
+            release_kept_sessions().await;
             return;
         }
         // Re-read before every connection, so a change made in the dashboard
@@ -5297,10 +5696,20 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
         cfg = baseline.clone();
         crate::settings::Settings::load(&node_dir).apply(&mut cfg);
         publish_config(&cfg);
-        match session(&client, &cfg, &mut stop).await {
+        let dialled_at = std::time::Instant::now();
+        let outcome = session(&client, &cfg, &mut stop).await;
+        if dialled_at.elapsed() >= RECONNECT_HEALTHY_AFTER {
+            failed_attempts = 0;
+        }
+        // Computed here so the log lines below can name it; only COUNTED at
+        // the sleep, because the `continue` paths (operator asked, identity
+        // healed) dial again at once and are not failures to back off from.
+        let delay = reconnect_delay(failed_attempts, reconnect_entropy());
+        match outcome {
             Ok(()) => healed_since_connect = false,
             Err(e) => {
                 if *stop.borrow() {
+                    release_kept_sessions().await;
                     return;
                 }
                 if e == RECONNECT_REQUESTED {
@@ -5328,21 +5737,23 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
                     }
                 } else if e == AUTH_REJECTED {
                     log(format!(
-                        "gateway rejected even a freshly registered identity; retrying in {}s",
-                        RECONNECT_DELAY.as_secs()
+                        "gateway rejected even a freshly registered identity; retrying in {:.1}s",
+                        delay.as_secs_f32()
                     ));
                 } else {
                     log(format!(
-                        "connection lost ({e}); retrying in {}s",
-                        RECONNECT_DELAY.as_secs()
+                        "connection lost ({e}); retrying in {:.1}s",
+                        delay.as_secs_f32()
                     ));
                 }
             }
         }
+        failed_attempts = failed_attempts.saturating_add(1);
         tokio::select! {
-            _ = tokio::time::sleep(RECONNECT_DELAY) => {}
+            _ = tokio::time::sleep(delay) => {}
             _ = stop.changed() => {
                 if *stop.borrow() {
+                    release_kept_sessions().await;
                     return;
                 }
             }
@@ -6442,5 +6853,443 @@ mod relay_frame_limit_tests {
         assert!(!RELAY_STRIPPED_HEADERS.contains(&"authorization"));
         assert!(RELAY_STRIPPED_HEADERS.contains(&"proxy-authorization"));
         assert!(RELAY_STRIPPED_HEADERS.contains(&"host"));
+    }
+}
+
+#[cfg(test)]
+mod reconnect_backoff_tests {
+    use super::*;
+
+    /// The first retry is fast: a gateway redeploy is back within seconds and
+    /// hosted sessions are waiting on the grace window.
+    #[test]
+    fn the_first_retry_is_under_a_second() {
+        for e in [0u64, 1, 499, 500, u64::MAX] {
+            let d = reconnect_delay(0, e);
+            assert!(
+                d >= Duration::from_millis(500) && d <= Duration::from_secs(1),
+                "{d:?}"
+            );
+        }
+    }
+
+    /// Never near zero (a hammer) and never past the ceiling.
+    #[test]
+    fn every_delay_stays_between_half_the_step_and_the_step() {
+        for attempt in 0..40u32 {
+            let step = (1000u64 << attempt.min(16)).min(60_000);
+            for e in [0u64, 7, 12_345, u64::MAX] {
+                let ms = reconnect_delay(attempt, e).as_millis() as u64;
+                assert!(
+                    ms >= step / 2 && ms <= step,
+                    "attempt {attempt}: {ms}ms vs step {step}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn it_reaches_the_ceiling_and_stays_there() {
+        assert!(reconnect_delay(6, u64::MAX - 1) <= RECONNECT_CEILING);
+        assert!(reconnect_delay(30, 0) >= Duration::from_secs(30));
+        assert!(reconnect_delay(u32::MAX, u64::MAX) <= RECONNECT_CEILING);
+    }
+
+    /// Two nodes that fail in the same instant must not dial in the same
+    /// instant: that is the whole point of the jitter.
+    #[test]
+    fn different_entropy_spreads_the_fleet() {
+        let a = reconnect_delay(5, 1);
+        let b = reconnect_delay(5, 9_999);
+        assert_ne!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod session_retention_tests {
+    use super::*;
+
+    fn lost() -> Result<(), String> {
+        Err("connection closed".to_string())
+    }
+    const GRACE: Duration = Duration::from_secs(180);
+
+    /// The case the whole feature exists for: a gateway redeploy.
+    #[test]
+    fn a_lost_link_keeps_hosted_sessions() {
+        assert!(keeps_sessions_across(&lost(), false, GRACE, 1));
+    }
+
+    /// Decisions tear down at once, exactly as before. An operator who stops
+    /// sharing must not leave a stranger's container running for three more
+    /// minutes, and a reload may be the operator switching sessions OFF.
+    #[test]
+    fn a_stop_a_clean_end_and_a_reload_do_not() {
+        assert!(!keeps_sessions_across(&lost(), true, GRACE, 1));
+        assert!(!keeps_sessions_across(&Ok(()), false, GRACE, 1));
+        assert!(!keeps_sessions_across(
+            &Err(RECONNECT_REQUESTED.to_string()),
+            false,
+            GRACE,
+            1
+        ));
+    }
+
+    #[test]
+    fn nothing_hosted_or_grace_zero_is_the_old_behaviour() {
+        assert!(!keeps_sessions_across(&lost(), false, GRACE, 0));
+        assert!(!keeps_sessions_across(&lost(), false, Duration::ZERO, 3));
+    }
+
+    /// Tied to the gateway's NODE_RETURN_GRACE_S (180 s). A different number
+    /// on either side throws sessions away or burns a GPU for nothing.
+    #[test]
+    fn the_default_grace_matches_the_gateways() {
+        assert_eq!(parse_session_grace(None), Duration::from_secs(180));
+        assert_eq!(parse_session_grace(Some("")), Duration::from_secs(180));
+    }
+
+    #[test]
+    fn an_operator_can_shorten_or_disable_it_but_not_make_it_forever() {
+        assert_eq!(parse_session_grace(Some("0")), Duration::ZERO);
+        assert_eq!(parse_session_grace(Some(" 30 ")), Duration::from_secs(30));
+        assert_eq!(parse_session_grace(Some("999999")), SESSION_GRACE_MAX);
+        // Unreadable is the default, never "off" and never "forever".
+        assert_eq!(parse_session_grace(Some("soon")), Duration::from_secs(180));
+        assert_eq!(parse_session_grace(Some("-5")), Duration::from_secs(180));
+    }
+
+    /// The exact shape gateway `reconcile_node_sessions` reads.
+    #[test]
+    fn the_hello_announces_each_session_with_its_state() {
+        let hosted = vec![
+            HostedSession {
+                session_id: "s-1".into(),
+                template: "comfyui".into(),
+                container: "kmplify-fabric-s-1".into(),
+                since: 0,
+                state: "running".into(),
+                cpus: 2.0,
+            },
+            HostedSession {
+                session_id: "s-2".into(),
+                template: "ollama".into(),
+                container: "kmplify-fabric-s-2".into(),
+                since: 0,
+                state: "pulling".into(),
+                cpus: 1.0,
+            },
+        ];
+        assert_eq!(
+            announced_sessions(&hosted),
+            json!([
+                {"session": "s-1", "state": "running"},
+                {"session": "s-2", "state": "pulling"},
+            ])
+        );
+        assert_eq!(announced_sessions(&[]), json!([]));
+    }
+
+    /// The reaper really removes what was kept, on the node's own clock, and
+    /// a returning link really calls it off.
+    #[tokio::test(start_paused = true)]
+    async fn the_grace_deadline_fires_unless_the_link_returns() {
+        let sessions: Sessions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        hosted_cell().lock().await.push(HostedSession {
+            session_id: "grace-test-pull".into(),
+            template: "echo-test".into(),
+            container: "kmplify-fabric-grace-test-pull".into(),
+            since: 0,
+            state: "pulling".into(),
+            cpus: 1.0,
+        });
+
+        // Link returns in time: nothing is touched.
+        // (A paused clock auto-advances through `sleep` once every task is
+        // idle, which also guarantees the reaper was polled and its timer
+        // registered before time moves. `advance` alone does not.)
+        arm_grace_reaper(sessions.clone(), Duration::from_secs(180));
+        tokio::time::sleep(Duration::from_secs(100)).await;
+        disarm_grace_reaper();
+        tokio::time::sleep(Duration::from_secs(200)).await;
+        assert!(hosted_cell()
+            .lock()
+            .await
+            .iter()
+            .any(|h| h.session_id == "grace-test-pull"));
+
+        // Link never returns: the mid-pull session is dropped AND tombstoned,
+        // so the detached pull cannot launch a container afterwards.
+        arm_grace_reaper(sessions.clone(), Duration::from_secs(180));
+        tokio::time::sleep(Duration::from_secs(181)).await;
+        assert!(!hosted_cell()
+            .lock()
+            .await
+            .iter()
+            .any(|h| h.session_id == "grace-test-pull"));
+        assert!(stopped_cell().lock().await.remove("grace-test-pull"));
+    }
+}
+
+#[cfg(test)]
+mod relay_streaming_tests {
+    use super::*;
+
+    #[test]
+    fn live_streams_always_stream() {
+        assert!(relay_streams("text/event-stream", Some(10)));
+        assert!(relay_streams("application/x-ndjson; charset=utf-8", None));
+    }
+
+    /// The page-load case: dozens of small assets, one frame each.
+    #[test]
+    fn a_body_known_to_be_small_is_one_frame() {
+        assert!(!relay_streams("text/html", Some(0)));
+        assert!(!relay_streams(
+            "application/json",
+            Some(RELAY_SINGLE_FRAME_MAX)
+        ));
+    }
+
+    /// The case this exists for: a 200 MB download must never be buffered,
+    /// and neither may a body whose length nobody announced.
+    #[test]
+    fn large_and_unknown_lengths_stream() {
+        assert!(relay_streams("video/mp4", Some(200 * 1024 * 1024)));
+        assert!(relay_streams("image/png", Some(RELAY_SINGLE_FRAME_MAX + 1)));
+        assert!(relay_streams("application/octet-stream", None));
+    }
+
+    /// A chunk frame has to fit the frame cap after base64, with room.
+    #[test]
+    fn one_chunk_is_far_below_the_frame_cap() {
+        const { assert!(crate::flow::CHUNK_BYTES * 2 < MAX_FRAME_BYTES) };
+    }
+}
+
+#[cfg(test)]
+mod streamed_upload_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A "container": reads exactly Content-Length bytes, slowly enough that
+    /// the upload has to be paced, and answers with their SHA-256.
+    async fn hashing_http_server() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                sock.read_exact(&mut byte).await.unwrap();
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+            let len: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .expect("a declared length keeps the upload un-chunked")
+                .trim()
+                .parse()
+                .unwrap();
+            let mut hasher = Sha256::new();
+            let mut got = 0usize;
+            let mut buf = vec![0u8; 64 * 1024];
+            while got < len {
+                let n = sock.read(&mut buf).await.unwrap();
+                assert!(n > 0, "body ended at {got} of {len}");
+                hasher.update(&buf[..n]);
+                got += n;
+            }
+            let body = format!("{got}:{:x}", hasher.finalize());
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+        port
+    }
+
+    /// A "gateway": accepts the node's socket and hands back every frame.
+    async fn gateway_socket() -> (
+        Arc<Mutex<WsSink>>,
+        tokio::sync::mpsc::UnboundedReceiver<Value>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(sock).await.unwrap();
+            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                let _ = tx.send(serde_json::from_str::<Value>(&t).unwrap());
+            }
+        });
+        let (ws, _) = connect_async(&url).await.unwrap();
+        let (write, _read) = ws.split();
+        (Arc::new(Mutex::new(write)), rx)
+    }
+
+    /// 24 MiB through a 1 MiB window: byte-exact at the container, credit
+    /// reported back for it, and never more than two windows queued here.
+    #[tokio::test]
+    async fn a_large_upload_reaches_the_container_byte_exact_under_credit() {
+        let _serial = crate::flow::TEST_LOCK.lock().await;
+        const WINDOW: usize = 1024 * 1024;
+        const TOTAL: usize = 24 * 1024 * 1024;
+        crate::flow::connected(Some(WINDOW));
+
+        let port = hashing_http_server().await;
+        let (sink, mut frames) = gateway_socket().await;
+        let sessions: Sessions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert("s-up".into(), ("kmplify-fabric-s-up".into(), port));
+
+        let frame = json!({
+            "type": "http", "session": "s-up", "req_id": "r-up", "method": "POST",
+            "path": "/upload", "query": "", "headers": {"content-type": "application/octet-stream"},
+            "body_stream": true, "body_length": TOTAL,
+        });
+        let rx = crate::flow::upload_open("r-up");
+        let relay = tokio::spawn(relay_http(
+            sink,
+            sessions,
+            reqwest::Client::new(),
+            frame,
+            Some(rx),
+        ));
+
+        // The gateway's side of the bargain: send while there is credit,
+        // wait for a grant when there is not.
+        let mut expect = Sha256::new();
+        let mut credit = WINDOW;
+        let mut sent = 0usize;
+        let mut granted = 0u64;
+        let mut response = None;
+        while sent < TOTAL {
+            let n = crate::flow::CHUNK_BYTES.min(TOTAL - sent);
+            while credit < n {
+                let f = frames
+                    .recv()
+                    .await
+                    .expect("the node stopped granting credit");
+                if f["type"] == "credit" {
+                    assert_eq!(f["stream"], "r-up");
+                    credit += f["bytes"].as_u64().unwrap() as usize;
+                    granted += f["bytes"].as_u64().unwrap();
+                }
+            }
+            let chunk: Vec<u8> = (0..n).map(|i| ((sent + i) % 251) as u8).collect();
+            expect.update(&chunk);
+            assert!(
+                crate::flow::upload_push("r-up", chunk),
+                "refused inside its credit"
+            );
+            credit -= n;
+            sent += n;
+        }
+        crate::flow::upload_end("r-up", false);
+
+        while response.is_none() {
+            let f = frames.recv().await.expect("no response frame");
+            match f["type"].as_str() {
+                Some("credit") => granted += f["bytes"].as_u64().unwrap(),
+                Some("http_resp") => response = Some(f),
+                _ => {}
+            }
+        }
+        relay.await.unwrap();
+        let response = response.unwrap();
+        assert_eq!(response["status"], 200);
+        let body =
+            String::from_utf8(b64_decode(response["body_b64"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(body, format!("{TOTAL}:{:x}", expect.finalize()));
+        // What is GUARANTEED, and no more: the sender starts with one window,
+        // so it cannot have sent everything unless at least TOTAL - WINDOW
+        // came back as grants. `>` here was a race, not an invariant: credit
+        // frames the node sends after its response arrive after this test
+        // has stopped reading, and whether the last batch is counted depends
+        // on scheduling. It passed on the Mac it was written on and failed on
+        // CI's Linux and Windows runners, with the upload itself byte-exact.
+        assert!(
+            granted as usize >= TOTAL - WINDOW,
+            "granted only {granted} of {TOTAL}"
+        );
+        assert!(granted as usize <= TOTAL, "granted more than was sent");
+        crate::flow::connected(None);
+    }
+
+    /// An aborted upload must reach the container as a FAILED request.
+    #[tokio::test]
+    async fn an_aborted_upload_fails_the_request_instead_of_sending_half_a_body() {
+        let _serial = crate::flow::TEST_LOCK.lock().await;
+        crate::flow::connected(Some(1024 * 1024));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut sink = Vec::new();
+            let _ = sock.read_to_end(&mut sink).await;
+        });
+        let (sink, mut frames) = gateway_socket().await;
+        let sessions: Sessions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert("s-ab".into(), ("kmplify-fabric-s-ab".into(), port));
+        let frame = json!({
+            "type": "http", "session": "s-ab", "req_id": "r-ab", "method": "POST",
+            "path": "/upload", "query": "", "headers": {}, "body_stream": true,
+            "body_length": 10 * 1024 * 1024,
+        });
+        let rx = crate::flow::upload_open("r-ab");
+        let relay = tokio::spawn(relay_http(
+            sink,
+            sessions,
+            reqwest::Client::new(),
+            frame,
+            Some(rx),
+        ));
+        assert!(crate::flow::upload_push("r-ab", vec![7u8; 1024]));
+        crate::flow::upload_end("r-ab", true);
+        let resp = loop {
+            let f = frames.recv().await.expect("no response frame");
+            if f["type"] == "http_resp" {
+                break f;
+            }
+        };
+        relay.await.unwrap();
+        assert_eq!(resp["status"], 502);
+        crate::flow::connected(None);
+    }
+}
+
+#[cfg(test)]
+mod relay_slot_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// Slots run out at the cap and come back when a relay ends, including
+    /// when it ends by being dropped mid-flight.
+    #[test]
+    fn slots_are_bounded_and_returned() {
+        let _serial = crate::flow::TEST_LOCK.blocking_lock();
+        let before = RELAYS_IN_FLIGHT.load(Ordering::Acquire);
+        let mut held = Vec::new();
+        while let Some(slot) = RelaySlot::take() {
+            held.push(slot);
+            assert!(held.len() <= MAX_RELAYS_IN_FLIGHT);
+        }
+        assert_eq!(before + held.len(), MAX_RELAYS_IN_FLIGHT);
+        assert!(RelaySlot::take().is_none());
+        held.pop();
+        assert!(RelaySlot::take().is_some());
+        drop(held);
+        assert_eq!(RELAYS_IN_FLIGHT.load(Ordering::Acquire), before);
     }
 }

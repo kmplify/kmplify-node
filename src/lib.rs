@@ -17,6 +17,7 @@
 pub mod control;
 pub mod engines;
 pub mod fabric_worker;
+pub mod flow;
 pub mod functions;
 pub mod gpu;
 pub mod hostcpu;
@@ -27,6 +28,7 @@ pub mod rewards;
 pub mod settings;
 pub mod status;
 pub mod vectors;
+pub mod wire;
 
 /// This crate's NOTICE, compiled in.
 ///
