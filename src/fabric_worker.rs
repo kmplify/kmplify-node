@@ -3135,14 +3135,31 @@ fn env_key_ok(key: &str) -> bool {
 }
 
 async fn send_frame(sink: &Arc<Mutex<WsSink>>, msg: Value) {
-    let text = msg.to_string();
-    if sink
-        .lock()
-        .await
-        .send(Message::Text(text.clone()))
-        .await
-        .is_ok()
-    {
+    send_message(sink, Message::Text(msg.to_string())).await;
+}
+
+/// A bulk payload frame (protocol v4): binary when the gateway said it reads
+/// binary and the id fits the header, the JSON form otherwise. `json` is only
+/// built on the fallback path, which is the point: no base64 on the fast one.
+async fn send_payload(
+    sink: &Arc<Mutex<WsSink>>,
+    kind: u8,
+    flags: u8,
+    stream_id: &str,
+    payload: &[u8],
+    json: impl FnOnce() -> Value,
+) {
+    if crate::wire::peer_reads_binary() {
+        if let Some(frame) = crate::wire::pack(kind, flags, stream_id, payload) {
+            send_message(sink, Message::Binary(frame)).await;
+            return;
+        }
+    }
+    send_frame(sink, json()).await;
+}
+
+async fn send_message(sink: &Arc<Mutex<WsSink>>, msg: Message) {
+    if sink.lock().await.send(msg.clone()).await.is_ok() {
         return;
     }
     // The captured sink belongs to a connection that no longer exists — a
@@ -3154,7 +3171,7 @@ async fn send_frame(sink: &Arc<Mutex<WsSink>>, msg: Value) {
     let current = current_sink_cell().read().await.clone();
     if let Some(current) = current {
         if !Arc::ptr_eq(&current, sink) {
-            let _ = current.lock().await.send(Message::Text(text)).await;
+            let _ = current.lock().await.send(msg).await;
         }
     }
 }
@@ -4102,24 +4119,26 @@ async fn ws_open(sink: Arc<Mutex<WsSink>>, sessions: Sessions, relays: RelaySock
         // instead of filling the gateway.
         let credit = crate::flow::open(&id2);
         while let Some(Ok(msg)) = read.next().await {
-            let (out, size) = match msg {
-                Message::Text(t) => (
-                    json!({"type": "ws_recv", "ws_id": id2, "data_b64": b64_encode(t.as_bytes()), "binary": false}),
-                    t.len(),
-                ),
-                Message::Binary(b) => (
-                    json!({"type": "ws_recv", "ws_id": id2, "data_b64": b64_encode(&b), "binary": true}),
-                    b.len(),
-                ),
+            let (data, binary) = match msg {
+                Message::Text(t) => (t.into_bytes(), false),
+                Message::Binary(b) => (b, true),
                 Message::Close(_) => break,
                 // Ping/Pong are answered by tungstenite itself; forwarding
                 // them would only duplicate keepalives on the gateway link.
                 _ => continue,
             };
-            if credit.acquire(size).await.is_err() {
+            if credit.acquire(data.len()).await.is_err() {
                 break;
             }
-            send_frame(&sink2, out).await;
+            send_payload(
+                &sink2,
+                crate::wire::KIND_WS_RECV,
+                if binary { crate::wire::FLAG_BINARY } else { 0 },
+                &id2,
+                &data,
+                || json!({"type": "ws_recv", "ws_id": id2, "data_b64": b64_encode(&data), "binary": binary}),
+            )
+            .await;
         }
         relays2.lock().await.remove(&id2);
         send_frame(&sink2, json!({"type": "ws_closed", "ws_id": id2})).await;
@@ -4167,6 +4186,19 @@ async fn relay_http(
     upload: Option<tokio::sync::mpsc::UnboundedReceiver<crate::flow::BodyItem>>,
 ) {
     let req_id = frame["req_id"].as_str().unwrap_or_default().to_string();
+    // 503 with Retry-After, answered at once: the consumer's client retries,
+    // which is better than queueing here while its own timeout runs.
+    let Some(_slot) = RelaySlot::take() else {
+        crate::flow::upload_end(&req_id, false);
+        send_frame(
+            &sink,
+            json!({"type": "http_resp", "req_id": req_id, "status": 503,
+            "headers": {"retry-after": "1"},
+            "body_b64": b64_encode(b"this provider is handling too many requests at once")}),
+        )
+        .await;
+        return;
+    };
     let session = frame["session"].as_str().unwrap_or_default().to_string();
     let Some((_, host_port)) = sessions.lock().await.get(&session).cloned() else {
         send_frame(
@@ -4292,10 +4324,16 @@ async fn relay_http(
                             // closes the container's connection.
                             break 'body;
                         }
-                        send_frame(
+                        send_payload(
                             &sink,
-                            json!({"type": "http_resp_chunk", "req_id": req_id,
-                            "body_b64": b64_encode(piece)}),
+                            crate::wire::KIND_HTTP_RESP_CHUNK,
+                            0,
+                            &req_id,
+                            piece,
+                            || {
+                                json!({"type": "http_resp_chunk", "req_id": req_id,
+                                "body_b64": b64_encode(piece)})
+                            },
                         )
                         .await;
                     }
@@ -4346,6 +4384,36 @@ async fn relay_http(
             )
             .await;
         }
+    }
+}
+
+/// Relayed requests this node will work on at once. Every `http` frame used to
+/// become a task with nothing counting them, so the only limit on how many
+/// connections, buffers and container sockets a gateway could make this
+/// process hold was the gateway's good behaviour. Generous on purpose: a page
+/// load is a burst of a hundred small requests.
+const MAX_RELAYS_IN_FLIGHT: usize = 256;
+
+static RELAYS_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A slot among `MAX_RELAYS_IN_FLIGHT`, given back when dropped.
+struct RelaySlot;
+
+impl RelaySlot {
+    fn take() -> Option<RelaySlot> {
+        use std::sync::atomic::Ordering;
+        RELAYS_IN_FLIGHT
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_RELAYS_IN_FLIGHT).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| RelaySlot)
+    }
+}
+
+impl Drop for RelaySlot {
+    fn drop(&mut self) {
+        RELAYS_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -4874,6 +4942,9 @@ async fn session(
         // response instead of buffering it, and announces kept sessions. A
         // gateway only sends `credit` frames to a node that says so.
         "protocol": 4,
+        // Bulk payload frames may be sent to this node as WebSocket binary
+        // messages (src/wire.rs). The JSON forms stay valid.
+        "binary_frames": true,
         // Which SYSTEM this build runs on, from the compiler, not probed at
         // runtime: "macos"/"linux"/"windows" and "aarch64"/"x86_64". The
         // gateway keeps these per node for an anonymous install count by
@@ -4950,6 +5021,7 @@ async fn session(
     // v4 gateways name a per-stream window; older ones do not, and then
     // nothing is paced. Also ends every stream of the previous connection.
     crate::flow::connected(crate::flow::window_from_welcome(&welcome));
+    crate::wire::set_peer_reads_binary(welcome["binary_frames"].as_bool().unwrap_or(false));
     crate::status::set_link(crate::status::Link::Online, String::new());
     crate::status::set_models(&models, &engines);
     log(format!(
@@ -5125,6 +5197,33 @@ async fn session(
                 last_rx = tokio::time::Instant::now();
                 let Some(msg) = msg else { break Err("connection closed".into()) };
                 let msg = match msg { Ok(m) => m, Err(e) => break Err(e.to_string()) };
+                // v4 bulk frames: payload raw behind a fixed header, no JSON
+                // and no base64 (src/wire.rs). Same effect as the JSON arms
+                // `http_req_chunk` and `ws_send` further down.
+                if let Message::Binary(raw) = &msg {
+                    if let Some(f) = crate::wire::unpack(raw) {
+                        match f.kind {
+                            crate::wire::KIND_HTTP_REQ_CHUNK => {
+                                crate::flow::upload_push(&f.stream_id, f.payload.to_vec());
+                            }
+                            crate::wire::KIND_WS_SEND => {
+                                let out = if f.flags & crate::wire::FLAG_BINARY != 0 {
+                                    Message::Binary(f.payload.to_vec())
+                                } else {
+                                    Message::Text(String::from_utf8_lossy(f.payload).into_owned())
+                                };
+                                let mut map = relays.lock().await;
+                                if let Some(tx) = map.get(&f.stream_id) {
+                                    if tx.send(out).is_err() {
+                                        map.remove(&f.stream_id);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
                 let Message::Text(text) = msg else { continue };
                 let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue };
                 match frame["type"].as_str() {
@@ -7160,5 +7259,30 @@ mod streamed_upload_tests {
         relay.await.unwrap();
         assert_eq!(resp["status"], 502);
         crate::flow::connected(None);
+    }
+}
+
+#[cfg(test)]
+mod relay_slot_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// Slots run out at the cap and come back when a relay ends, including
+    /// when it ends by being dropped mid-flight.
+    #[test]
+    fn slots_are_bounded_and_returned() {
+        let _serial = crate::flow::TEST_LOCK.blocking_lock();
+        let before = RELAYS_IN_FLIGHT.load(Ordering::Acquire);
+        let mut held = Vec::new();
+        while let Some(slot) = RelaySlot::take() {
+            held.push(slot);
+            assert!(held.len() <= MAX_RELAYS_IN_FLIGHT);
+        }
+        assert_eq!(before + held.len(), MAX_RELAYS_IN_FLIGHT);
+        assert!(RelaySlot::take().is_none());
+        held.pop();
+        assert!(RelaySlot::take().is_some());
+        drop(held);
+        assert_eq!(RELAYS_IN_FLIGHT.load(Ordering::Acquire), before);
     }
 }
