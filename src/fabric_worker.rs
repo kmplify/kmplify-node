@@ -29,7 +29,42 @@ use tokio_tungstenite::{
     connect_async, connect_async_with_config, tungstenite::Message, MaybeTlsStream, WebSocketStream,
 };
 
-const RECONNECT_DELAY: Duration = Duration::from_secs(10);
+/// Reconnect backoff bounds (protocol v4). The delay doubles from the floor
+/// to the ceiling while connections keep failing, with jitter, and resets
+/// once a connection has stayed up for `RECONNECT_HEALTHY_AFTER`.
+///
+/// This was a flat 10 s. With a few hundred nodes, a gateway restart then
+/// produced a synchronised reconnect storm every ten seconds, each wave
+/// arriving in the same instant the previous one failed in. The flat delay
+/// was also the wrong number at both ends: too slow for the common case (a
+/// gateway redeploy is back within two seconds, and hosted sessions are
+/// waiting on the grace window) and too fast for the rare one (a gateway
+/// that is down for an hour gains nothing from 360 dials per node).
+const RECONNECT_FLOOR: Duration = Duration::from_secs(1);
+const RECONNECT_CEILING: Duration = Duration::from_secs(60);
+/// A connection that lived this long was a real one: the next failure starts
+/// the backoff from the floor again instead of inheriting an old penalty.
+const RECONNECT_HEALTHY_AFTER: Duration = Duration::from_secs(60);
+
+/// How long to wait before dial number `attempt` (0 = first retry).
+///
+/// "Equal jitter": half the exponential step is fixed and half is random.
+/// Full jitter can draw a delay near zero, which turns a backoff back into
+/// a hammer for the unlucky node; no jitter at all is the synchronised
+/// storm this exists to prevent. `entropy` is injected so the arithmetic
+/// is testable.
+fn reconnect_delay(attempt: u32, entropy: u64) -> Duration {
+    let floor = RECONNECT_FLOOR.as_millis() as u64;
+    let ceiling = RECONNECT_CEILING.as_millis() as u64;
+    let step = floor.saturating_mul(1u64 << attempt.min(16)).min(ceiling);
+    let half = step / 2;
+    Duration::from_millis(half + entropy % (half + 1))
+}
+
+fn reconnect_entropy() -> u64 {
+    use rand_core::RngCore;
+    rand_core::OsRng.next_u64()
+}
 
 /// Session error that means "the operator asked for this": reconnect at once
 /// and say nothing alarming, rather than logging a lost connection and
@@ -5287,6 +5322,9 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
     // change made while the gateway is unreachable would otherwise sit out
     // the full backoff before anyone noticed it.
     let mut wake = control().subscribe();
+    // Consecutive failed connections, for the backoff. Reset by a connection
+    // that stayed up long enough to count as one.
+    let mut failed_attempts: u32 = 0;
     loop {
         if *stop.borrow() {
             return;
@@ -5297,7 +5335,16 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
         cfg = baseline.clone();
         crate::settings::Settings::load(&node_dir).apply(&mut cfg);
         publish_config(&cfg);
-        match session(&client, &cfg, &mut stop).await {
+        let dialled_at = std::time::Instant::now();
+        let outcome = session(&client, &cfg, &mut stop).await;
+        if dialled_at.elapsed() >= RECONNECT_HEALTHY_AFTER {
+            failed_attempts = 0;
+        }
+        // Computed here so the log lines below can name it; only COUNTED at
+        // the sleep, because the `continue` paths (operator asked, identity
+        // healed) dial again at once and are not failures to back off from.
+        let delay = reconnect_delay(failed_attempts, reconnect_entropy());
+        match outcome {
             Ok(()) => healed_since_connect = false,
             Err(e) => {
                 if *stop.borrow() {
@@ -5328,19 +5375,20 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
                     }
                 } else if e == AUTH_REJECTED {
                     log(format!(
-                        "gateway rejected even a freshly registered identity; retrying in {}s",
-                        RECONNECT_DELAY.as_secs()
+                        "gateway rejected even a freshly registered identity; retrying in {:.1}s",
+                        delay.as_secs_f32()
                     ));
                 } else {
                     log(format!(
-                        "connection lost ({e}); retrying in {}s",
-                        RECONNECT_DELAY.as_secs()
+                        "connection lost ({e}); retrying in {:.1}s",
+                        delay.as_secs_f32()
                     ));
                 }
             }
         }
+        failed_attempts = failed_attempts.saturating_add(1);
         tokio::select! {
-            _ = tokio::time::sleep(RECONNECT_DELAY) => {}
+            _ = tokio::time::sleep(delay) => {}
             _ = stop.changed() => {
                 if *stop.borrow() {
                     return;
@@ -6442,5 +6490,57 @@ mod relay_frame_limit_tests {
         assert!(!RELAY_STRIPPED_HEADERS.contains(&"authorization"));
         assert!(RELAY_STRIPPED_HEADERS.contains(&"proxy-authorization"));
         assert!(RELAY_STRIPPED_HEADERS.contains(&"host"));
+    }
+}
+
+#[cfg(test)]
+mod reconnect_backoff_tests {
+    use super::*;
+
+    /// The first retry is fast: a gateway redeploy is back within seconds and
+    /// hosted sessions are waiting on the grace window.
+    #[test]
+    fn the_first_retry_is_under_a_second() {
+        for e in [0u64, 1, 499, 500, u64::MAX] {
+            let d = reconnect_delay(0, e);
+            assert!(
+                d >= Duration::from_millis(500) && d <= Duration::from_secs(1),
+                "{d:?}"
+            );
+        }
+    }
+
+    /// Never near zero (a hammer) and never past the ceiling.
+    #[test]
+    fn every_delay_stays_between_half_the_step_and_the_step() {
+        for attempt in 0..40u32 {
+            let step = (1000u64 << attempt.min(16)).min(60_000);
+            for e in [0u64, 7, 12_345, u64::MAX] {
+                let ms = reconnect_delay(attempt, e).as_millis() as u64;
+                assert!(
+                    ms >= step / 2 && ms <= step,
+                    "attempt {attempt}: {ms}ms vs step {step}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn it_reaches_the_ceiling_and_stays_there() {
+        assert_eq!(
+            reconnect_delay(6, u64::MAX - 1).as_millis() as u64 <= 60_000,
+            true
+        );
+        assert!(reconnect_delay(30, 0) >= Duration::from_secs(30));
+        assert!(reconnect_delay(u32::MAX, u64::MAX) <= RECONNECT_CEILING);
+    }
+
+    /// Two nodes that fail in the same instant must not dial in the same
+    /// instant: that is the whole point of the jitter.
+    #[test]
+    fn different_entropy_spreads_the_fleet() {
+        let a = reconnect_delay(5, 1);
+        let b = reconnect_delay(5, 9_999);
+        assert_ne!(a, b);
     }
 }
