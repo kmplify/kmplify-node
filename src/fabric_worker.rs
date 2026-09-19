@@ -1542,8 +1542,49 @@ const NODE_LABEL: &str = "kmplify.fabric.node";
 pub fn noegress_network_name(container: &str) -> String {
     format!("{container}-net")
 }
-/// The guard image. Pinned by tag, tiny, pulled once per node.
-pub const GUARD_IMAGE: &str = "alpine/socat:1.8.0.0";
+/// The guard image, pinned by DIGEST. It used to be a tag, and a tag is a
+/// name somebody else can move: this container runs on every node that hosts
+/// a no-egress session and sits in the data path of all of them.
+///
+/// The digest is the multi-platform INDEX of `alpine/socat:1.8.0.0` (amd64,
+/// arm64, arm/v6, arm/v7, ppc64le, s390x), not one platform's manifest.
+/// Pinning a single platform's digest here would make every node of any
+/// other architecture fail its guard pull, and with it every no-egress
+/// session. The tag stays in the reference for the reader; Docker resolves
+/// the digest and ignores it.
+pub const GUARD_IMAGE: &str =
+    "alpine/socat:1.8.0.0@sha256:a6be4c0262b339c53ddad723cdd178a1a13271e1137c65e27f90a08c16de02b8";
+
+/// Open files per session container. Docker's default inherits the daemon's,
+/// which on many hosts is about a million: one container can then exhaust the
+/// host's file table for everyone else on the machine, the owner included.
+/// 65536 is far above what any template in the catalog opens.
+const SESSION_NOFILE: &str = "nofile=65536:65536";
+
+/// A `user` from a workload_start frame, if it is something this node will
+/// pass to `docker run --user`.
+///
+/// NUMERIC only, `uid` or `uid:gid`, and never root. A name would be resolved
+/// inside an image this node does not control, `0` would be a request to run
+/// as root spelled as hardening, and the value arrives over a socket, so
+/// anything else (whitespace, a flag, a path) is refused rather than quoted.
+pub fn session_user(v: Option<&str>) -> Option<String> {
+    let v = v?.trim();
+    let mut parts = v.split(':');
+    let uid = parts.next()?;
+    let gid = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
+    let numeric = |p: &str| !p.is_empty() && p.len() <= 10 && p.bytes().all(|b| b.is_ascii_digit());
+    if !numeric(uid) || gid.is_some_and(|g| !numeric(g)) {
+        return None;
+    }
+    if uid.parse::<u64>().ok()? == 0 {
+        return None;
+    }
+    Some(v.to_string())
+}
 
 /// The guard container that publishes a no-egress session's port.
 pub fn guard_name(container: &str) -> String {
@@ -3833,10 +3874,39 @@ async fn start_workload(
         format!("{cpus:.2}"),
         "--pids-limit".into(),
         "512".into(),
+        "--ulimit".into(),
+        SESSION_NOFILE.into(),
         // Protocol v3.5: owned-by label for the startup orphan sweep.
         "--label".into(),
         format!("{NODE_LABEL}={}", node_label().await),
     ];
+    // Protocol v4.1: a template whose image is known to run unprivileged says
+    // so, and the container then has no root inside it at all. Opt-in per
+    // template because it cannot be the default: much of the catalog (CUDA
+    // images that write under /root, anything that chowns at start) breaks
+    // without root, and a broken session is not a hardened one. A value this
+    // node does not like is REFUSED, not ignored: the catalog meant the
+    // session to run unprivileged, and running it as root instead would be
+    // the opposite of what was asked.
+    if let Some(raw) = frame["user"].as_str() {
+        match session_user(Some(raw)) {
+            Some(user) => {
+                args.push("--user".into());
+                args.push(user);
+            }
+            None => {
+                workload_status(
+                    &sink,
+                    &session,
+                    "error",
+                    "template asks for a container user this node will not set (numeric non-root uid[:gid] only)",
+                )
+                .await;
+                hosted_remove(&session).await;
+                return;
+            }
+        }
+    }
     if isolation == Isolation::Gvisor {
         args.push("--runtime".into());
         args.push("runsc".into());
@@ -7872,5 +7942,57 @@ mod work_receipt_tests {
             .unwrap(),
             r#"{"node_id":"n-1","pubkey":"ab","running_s":90,"session":"s-1","ts":1090}"#
         );
+    }
+}
+
+#[cfg(test)]
+mod container_hardening_tests {
+    use super::*;
+
+    #[test]
+    fn a_numeric_non_root_user_is_accepted() {
+        assert_eq!(session_user(Some("65534")).as_deref(), Some("65534"));
+        assert_eq!(session_user(Some("1001:0")).as_deref(), Some("1001:0"));
+        assert_eq!(
+            session_user(Some(" 1000:1000 ")).as_deref(),
+            Some("1000:1000")
+        );
+    }
+
+    /// The value arrives over a socket and becomes a docker argument.
+    #[test]
+    fn root_names_and_anything_clever_are_refused() {
+        for bad in [
+            "0",
+            "0:0",
+            "00",
+            "root",
+            "nobody",
+            "",
+            ":",
+            "1000:",
+            ":1000",
+            "1:2:3",
+            "1000 --privileged",
+            "-1",
+            "1000;id",
+            "99999999999",
+            "1e3",
+        ] {
+            assert_eq!(session_user(Some(bad)), None, "{bad:?}");
+        }
+        assert_eq!(session_user(None), None);
+    }
+
+    /// A tag is a name somebody else can move; the guard sits in the data
+    /// path of every no-egress session on the node.
+    #[test]
+    fn the_guard_image_is_pinned_by_digest() {
+        let (_, digest) = GUARD_IMAGE
+            .split_once("@sha256:")
+            .expect("pinned by digest");
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(GUARD_IMAGE.starts_with("alpine/socat:"));
     }
 }
