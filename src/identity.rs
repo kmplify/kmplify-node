@@ -62,19 +62,28 @@ pub struct NodeKey {
 impl std::fmt::Debug for NodeKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never the seed, not even in a debug dump.
-        f.debug_struct("NodeKey").field("address", &self.address()).finish()
+        f.debug_struct("NodeKey")
+            .field("address", &self.address())
+            .finish()
     }
 }
 
 impl NodeKey {
     pub fn generate() -> Self {
-        Self { signing: SigningKey::generate(&mut rand_core::OsRng) }
+        Self {
+            signing: SigningKey::generate(&mut rand_core::OsRng),
+        }
     }
 
     pub fn from_seed_hex(seed_hex: &str) -> Result<Self, String> {
-        let bytes = crate::functions::hex_decode(seed_hex.trim()).ok_or("identity seed is not hex")?;
-        let seed: [u8; 32] = bytes.try_into().map_err(|_| "identity seed must be 32 bytes".to_string())?;
-        Ok(Self { signing: SigningKey::from_bytes(&seed) })
+        let bytes =
+            crate::functions::hex_decode(seed_hex.trim()).ok_or("identity seed is not hex")?;
+        let seed: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| "identity seed must be 32 bytes".to_string())?;
+        Ok(Self {
+            signing: SigningKey::from_bytes(&seed),
+        })
     }
 
     pub fn seed_hex(&self) -> String {
@@ -96,18 +105,29 @@ impl NodeKey {
 
     /// Hex Ed25519 signature over `KMPLIFY-ID-v1/<purpose>\n` || canonical.
     pub fn sign(&self, purpose: &str, canonical: &[u8]) -> String {
-        hex_encode(&self.signing.sign(&signing_input(purpose, canonical)).to_bytes())
+        hex_encode(
+            &self
+                .signing
+                .sign(&signing_input(purpose, canonical))
+                .to_bytes(),
+        )
     }
 
     /// The signed body of a `POST /fabric/register` (protocol v3.7).
     pub fn register_fields(&self, gateway: &str, ts: u64) -> serde_json::Value {
-        let sig = self.sign(PURPOSE_NODE_REGISTER, &canonical_register(gateway, &self.public_hex(), ts));
+        let sig = self.sign(
+            PURPOSE_NODE_REGISTER,
+            &canonical_register(gateway, &self.public_hex(), ts),
+        );
         serde_json::json!({ "pubkey": self.public_hex(), "gateway": gateway, "ts": ts, "sig": sig })
     }
 
     /// The signed identity fields of a hello frame (protocol v3.7).
     pub fn hello_fields(&self, node_id: &str, ts: u64) -> serde_json::Value {
-        let sig = self.sign(PURPOSE_NODE_HELLO, &canonical_hello(node_id, &self.public_hex(), ts));
+        let sig = self.sign(
+            PURPOSE_NODE_HELLO,
+            &canonical_hello(node_id, &self.public_hex(), ts),
+        );
         serde_json::json!({ "pubkey": self.public_hex(), "ts": ts, "sig": sig })
     }
 }
@@ -145,11 +165,21 @@ pub fn canonical_hello(node_id: &str, pubkey_hex: &str, ts: u64) -> Vec<u8> {
 /// Verify a KIP-1 signature under a hex public key. Used by the tests and
 /// available to any companion that wants to check what a node said.
 pub fn verify(pubkey_hex: &str, purpose: &str, canonical: &[u8], sig_hex: &str) -> bool {
-    let Some(pk) = crate::functions::hex_decode(pubkey_hex) else { return false };
-    let Ok(pk): Result<[u8; 32], _> = pk.try_into() else { return false };
-    let Ok(key) = VerifyingKey::from_bytes(&pk) else { return false };
-    let Some(sig) = crate::functions::hex_decode(sig_hex) else { return false };
-    let Ok(sig) = ed25519_dalek::Signature::from_slice(&sig) else { return false };
+    let Some(pk) = crate::functions::hex_decode(pubkey_hex) else {
+        return false;
+    };
+    let Ok(pk): Result<[u8; 32], _> = pk.try_into() else {
+        return false;
+    };
+    let Ok(key) = VerifyingKey::from_bytes(&pk) else {
+        return false;
+    };
+    let Some(sig) = crate::functions::hex_decode(sig_hex) else {
+        return false;
+    };
+    let Ok(sig) = ed25519_dalek::Signature::from_slice(&sig) else {
+        return false;
+    };
     key.verify(&signing_input(purpose, canonical), &sig).is_ok()
 }
 
@@ -170,7 +200,13 @@ const CHARSET: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 const BECH32M_CONST: u32 = 0x2bc8_30a3;
 
 fn polymod(values: &[u8]) -> u32 {
-    const GEN: [u32; 5] = [0x3b6a_57b2, 0x2650_8e6d, 0x1ea1_19fa, 0x3d42_33dd, 0x2a14_62b3];
+    const GEN: [u32; 5] = [
+        0x3b6a_57b2,
+        0x2650_8e6d,
+        0x1ea1_19fa,
+        0x3d42_33dd,
+        0x2a14_62b3,
+    ];
     let mut chk: u32 = 1;
     for &v in values {
         let top = chk >> 25;
@@ -395,8 +431,14 @@ mod tests {
         assert!(raw.contains(NODE_ADDR));
         assert!(raw.contains(PUB));
         // The two things this file must never carry.
-        assert!(!raw.contains("token"), "the gateway token must never leak here");
-        assert!(!raw.contains(SEED), "the identity seed must never leak here");
+        assert!(
+            !raw.contains("token"),
+            "the gateway token must never leak here"
+        );
+        assert!(
+            !raw.contains(SEED),
+            "the identity seed must never leak here"
+        );
         let back = Identity::read(&dir).unwrap();
         assert_eq!(back.node_id, "abc123");
         assert_eq!(back.address, NODE_ADDR);

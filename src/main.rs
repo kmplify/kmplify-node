@@ -1437,7 +1437,12 @@ pub(crate) async fn start_node(cfg: WorkerConfig, dir: PathBuf) -> Node {
             status::update(move |s| s.node_id = id);
             // The PUBLIC half, in its own file, so a companion never has to
             // open the credential to learn the node id — see identity.rs.
-            kmplify_node::identity::publish_for(&dir, &c.node_id, &cfg.gateway_url, c.key().as_ref());
+            kmplify_node::identity::publish_for(
+                &dir,
+                &c.node_id,
+                &cfg.gateway_url,
+                c.key().as_ref(),
+            );
             status::push_log(format!(
                 "node identity {}…",
                 &c.node_id[..8.min(c.node_id.len())]

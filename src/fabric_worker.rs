@@ -1407,7 +1407,9 @@ async fn start_guard(container: &str, port: u64) -> Result<String, String> {
     if !present {
         let pull = tokio::time::timeout(
             Duration::from_secs(180),
-            crate::proc::command("docker").args(["pull", GUARD_IMAGE]).output(),
+            crate::proc::command("docker")
+                .args(["pull", GUARD_IMAGE])
+                .output(),
         )
         .await
         .map_err(|_| "pulling the guard image timed out".to_string())?
@@ -1470,7 +1472,11 @@ pub fn orphan_names(listed: &[String], live: &[String]) -> Vec<String> {
         .iter()
         .filter(|n| n.starts_with("kmplify-fabric-"))
         .filter(|n| !n.starts_with("kmplify-fabric-prefetch-"))
-        .filter(|n| !live.iter().any(|l| l == *n || guard_name(l).as_str() == n.as_str()))
+        .filter(|n| {
+            !live
+                .iter()
+                .any(|l| l == *n || guard_name(l).as_str() == n.as_str())
+        })
         .cloned()
         .collect()
 }
@@ -6241,8 +6247,8 @@ mod model_manifest_tests {
 
 #[cfg(test)]
 mod isolation_and_sweep_tests {
-    use super::{orphan_names, runtimes_from_info, Isolation};
     use super::{guard_run_args, noegress_network_name};
+    use super::{orphan_names, runtimes_from_info, Isolation};
 
     #[test]
     fn runtimes_are_read_from_docker_info_and_container_is_always_first() {
@@ -6294,7 +6300,10 @@ mod isolation_and_sweep_tests {
             "kmplify-fabric-aaaa-guard".to_string(),
         ];
         let live = vec!["kmplify-fabric-bbbb".to_string()];
-        assert_eq!(orphan_names(&listed, &live), vec!["kmplify-fabric-aaaa-guard"]);
+        assert_eq!(
+            orphan_names(&listed, &live),
+            vec!["kmplify-fabric-aaaa-guard"]
+        );
     }
 
     #[test]
@@ -6307,6 +6316,9 @@ mod isolation_and_sweep_tests {
         assert!(joined.contains("--label kmplify.fabric.node=node-x"));
         assert!(joined.ends_with("TCP-LISTEN:80,fork,reuseaddr TCP:172.30.0.2:80"));
         assert!(!joined.contains(&noegress_network_name("kmplify-fabric-abc")));
-        assert_eq!(noegress_network_name("kmplify-fabric-abc"), "kmplify-fabric-abc-net");
+        assert_eq!(
+            noegress_network_name("kmplify-fabric-abc"),
+            "kmplify-fabric-abc-net"
+        );
     }
 }
