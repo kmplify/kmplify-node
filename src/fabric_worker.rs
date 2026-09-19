@@ -7614,11 +7614,18 @@ mod streamed_upload_tests {
         let body =
             String::from_utf8(b64_decode(response["body_b64"].as_str().unwrap()).unwrap()).unwrap();
         assert_eq!(body, format!("{TOTAL}:{:x}", expect.finalize()));
-        // Nearly all of it was acknowledged (the last partial batch may not be).
+        // What is GUARANTEED, and no more: the sender starts with one window,
+        // so it cannot have sent everything unless at least TOTAL - WINDOW
+        // came back as grants. `>` here was a race, not an invariant: credit
+        // frames the node sends after its response arrive after this test
+        // has stopped reading, and whether the last batch is counted depends
+        // on scheduling. It passed on the Mac it was written on and failed on
+        // CI's Linux and Windows runners, with the upload itself byte-exact.
         assert!(
-            granted as usize > TOTAL - WINDOW,
+            granted as usize >= TOTAL - WINDOW,
             "granted only {granted} of {TOTAL}"
         );
+        assert!(granted as usize <= TOTAL, "granted more than was sent");
         crate::flow::connected(None);
     }
 
