@@ -6421,15 +6421,15 @@ mod relay_frame_limit_tests {
     /// over it. This is the arithmetic that mistake hides in.
     #[test]
     fn a_body_at_the_cap_still_fits_in_a_frame() {
-        let encoded = (MAX_RELAY_BODY_BYTES + 2) / 3 * 4;
+        let encoded = MAX_RELAY_BODY_BYTES.div_ceil(3) * 4;
         assert!(
             encoded < MAX_FRAME_BYTES,
             "a {MAX_RELAY_BODY_BYTES} byte body encodes to {encoded}, over the \
              {MAX_FRAME_BYTES} byte frame cap"
         );
-        assert!(MAX_RELAY_BODY_BYTES < MAX_FRAME_BYTES);
         // Still a useful size, not a cap so tight it refuses ordinary work.
-        assert!(MAX_RELAY_BODY_BYTES > 8 * 1024 * 1024);
+        const { assert!(MAX_RELAY_BODY_BYTES < MAX_FRAME_BYTES) };
+        const { assert!(MAX_RELAY_BODY_BYTES > 8 * 1024 * 1024) };
     }
 
     /// Consumers do not authenticate to a workload with a fabric key, so the
