@@ -14,6 +14,7 @@
 //! See PROTOCOL.md for the wire format and the trust model, and README.md for
 //! the operator's view.
 
+pub mod catalog;
 pub mod control;
 pub mod engines;
 pub mod fabric_worker;

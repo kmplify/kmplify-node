@@ -1427,8 +1427,46 @@ pub fn runtimes_from_info(json_text: &str) -> Vec<String> {
         if map.contains_key("runsc") {
             out.push("gvisor".to_string());
         }
+        if microvm_runtime(&map).is_some() {
+            out.push("microvm".to_string());
+        }
     }
     out
+}
+
+/// Docker runtime names that put a session behind a real VM boundary, in the
+/// order this node prefers them.
+///
+/// These are the names Kata Containers registers. `kata-clh` (Cloud
+/// Hypervisor) and `kata-qemu` can pass a GPU through with VFIO; `kata-fc`
+/// (Firecracker) cannot, by design: no PCIe. That is why Firecracker is not
+/// simply "the microvm runtime" and why the order puts it last: on a GPU box
+/// the generic name or the VFIO-capable ones are what an operator installed
+/// for a reason. An unknown name is never mapped: a runtime this list does
+/// not know may be anything, and "microvm" is a promise to a consumer.
+const MICROVM_RUNTIMES: &[&str] = &["kata", "kata-clh", "kata-qemu", "kata-fc"];
+
+pub fn microvm_runtime(runtimes: &serde_json::Map<String, Value>) -> Option<&'static str> {
+    MICROVM_RUNTIMES
+        .iter()
+        .copied()
+        .find(|name| runtimes.contains_key(*name))
+}
+
+/// The Kata runtime installed on this host, if any.
+async fn docker_microvm_runtime() -> Option<&'static str> {
+    let probe = crate::proc::command("docker")
+        .args(["info", "--format", "{{json .Runtimes}}"])
+        .output();
+    match tokio::time::timeout(DOCKER_PROBE_TIMEOUT, probe).await {
+        Ok(Ok(o)) if o.status.success() => {
+            match serde_json::from_str::<Value>(String::from_utf8_lossy(&o.stdout).trim()) {
+                Ok(Value::Object(map)) => microvm_runtime(&map),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Sandbox level a `workload_start` asks for (protocol v3.5). Absent means
@@ -2258,6 +2296,21 @@ fn image_repository(image: &str) -> String {
 /// through, so a gateway cannot introduce a new template id to an old node
 /// and have it run whatever comes attached.
 pub fn image_allowed_for(template: &str, image: &str) -> bool {
+    image_allowed_with(crate::catalog::current().as_ref(), template, image)
+}
+
+/// `image_allowed_for` over an explicit catalog, so the rule can be tested
+/// without touching the process-wide one.
+pub fn image_allowed_with(
+    catalog: Option<&crate::catalog::Catalog>,
+    template: &str,
+    image: &str,
+) -> bool {
+    // A verified catalog may REVOKE a template, compiled-in ones included:
+    // that is how a withdrawn image stops running without a node release.
+    if catalog.is_some_and(|c| c.revoked.contains(template)) {
+        return false;
+    }
     let repo = image_repository(image);
     IMAGE_PINS
         .iter()
@@ -2265,6 +2318,49 @@ pub fn image_allowed_for(template: &str, image: &str) -> bool {
         || extra_image_pins()
             .iter()
             .any(|(t, pinned)| t == template && &repo == pinned)
+        // And it may ADD one this build predates. A catalog entry that
+        // contradicts a compiled-in pin never gets this far: it is refused
+        // when the catalog is verified (src/catalog.rs).
+        || catalog
+            .and_then(|c| c.entries.get(template))
+            .is_some_and(|e| e.repository == repo)
+}
+
+/// The compiled-in repository for a template, for the catalog's conflict
+/// check. Operator extra pins count: they are this owner's own floor.
+pub fn pinned_repository(template: &str) -> Option<String> {
+    IMAGE_PINS
+        .iter()
+        .find(|p| p.template == template)
+        .map(|p| p.repository.to_string())
+        .or_else(|| {
+            extra_image_pins()
+                .iter()
+                .find(|(t, _)| t == template)
+                .map(|(_, r)| r.clone())
+        })
+}
+
+/// The reference this node actually pulls. When the verified catalog pins a
+/// digest for the template, that digest replaces whatever tag (or digest) the
+/// gateway sent: which bytes run here is the publisher's statement, and the
+/// far end of the socket does not get to choose others.
+pub fn image_to_pull(template: &str, image: &str) -> String {
+    image_to_pull_with(crate::catalog::current().as_ref(), template, image)
+}
+
+pub fn image_to_pull_with(
+    catalog: Option<&crate::catalog::Catalog>,
+    template: &str,
+    image: &str,
+) -> String {
+    match catalog
+        .and_then(|c| c.entries.get(template))
+        .and_then(|e| e.digest.as_deref())
+    {
+        Some(digest) => crate::catalog::with_digest(image, digest),
+        None => image.to_string(),
+    }
 }
 
 /// Is this a tmpfs path we will mount under a read-only rootfs?
@@ -2297,10 +2393,26 @@ pub fn tmpfs_path_ok(path: &str) -> bool {
 /// has no ceiling to consult and gets `None`: the safe end, since nothing here
 /// vouches for what it would reach.
 pub fn network_for(template: &str, requested: Network) -> Network {
+    network_with(crate::catalog::current().as_ref(), template, requested)
+}
+
+pub fn network_with(
+    catalog: Option<&crate::catalog::Catalog>,
+    template: &str,
+    requested: Network,
+) -> Network {
     let ceiling = IMAGE_PINS
         .iter()
         .find(|p| p.template == template)
         .map(|p| p.network)
+        // A template this build predates gets the ceiling its publisher
+        // signed. For a compiled-in template the build's own ceiling stands:
+        // a catalog may add, never widen.
+        .or_else(|| {
+            catalog
+                .and_then(|c| c.entries.get(template))
+                .map(|e| e.network)
+        })
         .unwrap_or(Network::None);
     ceiling.min(requested)
 }
@@ -3392,6 +3504,18 @@ async fn start_workload(
         .await;
         return;
     }
+    // From here on `image` is what this node pulls and runs. With a digest
+    // pinned by the verified catalog that is `repository@sha256:...`, and the
+    // gateway's tag is no longer consulted.
+    let image = {
+        let pinned = image_to_pull(&template, &image);
+        if pinned != image {
+            log(format!(
+                "session {session}: catalog pins {template} to {pinned}"
+            ));
+        }
+        pinned
+    };
     let accel = cfg.accel();
     if let Some(need) = required {
         if need != accel {
@@ -3460,14 +3584,19 @@ async fn start_workload(
             }
         }
         Isolation::Microvm => {
-            workload_status(
-                &sink,
-                &session,
-                "error",
-                "template requires microvm isolation, which this node does not offer",
-            )
-            .await;
-            return;
+            // Real since protocol v4.1: a host with Kata Containers installed
+            // runs the session in a VM. Still refused everywhere else, so a
+            // template that asks for a VM boundary never quietly gets less.
+            if docker_microvm_runtime().await.is_none() {
+                workload_status(
+                    &sink,
+                    &session,
+                    "error",
+                    "template requires microvm isolation but no Kata runtime is installed on this node",
+                )
+                .await;
+                return;
+            }
         }
     }
 
@@ -3683,6 +3812,19 @@ async fn start_workload(
     if isolation == Isolation::Gvisor {
         args.push("--runtime".into());
         args.push("runsc".into());
+    }
+    if isolation == Isolation::Microvm {
+        // Checked a moment ago in the isolation match; asked again rather
+        // than threaded through, and failing CLOSED if it vanished meanwhile:
+        // a bogus runtime name makes `docker run` fail, which is the right
+        // outcome for a session that was promised a VM.
+        args.push("--runtime".into());
+        args.push(
+            docker_microvm_runtime()
+                .await
+                .unwrap_or("kata-runtime-missing")
+                .into(),
+        );
     }
     // Protocol v3.2. `--network none` leaves the container loopback only: it
     // cannot reach the provider's LAN, cannot call home, cannot exfiltrate
@@ -4387,6 +4529,109 @@ async fn relay_http(
     }
 }
 
+/// Set once a gateway answered `welcome` on the current connection.
+static WELCOMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the connection that just ended had been accepted by the gateway,
+/// clearing the mark for the next one.
+fn session_was_welcomed() -> bool {
+    WELCOMED.swap(false, std::sync::atomic::Ordering::AcqRel)
+}
+
+/// Whether a rejected identity should be re-registered right now.
+///
+/// Once per REJECTION STREAK, not once per process: `healed` is cleared by
+/// any connection the gateway welcomed. Without a cap at all a gateway that
+/// rejects even a fresh identity would spin register/reject with no delay.
+fn should_reregister(error: &str, healed_since_welcome: bool) -> bool {
+    error == AUTH_REJECTED && !healed_since_welcome
+}
+
+/// Publisher keys this node's owner trusts for the workload catalog.
+fn trusted_publishers() -> Vec<String> {
+    crate::catalog::parse_trusted(&std::env::var("KMPLIFY_TRUSTED_PUBLISHERS").unwrap_or_default())
+}
+
+/// Verify an envelope against this node's trust and floor, and adopt it.
+fn adopt_catalog(
+    envelope: &Value,
+    node_dir: &std::path::Path,
+    trusted: &[String],
+) -> Result<String, String> {
+    let held = crate::catalog::load_held_version(node_dir).max(crate::catalog::version());
+    let (catalog, notes) =
+        crate::catalog::verify(envelope, trusted, held, &pinned_repository, &|image| {
+            image_repository(image)
+        })
+        .map_err(|e| e.to_string())?;
+    for note in notes {
+        log(note);
+    }
+    let summary = format!(
+        "signed catalog v{} from publisher '{}' adopted: {} entr{}, {} revoked",
+        catalog.version,
+        catalog.publisher,
+        catalog.entries.len(),
+        if catalog.entries.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        catalog.revoked.len(),
+    );
+    // Version first: if the write fails the catalog is still adopted for this
+    // run, and the worst case is that a rollback is not caught after a
+    // restart that also lost the cached document, which then refetches.
+    if let Err(e) = crate::catalog::save_held_version(node_dir, catalog.version) {
+        log(format!(
+            "could not persist the catalog version ({e}); rollback protection is per-run only"
+        ));
+    }
+    let _ = std::fs::write(node_dir.join("catalog.json"), envelope.to_string());
+    crate::catalog::install(catalog);
+    Ok(summary)
+}
+
+async fn fetch_catalog(
+    client: &reqwest::Client,
+    gateway_url: &str,
+    node_dir: &std::path::Path,
+    trusted: &[String],
+) -> Result<String, String> {
+    let resp = client
+        .get(format!("{gateway_url}/v1/catalog"))
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("gateway answered {}", resp.status()));
+    }
+    let envelope: Value = resp.json().await.map_err(|e| e.to_string())?;
+    adopt_catalog(&envelope, node_dir, trusted)
+}
+
+/// The catalog this install verified last time, so a restart (or a gateway
+/// that is down) does not lose templates the owner already runs.
+fn restore_catalog(node_dir: &std::path::Path) {
+    let trusted = trusted_publishers();
+    if trusted.is_empty() {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(node_dir.join("catalog.json")) else {
+        return;
+    };
+    let Ok(envelope) = serde_json::from_str::<Value>(&text) else {
+        return;
+    };
+    // Verified again, not believed because it is on our disk: the trust list
+    // may have changed since it was written.
+    match adopt_catalog(&envelope, node_dir, &trusted) {
+        Ok(msg) => log(format!("{msg} (restored from disk)")),
+        Err(e) => log(format!("cached catalog not restored: {e}")),
+    }
+}
+
 /// Relayed requests this node will work on at once. Every `http` frame used to
 /// become a task with nothing counting them, so the only limit on how many
 /// connections, buffers and container sockets a gateway could make this
@@ -4942,6 +5187,10 @@ async fn session(
         // response instead of buffering it, and announces kept sessions. A
         // gateway only sends `credit` frames to a node that says so.
         "protocol": 4,
+        // Highest signed catalog this node holds, 0 when it trusts no
+        // publisher (src/catalog.rs). Lets an operator see which nodes have
+        // picked up a new catalog without asking them.
+        "catalog_version": crate::catalog::version(),
         // Bulk payload frames may be sent to this node as WebSocket binary
         // messages (src/wire.rs). The JSON forms stay valid.
         "binary_frames": true,
@@ -5015,6 +5264,9 @@ async fn session(
     if welcome["type"] != "welcome" {
         return Err(format!("gateway refused: {welcome}"));
     }
+    // The gateway accepted this identity. `run` reads this to know the
+    // connection was a real one (see healed_since_connect there).
+    WELCOMED.store(true, std::sync::atomic::Ordering::Release);
     // The link is back inside the grace window: the sessions announced in
     // the hello stay, and the deadline that would have removed them is off.
     disarm_grace_reaper();
@@ -5022,6 +5274,29 @@ async fn session(
     // nothing is paced. Also ends every stream of the previous connection.
     crate::flow::connected(crate::flow::window_from_welcome(&welcome));
     crate::wire::set_peer_reads_binary(welcome["binary_frames"].as_bool().unwrap_or(false));
+    // The signed workload catalog (src/catalog.rs). Only a node whose owner
+    // named a publisher to trust looks at it at all; then it is fetched when
+    // the gateway advertises something newer than what is held. Off the
+    // session loop: a slow or absent catalog must not delay serving.
+    {
+        let offered = welcome["catalog_version"].as_u64().unwrap_or(0);
+        let trusted = trusted_publishers();
+        if !trusted.is_empty() && offered > crate::catalog::version() {
+            let client = client.clone();
+            let gateway_url = cfg.gateway_url.clone();
+            let node_dir = cfg
+                .creds_path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_default();
+            tokio::spawn(async move {
+                match fetch_catalog(&client, &gateway_url, &node_dir, &trusted).await {
+                    Ok(msg) => log(msg),
+                    Err(e) => log(format!("signed catalog not adopted: {e}")),
+                }
+            });
+        }
+    }
     crate::status::set_link(crate::status::Link::Online, String::new());
     crate::status::set_models(&models, &engines);
     log(format!(
@@ -5635,6 +5910,7 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
     // environment resolves to — the two differ the moment a service unit and
     // an operator's shell disagree.
     publish_config(&cfg);
+    restore_catalog(&node_dir);
     if cfg.vectors.enabled {
         let loaded = vectors_store(&cfg).load().await;
         if loaded > 0 {
@@ -5705,6 +5981,17 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
         // the sleep, because the `continue` paths (operator asked, identity
         // healed) dial again at once and are not failures to back off from.
         let delay = reconnect_delay(failed_attempts, reconnect_entropy());
+        // "Reset after any session that actually ran", which the comment
+        // above always promised and the code never did: the flag was cleared
+        // only on Ok(()), and session() returns Ok only when the worker is
+        // stopping. So a node healed a rejected identity exactly ONCE per
+        // process lifetime. The second time its gateway lost the registry
+        // (a redeploy with a fresh volume is enough) it logged "rejected even
+        // a freshly registered identity" with a growing backoff until a human
+        // restarted it. Found on the local rig by wiping the gateway twice.
+        if session_was_welcomed() {
+            healed_since_connect = false;
+        }
         match outcome {
             Ok(()) => healed_since_connect = false,
             Err(e) => {
@@ -5719,7 +6006,7 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
                     continue;
                 }
                 crate::status::set_link(crate::status::Link::Retrying, e.clone());
-                if e == AUTH_REJECTED && !healed_since_connect {
+                if should_reregister(&e, healed_since_connect) {
                     // The gateway does not know this node id — retrying with
                     // it can only fail identically, forever. Mint a fresh
                     // identity for THIS gateway and reconnect immediately; an
@@ -7284,5 +7571,185 @@ mod relay_slot_tests {
         assert!(RelaySlot::take().is_some());
         drop(held);
         assert_eq!(RELAYS_IN_FLIGHT.load(Ordering::Acquire), before);
+    }
+}
+
+#[cfg(test)]
+mod signed_catalog_enforcement_tests {
+    use super::*;
+    use crate::catalog::{Catalog, Entry};
+
+    const DIGEST: &str = "sha256:abababababababababababababababababababababababababababababababab";
+
+    fn catalog() -> Catalog {
+        let mut c = Catalog {
+            version: 7,
+            publisher: "kmplify".into(),
+            ..Default::default()
+        };
+        c.entries.insert(
+            "brand-new".into(),
+            Entry {
+                repository: "good/brand-new".into(),
+                network: Network::Egress,
+                digest: Some(DIGEST.into()),
+            },
+        );
+        c.entries.insert(
+            "quiet-new".into(),
+            Entry {
+                repository: "good/quiet".into(),
+                network: Network::None,
+                digest: None,
+            },
+        );
+        c.revoked.insert("ollama".into());
+        c
+    }
+
+    /// The point of the whole lane: a template this build has never heard of
+    /// runs, under its publisher's repository and nothing else.
+    #[test]
+    fn a_signed_entry_admits_a_template_this_build_predates() {
+        let c = catalog();
+        assert!(!image_allowed_with(None, "brand-new", "good/brand-new:1"));
+        assert!(image_allowed_with(
+            Some(&c),
+            "brand-new",
+            "good/brand-new:1"
+        ));
+        assert!(image_allowed_with(
+            Some(&c),
+            "brand-new",
+            "docker.io/good/brand-new:2"
+        ));
+        assert!(!image_allowed_with(
+            Some(&c),
+            "brand-new",
+            "evil/brand-new:1"
+        ));
+        assert!(!image_allowed_with(
+            Some(&c),
+            "quiet-new",
+            "good/brand-new:1"
+        ));
+    }
+
+    /// Withdrawing an image without a node release.
+    #[test]
+    fn revocation_beats_even_a_compiled_in_pin() {
+        let c = catalog();
+        assert!(image_allowed_with(None, "ollama", "ollama/ollama:latest"));
+        assert!(!image_allowed_with(
+            Some(&c),
+            "ollama",
+            "ollama/ollama:latest"
+        ));
+        // Everything else compiled in is untouched by an unrelated catalog.
+        assert!(image_allowed_with(
+            Some(&c),
+            "echo-test",
+            "traefik/whoami:latest"
+        ));
+    }
+
+    /// Which bytes run here is the publisher's statement, not the gateway's.
+    #[test]
+    fn a_pinned_digest_replaces_whatever_tag_the_gateway_sent() {
+        let c = catalog();
+        assert_eq!(
+            image_to_pull_with(Some(&c), "brand-new", "good/brand-new:latest"),
+            format!("good/brand-new@{DIGEST}")
+        );
+        assert_eq!(
+            image_to_pull_with(Some(&c), "quiet-new", "good/quiet:3"),
+            "good/quiet:3"
+        );
+        assert_eq!(
+            image_to_pull_with(None, "brand-new", "good/brand-new:latest"),
+            "good/brand-new:latest"
+        );
+    }
+
+    #[test]
+    fn a_catalog_sets_the_ceiling_only_for_templates_it_added() {
+        let c = catalog();
+        assert_eq!(
+            network_with(Some(&c), "brand-new", Network::Egress),
+            Network::Egress
+        );
+        assert_eq!(
+            network_with(Some(&c), "quiet-new", Network::Egress),
+            Network::None
+        );
+        assert_eq!(
+            network_with(None, "brand-new", Network::Egress),
+            Network::None
+        );
+        // echo-test is compiled in with no network; nothing signed widens it.
+        let mut wide = catalog();
+        wide.entries.insert(
+            "echo-test".into(),
+            Entry {
+                repository: "traefik/whoami".into(),
+                network: Network::Egress,
+                digest: None,
+            },
+        );
+        assert_eq!(
+            network_with(Some(&wide), "echo-test", Network::Egress),
+            Network::None
+        );
+    }
+
+    /// Kata's names mean a VM; nothing else does, and an unknown runtime is
+    /// never promoted to a promise made to a consumer.
+    #[test]
+    fn kata_runtimes_are_the_microvm_rung_and_nothing_else_is() {
+        assert_eq!(runtimes_from_info(r#"{"runc":{}}"#), vec!["container"]);
+        assert_eq!(
+            runtimes_from_info(r#"{"runc":{},"runsc":{},"kata-clh":{}}"#),
+            vec!["container", "gvisor", "microvm"]
+        );
+        assert_eq!(
+            runtimes_from_info(r#"{"runc":{},"totally-a-vm":{},"firecracker":{}}"#),
+            vec!["container"]
+        );
+        let both: serde_json::Map<String, Value> =
+            serde_json::from_str(r#"{"kata-fc":{},"kata-qemu":{}}"#).unwrap();
+        // Firecracker last: it cannot pass a GPU through.
+        assert_eq!(microvm_runtime(&both), Some("kata-qemu"));
+    }
+}
+
+#[cfg(test)]
+mod identity_heal_tests {
+    use super::*;
+
+    /// The regression: gateway loses its registry, node heals, runs for a
+    /// week, gateway loses it again. The second time has to heal too.
+    #[test]
+    fn a_welcomed_connection_re_arms_the_heal() {
+        let mut healed = false;
+        // First loss: heal.
+        assert!(should_reregister(AUTH_REJECTED, healed));
+        healed = true;
+        // Rejected again straight away: do NOT spin, back off instead.
+        assert!(!should_reregister(AUTH_REJECTED, healed));
+        // The gateway then welcomes a connection...
+        WELCOMED.store(true, std::sync::atomic::Ordering::Release);
+        if session_was_welcomed() {
+            healed = false;
+        }
+        // ...so the next registry loss heals again.
+        assert!(should_reregister(AUTH_REJECTED, healed));
+        // The mark is consumed: a later failed dial is not "welcomed".
+        assert!(!session_was_welcomed());
+    }
+
+    #[test]
+    fn only_a_rejected_identity_triggers_a_re_registration() {
+        assert!(!should_reregister("connection closed", false));
+        assert!(!should_reregister(RECONNECT_REQUESTED, false));
     }
 }
