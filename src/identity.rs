@@ -51,6 +51,8 @@ pub const MAX_CLOCK_SKEW_S: u64 = 300;
 
 pub const PURPOSE_NODE_REGISTER: &str = "node-register";
 pub const PURPOSE_NODE_HELLO: &str = "node-hello";
+/// This node's own statement of how long a session has been running here.
+pub const PURPOSE_NODE_RECEIPT: &str = "node-receipt";
 
 /// The node's Ed25519 identity key. Holds the secret; hand out only what the
 /// accessors give you.
@@ -122,6 +124,29 @@ impl NodeKey {
         serde_json::json!({ "pubkey": self.public_hex(), "gateway": gateway, "ts": ts, "sig": sig })
     }
 
+    /// A signed receipt for one session (protocol v4.1): "this node says
+    /// session S has been running here for N whole seconds, as of ts".
+    ///
+    /// CUMULATIVE on purpose. A per-interval receipt that is lost is lost
+    /// money and an argument; a cumulative one is superseded by the next, so
+    /// the gateway only ever needs the latest and a dropped pong costs nothing.
+    ///
+    /// The identity key signs a statement ABOUT this node and nothing else.
+    /// It authenticates; it is never a wallet and moves no value (REWARDS.md).
+    pub fn receipt(
+        &self,
+        node_id: &str,
+        session: &str,
+        running_s: u64,
+        ts: u64,
+    ) -> serde_json::Value {
+        let sig = self.sign(
+            PURPOSE_NODE_RECEIPT,
+            &canonical_receipt(node_id, &self.public_hex(), session, running_s, ts),
+        );
+        serde_json::json!({ "session": session, "running_s": running_s, "ts": ts, "sig": sig })
+    }
+
     /// The signed identity fields of a hello frame (protocol v3.7).
     pub fn hello_fields(&self, node_id: &str, ts: u64) -> serde_json::Value {
         let sig = self.sign(
@@ -147,6 +172,25 @@ pub fn canonical_register(gateway: &str, pubkey_hex: &str, ts: u64) -> Vec<u8> {
         "{{\"gateway\":{},\"pubkey\":{},\"ts\":{}}}",
         serde_json::json!(gateway),
         serde_json::json!(pubkey_hex),
+        ts
+    )
+    .into_bytes()
+}
+
+/// Canonical JSON of a work receipt: keys sorted, no whitespace.
+pub fn canonical_receipt(
+    node_id: &str,
+    pubkey_hex: &str,
+    session: &str,
+    running_s: u64,
+    ts: u64,
+) -> Vec<u8> {
+    format!(
+        "{{\"node_id\":{},\"pubkey\":{},\"running_s\":{},\"session\":{},\"ts\":{}}}",
+        serde_json::json!(node_id),
+        serde_json::json!(pubkey_hex),
+        running_s,
+        serde_json::json!(session),
         ts
     )
     .into_bytes()
