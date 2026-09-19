@@ -28,6 +28,7 @@ pub mod rewards;
 pub mod settings;
 pub mod status;
 pub mod vectors;
+pub mod wire;
 
 /// This crate's NOTICE, compiled in.
 ///
