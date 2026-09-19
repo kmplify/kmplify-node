@@ -25,7 +25,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::{watch, Mutex};
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    connect_async, connect_async_with_config, tungstenite::Message, MaybeTlsStream, WebSocketStream,
+};
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(10);
 
@@ -41,6 +43,31 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// deadline the worker sat "connected" for good while the gateway had long
 /// forgotten it. 45s = four missed pings, comfortably past jitter.
 const GATEWAY_SILENCE_TIMEOUT: Duration = Duration::from_secs(45);
+/// Largest frame this node will send or accept on the gateway socket, and the
+/// cap on a relayed response body. One number across all three
+/// implementations: uvicorn's `--ws-max-size` on the gateway, `MAX_FRAME_BYTES`
+/// in the reference worker, and this. See ../docs/PROTOCOL.md "Frame size".
+///
+/// Why a relayed body has to be capped HERE and not only at the gateway: a
+/// container answering with a 200 MB file becomes one ~267 MB base64 frame,
+/// and a frame over the gateway's limit does not fail that one request, it
+/// closes the socket. Every other session this node is hosting dies with it.
+/// Refusing the single oversized response is the only outcome that keeps the
+/// rest of the node's work alive.
+const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// Frame limits for the gateway socket, matching the gateway's own.
+fn gateway_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(MAX_FRAME_BYTES),
+        max_frame_size: Some(MAX_FRAME_BYTES),
+        ..Default::default()
+    }
+}
+
+/// Room for base64 (4/3) plus the surrounding JSON, so a body at the cap
+/// still produces a frame under it.
+const MAX_RELAY_BODY_BYTES: usize = (MAX_FRAME_BYTES / 4) * 3 - 4096;
 /// How often a quiet image pull reports "still working" upstream.
 const PULL_HEARTBEAT: Duration = Duration::from_secs(20);
 /// Docker daemon liveness probe. Short: it runs on the telemetry path, and a
@@ -3959,6 +3986,22 @@ async fn ws_open(sink: Arc<Mutex<WsSink>>, sessions: Sessions, relays: RelaySock
 /// relay into the container. `host` would address the wrong server,
 /// `content-length`/`transfer-encoding` are rewritten by the client that
 /// actually sends the bytes, and the rest are connection management.
+///
+/// Deliberately NOT in this list: `authorization`. A consumer needs no bearer
+/// to reach a session (the session id in the relay path is the capability), so
+/// a client that attaches its fabric key by habit used to hand that key to
+/// whoever operates this machine. That leak is closed at the GATEWAY, which
+/// strips the header unless the template declares `forward_authorization`
+/// because the header is the template's own app token: Jupyter's
+/// `token <JUPYTER_TOKEN>`, n8n's basic auth, and every AWS SDK's
+/// `AWS4-HMAC-SHA256` signature for floci.
+///
+/// Stripping it here as well would be better defence in depth, and cannot be
+/// done yet: the node is not told which template policy applies, so an
+/// unconditional strip here would silently stop those three templates from
+/// authenticating at all. Doing it properly needs the gateway to carry the
+/// per-session flag in the start frame, which is a protocol addition and
+/// belongs with the transport round, not with this one.
 const RELAY_STRIPPED_HEADERS: &[&str] = &[
     "host",
     "connection",
@@ -4074,6 +4117,33 @@ async fn relay_http(
                 send_frame(&sink, json!({"type": "http_resp_end", "req_id": req_id})).await;
             } else {
                 let body = resp.bytes().await.unwrap_or_default();
+                if body.len() > MAX_RELAY_BODY_BYTES {
+                    // 502, not a truncated 200: a half-delivered file that
+                    // claims success is worse than an error, and the consumer
+                    // can act on this message.
+                    log(format!(
+                        "relay: refused a {} byte response from the container \
+                         (cap {MAX_RELAY_BODY_BYTES}); sending it would have \
+                         closed the gateway connection and every session on it",
+                        body.len()
+                    ));
+                    send_frame(
+                        &sink,
+                        json!({"type": "http_resp", "req_id": req_id, "status": 502,
+                        "headers": {}, "body_b64": b64_encode(
+                            format!(
+                                "the workload answered with {} bytes, over the \
+                                 {MAX_RELAY_BODY_BYTES} byte relay limit for a \
+                                 single response. Stream it (text/event-stream \
+                                 or application/x-ndjson) or fetch it in ranges.",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )}),
+                    )
+                    .await;
+                    return;
+                }
                 send_frame(
                     &sink,
                     json!({"type": "http_resp", "req_id": req_id, "status": status,
@@ -4521,7 +4591,13 @@ async fn session(
         cfg.gateway_url.replacen("http", "ws", 1)
     );
     crate::status::set_link(crate::status::Link::Connecting, ws_url.clone());
-    let (ws, _) = connect_async(&ws_url).await.map_err(|e| e.to_string())?;
+    // Explicit frame limits rather than tungstenite's defaults (64 MiB
+    // message, 16 MiB frame): the gateway enforces 16 MiB, and a node that
+    // would accept more only discovers the mismatch when a large payload
+    // closes the socket mid-session.
+    let (ws, _) = connect_async_with_config(&ws_url, Some(gateway_ws_config()), false)
+        .await
+        .map_err(|e| e.to_string())?;
     let (write, mut read) = ws.split();
     let sink = Arc::new(Mutex::new(write));
     // Register as THE live connection, so frames from session tasks born on
@@ -6320,5 +6396,51 @@ mod isolation_and_sweep_tests {
             noegress_network_name("kmplify-fabric-abc"),
             "kmplify-fabric-abc-net"
         );
+    }
+}
+
+#[cfg(test)]
+mod relay_frame_limit_tests {
+    use super::*;
+
+    /// One number across three implementations. The gateway passes
+    /// `--ws-max-size 16777216`, the reference worker passes the same to
+    /// `websockets.connect`, and this is the node's copy. A node that accepts
+    /// more than the gateway does discovers the mismatch when a large payload
+    /// closes the socket, which takes every session on the node with it.
+    #[test]
+    fn the_frame_cap_matches_the_gateways() {
+        assert_eq!(MAX_FRAME_BYTES, 16 * 1024 * 1024);
+        let cfg = gateway_ws_config();
+        assert_eq!(cfg.max_message_size, Some(MAX_FRAME_BYTES));
+        assert_eq!(cfg.max_frame_size, Some(MAX_FRAME_BYTES));
+    }
+
+    /// base64 grows a body by 4/3, so the body cap has to be the SMALLER
+    /// number or a response just under the frame limit still produces a frame
+    /// over it. This is the arithmetic that mistake hides in.
+    #[test]
+    fn a_body_at_the_cap_still_fits_in_a_frame() {
+        let encoded = (MAX_RELAY_BODY_BYTES + 2) / 3 * 4;
+        assert!(
+            encoded < MAX_FRAME_BYTES,
+            "a {MAX_RELAY_BODY_BYTES} byte body encodes to {encoded}, over the \
+             {MAX_FRAME_BYTES} byte frame cap"
+        );
+        assert!(MAX_RELAY_BODY_BYTES < MAX_FRAME_BYTES);
+        // Still a useful size, not a cap so tight it refuses ordinary work.
+        assert!(MAX_RELAY_BODY_BYTES > 8 * 1024 * 1024);
+    }
+
+    /// Consumers do not authenticate to a workload with a fabric key, so the
+    /// gateway strips `authorization` unless the template owns the header.
+    /// The node cannot make that call (it is not told the template policy),
+    /// and must therefore NOT strip it blindly, or floci stops speaking AWS
+    /// and Jupyter stops accepting its own token.
+    #[test]
+    fn the_node_leaves_authorization_to_the_gateway() {
+        assert!(!RELAY_STRIPPED_HEADERS.contains(&"authorization"));
+        assert!(RELAY_STRIPPED_HEADERS.contains(&"proxy-authorization"));
+        assert!(RELAY_STRIPPED_HEADERS.contains(&"host"));
     }
 }
