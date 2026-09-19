@@ -421,3 +421,87 @@ before and the app reports its own missing files.
 
 Still on the optimization path: an optional P2P data channel (WebRTC/QUIC)
 for heavy image/video traffic.
+
+## Protocol v3.5 — isolation levels, runtimes, owned-by label
+
+- The hello's `workloads` block carries `runtimes`: the sandbox levels this
+  Docker daemon can run a session under. `"container"` (plain docker) is
+  always present; `"gvisor"` is added only when `runsc` is registered as a
+  Docker runtime on the host (`docker info` `.Runtimes`); `"microvm"` is
+  reserved. The gateway only schedules a template whose `isolation` is
+  stronger than `container` onto a node that advertised that level.
+- `workload_start` may carry `isolation` (`container` | `gvisor` |
+  `microvm`; absent = `container`). The node refuses, never downgrades: a
+  `gvisor` request without runsc answers `workload_status: error`; an
+  unknown name fails closed; `microvm` is refused by this build. A `gvisor`
+  session runs with `--runtime runsc` on top of every existing hardening
+  flag.
+- Every session container carries the Docker label
+  `kmplify.fabric.node=<8-char node id>`. On connect, before the hello, the
+  node lists containers under its own label and removes any session
+  container it does not know (a predecessor of this node that was
+  SIGKILLed never reached `cleanup_sessions`). Containers of a sibling
+  worker on the same machine carry a different label and are untouched;
+  containers from builds predating the label are left alone and remain a
+  manual repair.
+- Operator facts (peer/managed, operator, region) are set by the gateway's
+  deployer through its admin API and are never part of this protocol's
+  node-side frames: a node cannot declare itself KMPLIFY-managed.
+
+## Protocol v3.6 — no-egress guard, consumer env, per-consumer volumes
+
+- A `network: none` session used to be unhostable on this node: Docker
+  publishes no host port for a container on `--network none`, and none for
+  one on an `--internal` network either, so `-p` was silently ignored and
+  the session died with "could not resolve the container's host port".
+  Now such a session runs on an internal Docker network of its own,
+  `<container>-net`, and the node starts a guard, `<container>-guard`
+  (`alpine/socat:1.8.0.0`, `--cap-drop ALL`, `no-new-privileges`,
+  read-only, 64 MB, a quarter core), on the default bridge that publishes
+  the port and forwards it to the session's address on that network. The
+  workload keeps no route to the internet or the provider's LAN; the guard
+  forwards one listening port back to it and nothing else. Two sessions on
+  one machine never share a network. The host port is resolved from the
+  guard, the readiness probe and the relay are unchanged, and the guard and
+  the network are removed with the session. Guards carry the owned-by label
+  and are swept with the session they belong to.
+- `workload_start.env` may carry entries the CONSUMER set, already checked
+  by the gateway against the template's `consumer_env` allow-list. The node
+  applies the same key rule it always did (`env_key_ok`), so the frame
+  shape is unchanged.
+- Volume names arrive rendered: the gateway replaced `{consumer}` before
+  sending. The node's rule is unchanged: fabric-namespaced named volumes
+  only.
+- Managed-only templates (`n8n`, `jupyter`) are decided on the gateway
+  from operator facts; the node's pin table lists their repositories so a
+  mis-tagged node still cannot run them under another image.
+
+
+
+## Protocol v3.7 — node identity keys
+
+A node carries an Ed25519 **identity key** (`src/identity.rs`), generated
+before it first registers and kept as a hex seed in `fabric_node.json` beside
+the token. The public half is a `kmpn1…` bech32m address, published in
+`identity.json` and printed by `kmplify-node id`. Contract:
+`kmplify-infrastructure/docs/IDENTITY_KEYS.md` (KIP-1).
+
+* `POST /fabric/register` carries `{ "pubkey", "gateway", "ts", "sig" }`
+  where `sig` is the Ed25519 signature over
+  `"KMPLIFY-ID-v1/node-register\n" + {"gateway":…,"pubkey":…,"ts":…}`
+  (canonical JSON: sorted keys, no whitespace). `ts` must be within 300 s.
+  The response gains `address`. A KNOWN key gets its `node_id` back with a
+  fresh token even without `previous_token` — the signature is the proof.
+  A known `node_id` presented with a *different* key is never re-adopted.
+* The hello frame carries `{ "pubkey", "ts", "sig" }` with `sig` over
+  `"KMPLIFY-ID-v1/node-hello\n" + {"node_id":…,"pubkey":…,"ts":…}`. The
+  first signed hello under a valid token **binds** the key to the node.
+  From then on a hello without a valid signature closes with 4001, exactly
+  like a bad token, so the worker re-registers (with its key) instead of
+  retrying forever.
+* Workers predating v3.7 send none of these fields and keep working
+  token-only; on upgrade they add a seed to their credential file and bind
+  the key at the next hello. Gateways predating v3.7 ignore the fields.
+* The key is not a wallet and never leaves the credential file; the rewards
+  boundary in `docs/REWARDS.md` is unchanged. Claiming a node as "mine" is a
+  signed statement in the operator's KMPLIFY account, not on the fabric.
