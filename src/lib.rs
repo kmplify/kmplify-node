@@ -17,6 +17,7 @@
 pub mod control;
 pub mod engines;
 pub mod fabric_worker;
+pub mod flow;
 pub mod functions;
 pub mod gpu;
 pub mod hostcpu;
