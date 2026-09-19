@@ -4164,6 +4164,7 @@ async fn relay_http(
     sessions: Sessions,
     client: reqwest::Client,
     frame: Value,
+    upload: Option<tokio::sync::mpsc::UnboundedReceiver<crate::flow::BodyItem>>,
 ) {
     let req_id = frame["req_id"].as_str().unwrap_or_default().to_string();
     let session = frame["session"].as_str().unwrap_or_default().to_string();
@@ -4207,7 +4208,37 @@ async fn relay_http(
             }
         }
     }
-    if let Some(body) = frame["body_b64"].as_str() {
+    if let Some(rx) = upload {
+        // v4 streamed upload. The body is pulled by the HTTP client as the
+        // CONTAINER reads it; each pull reports the bytes back as credit, so
+        // the consumer uploads exactly as fast as the container consumes.
+        if let Some(n) = frame["body_length"].as_u64() {
+            // A declared length keeps this a plain Content-Length upload;
+            // without it the client falls back to chunked encoding, which
+            // some upload handlers refuse.
+            req = req.header(reqwest::header::CONTENT_LENGTH, n);
+        }
+        let credit_sink = sink.clone();
+        let credit_id = req_id.clone();
+        let body = futures_util::stream::unfold(rx, move |mut rx| {
+            let sink = credit_sink.clone();
+            let id = credit_id.clone();
+            async move {
+                let item = rx.recv().await?;
+                if let Ok(bytes) = &item {
+                    if let Some(grant) = crate::flow::upload_consumed(&id, bytes.len()) {
+                        send_frame(
+                            &sink,
+                            json!({"type": "credit", "stream": id, "bytes": grant}),
+                        )
+                        .await;
+                    }
+                }
+                Some((item, rx))
+            }
+        });
+        req = req.body(reqwest::Body::wrap_stream(body));
+    } else if let Some(body) = frame["body_b64"].as_str() {
         if !body.is_empty() {
             if let Some(bytes) = b64_decode(body) {
                 req = req.body(bytes);
@@ -4215,7 +4246,11 @@ async fn relay_http(
         }
     }
 
-    match req.send().await {
+    let sent = req.send().await;
+    // Whatever happened, the upload is over from this side: late chunks for
+    // it are dropped instead of queued for a request that already ended.
+    crate::flow::upload_end(&req_id, false);
+    match sent {
         Ok(resp) => {
             let status = resp.status().as_u16();
             let mut headers = serde_json::Map::new();
@@ -5344,7 +5379,27 @@ async fn session(
                         ));
                     }
                     Some("http") => {
-                        tokio::spawn(relay_http(sink.clone(), sessions.clone(), client.clone(), frame));
+                        // v4 streamed upload: register the body channel HERE,
+                        // in the read loop, because the chunks follow this
+                        // frame immediately and a spawned task may not have
+                        // run yet when the first one arrives.
+                        let upload = frame["body_stream"]
+                            .as_bool()
+                            .unwrap_or(false)
+                            .then(|| crate::flow::upload_open(frame["req_id"].as_str().unwrap_or_default()));
+                        tokio::spawn(relay_http(sink.clone(), sessions.clone(), client.clone(), frame, upload));
+                    }
+                    Some("http_req_chunk") => {
+                        let id = frame["req_id"].as_str().unwrap_or_default();
+                        if let Some(bytes) = frame["body_b64"].as_str().and_then(b64_decode) {
+                            crate::flow::upload_push(id, bytes);
+                        }
+                    }
+                    Some("http_req_end") => {
+                        crate::flow::upload_end(
+                            frame["req_id"].as_str().unwrap_or_default(),
+                            frame["abort"].as_bool().unwrap_or(false),
+                        );
                     }
                     // Protocol v4: the consumer drained this much of a stream.
                     // Handled inline: it is a map lookup and must never queue
@@ -6910,5 +6965,200 @@ mod relay_streaming_tests {
     #[test]
     fn one_chunk_is_far_below_the_frame_cap() {
         const { assert!(crate::flow::CHUNK_BYTES * 2 < MAX_FRAME_BYTES) };
+    }
+}
+
+#[cfg(test)]
+mod streamed_upload_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A "container": reads exactly Content-Length bytes, slowly enough that
+    /// the upload has to be paced, and answers with their SHA-256.
+    async fn hashing_http_server() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                sock.read_exact(&mut byte).await.unwrap();
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+            let len: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .expect("a declared length keeps the upload un-chunked")
+                .trim()
+                .parse()
+                .unwrap();
+            let mut hasher = Sha256::new();
+            let mut got = 0usize;
+            let mut buf = vec![0u8; 64 * 1024];
+            while got < len {
+                let n = sock.read(&mut buf).await.unwrap();
+                assert!(n > 0, "body ended at {got} of {len}");
+                hasher.update(&buf[..n]);
+                got += n;
+            }
+            let body = format!("{got}:{:x}", hasher.finalize());
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+        port
+    }
+
+    /// A "gateway": accepts the node's socket and hands back every frame.
+    async fn gateway_socket() -> (
+        Arc<Mutex<WsSink>>,
+        tokio::sync::mpsc::UnboundedReceiver<Value>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(sock).await.unwrap();
+            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                let _ = tx.send(serde_json::from_str::<Value>(&t).unwrap());
+            }
+        });
+        let (ws, _) = connect_async(&url).await.unwrap();
+        let (write, _read) = ws.split();
+        (Arc::new(Mutex::new(write)), rx)
+    }
+
+    /// 24 MiB through a 1 MiB window: byte-exact at the container, credit
+    /// reported back for it, and never more than two windows queued here.
+    #[tokio::test]
+    async fn a_large_upload_reaches_the_container_byte_exact_under_credit() {
+        let _serial = crate::flow::TEST_LOCK.lock().await;
+        const WINDOW: usize = 1024 * 1024;
+        const TOTAL: usize = 24 * 1024 * 1024;
+        crate::flow::connected(Some(WINDOW));
+
+        let port = hashing_http_server().await;
+        let (sink, mut frames) = gateway_socket().await;
+        let sessions: Sessions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert("s-up".into(), ("kmplify-fabric-s-up".into(), port));
+
+        let frame = json!({
+            "type": "http", "session": "s-up", "req_id": "r-up", "method": "POST",
+            "path": "/upload", "query": "", "headers": {"content-type": "application/octet-stream"},
+            "body_stream": true, "body_length": TOTAL,
+        });
+        let rx = crate::flow::upload_open("r-up");
+        let relay = tokio::spawn(relay_http(
+            sink,
+            sessions,
+            reqwest::Client::new(),
+            frame,
+            Some(rx),
+        ));
+
+        // The gateway's side of the bargain: send while there is credit,
+        // wait for a grant when there is not.
+        let mut expect = Sha256::new();
+        let mut credit = WINDOW;
+        let mut sent = 0usize;
+        let mut granted = 0u64;
+        let mut response = None;
+        while sent < TOTAL {
+            let n = crate::flow::CHUNK_BYTES.min(TOTAL - sent);
+            while credit < n {
+                let f = frames
+                    .recv()
+                    .await
+                    .expect("the node stopped granting credit");
+                if f["type"] == "credit" {
+                    assert_eq!(f["stream"], "r-up");
+                    credit += f["bytes"].as_u64().unwrap() as usize;
+                    granted += f["bytes"].as_u64().unwrap();
+                }
+            }
+            let chunk: Vec<u8> = (0..n).map(|i| ((sent + i) % 251) as u8).collect();
+            expect.update(&chunk);
+            assert!(
+                crate::flow::upload_push("r-up", chunk),
+                "refused inside its credit"
+            );
+            credit -= n;
+            sent += n;
+        }
+        crate::flow::upload_end("r-up", false);
+
+        while response.is_none() {
+            let f = frames.recv().await.expect("no response frame");
+            match f["type"].as_str() {
+                Some("credit") => granted += f["bytes"].as_u64().unwrap(),
+                Some("http_resp") => response = Some(f),
+                _ => {}
+            }
+        }
+        relay.await.unwrap();
+        let response = response.unwrap();
+        assert_eq!(response["status"], 200);
+        let body =
+            String::from_utf8(b64_decode(response["body_b64"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(body, format!("{TOTAL}:{:x}", expect.finalize()));
+        // Nearly all of it was acknowledged (the last partial batch may not be).
+        assert!(
+            granted as usize > TOTAL - WINDOW,
+            "granted only {granted} of {TOTAL}"
+        );
+        crate::flow::connected(None);
+    }
+
+    /// An aborted upload must reach the container as a FAILED request.
+    #[tokio::test]
+    async fn an_aborted_upload_fails_the_request_instead_of_sending_half_a_body() {
+        let _serial = crate::flow::TEST_LOCK.lock().await;
+        crate::flow::connected(Some(1024 * 1024));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut sink = Vec::new();
+            let _ = sock.read_to_end(&mut sink).await;
+        });
+        let (sink, mut frames) = gateway_socket().await;
+        let sessions: Sessions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert("s-ab".into(), ("kmplify-fabric-s-ab".into(), port));
+        let frame = json!({
+            "type": "http", "session": "s-ab", "req_id": "r-ab", "method": "POST",
+            "path": "/upload", "query": "", "headers": {}, "body_stream": true,
+            "body_length": 10 * 1024 * 1024,
+        });
+        let rx = crate::flow::upload_open("r-ab");
+        let relay = tokio::spawn(relay_http(
+            sink,
+            sessions,
+            reqwest::Client::new(),
+            frame,
+            Some(rx),
+        ));
+        assert!(crate::flow::upload_push("r-ab", vec![7u8; 1024]));
+        crate::flow::upload_end("r-ab", true);
+        let resp = loop {
+            let f = frames.recv().await.expect("no response frame");
+            if f["type"] == "http_resp" {
+                break f;
+            }
+        };
+        relay.await.unwrap();
+        assert_eq!(resp["status"], 502);
+        crate::flow::connected(None);
     }
 }
