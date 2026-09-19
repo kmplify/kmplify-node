@@ -258,6 +258,10 @@ pub struct HostedSession {
     /// node's clamp. Surfaced so the provider can see what a peer is
     /// actually holding, not just what the gateway asked for.
     pub cpus: f64,
+    /// Unix seconds when the container became `running`, which is when this
+    /// node's receipts start counting. Distinct from `since`: the minutes a
+    /// session spent pulling an image are not compute anybody is paid for.
+    pub running_since: Option<i64>,
 }
 
 static HOSTED: std::sync::OnceLock<Arc<Mutex<Vec<HostedSession>>>> = std::sync::OnceLock::new();
@@ -421,6 +425,7 @@ async fn hosted_add(session: &str, template: &str, container: &str, state: &str,
         since: chrono_now_secs(),
         state: state.to_string(),
         cpus,
+        running_since: (state == "running").then(chrono_now_secs),
     });
 }
 
@@ -497,7 +502,30 @@ async fn hosted_set_state(session: &str, state: &str) {
         .find(|h| h.session_id == session)
     {
         h.state = state.to_string();
+        if state == "running" && h.running_since.is_none() {
+            h.running_since = Some(chrono_now_secs());
+        }
     }
+}
+
+/// Signed receipts for every session running here right now (protocol v4.1),
+/// or nothing when this node has no identity key to sign with.
+fn work_receipts(
+    key: Option<&crate::identity::NodeKey>,
+    node_id: &str,
+    hosted: &[HostedSession],
+    now: i64,
+) -> Vec<Value> {
+    let Some(key) = key else { return Vec::new() };
+    hosted
+        .iter()
+        .filter(|h| h.state == "running")
+        .filter_map(|h| {
+            let since = h.running_since?;
+            let running_s = u64::try_from(now - since).ok()?;
+            Some(key.receipt(node_id, &h.session_id, running_s, now.max(0) as u64))
+        })
+        .collect()
 }
 
 async fn hosted_remove(session: &str) {
@@ -5334,6 +5362,8 @@ async fn session(
     // Per-connection: a dropped gateway link invalidates every relayed
     // socket, so these die with it rather than outliving the connection that
     // owns their ws_ids.
+    // Parsed once per connection, not once per pong.
+    let receipt_key = creds.key();
     let relays: RelaySockets = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let telemetry: Arc<Mutex<Telemetry>> = Arc::new(Mutex::new(Telemetry {
         docker_ok: docker_live,
@@ -5540,6 +5570,21 @@ async fn session(
                             // peer GPUs" list with entries stuck at
                             // "expiring now" forever.
                             p["loaded_models"] = json!(t.loaded_models);
+                            // v4.1: this node's own signed word on how long
+                            // each session has run here, so a compute
+                            // attestation rests on two signatures and not
+                            // only the gateway's. Absent key = older gateway
+                            // semantics: a gateway that does not know the
+                            // field ignores it.
+                            let receipts = work_receipts(
+                                receipt_key.as_ref(),
+                                &creds.node_id,
+                                &hosted_sessions().await,
+                                chrono_now_secs(),
+                            );
+                            if !receipts.is_empty() {
+                                p["receipts"] = json!(receipts);
+                            }
                             // Live CPU/RAM, so a CPU peer is as current as a
                             // GPU one (which has had vram_used_mb all along).
                             // Read from the background sampler — a snapshot,
@@ -7257,6 +7302,7 @@ mod session_retention_tests {
                 since: 0,
                 state: "running".into(),
                 cpus: 2.0,
+                running_since: None,
             },
             HostedSession {
                 session_id: "s-2".into(),
@@ -7265,6 +7311,7 @@ mod session_retention_tests {
                 since: 0,
                 state: "pulling".into(),
                 cpus: 1.0,
+                running_since: None,
             },
         ];
         assert_eq!(
@@ -7289,6 +7336,7 @@ mod session_retention_tests {
             since: 0,
             state: "pulling".into(),
             cpus: 1.0,
+            running_since: None,
         });
 
         // Link returns in time: nothing is touched.
@@ -7751,5 +7799,78 @@ mod identity_heal_tests {
     fn only_a_rejected_identity_triggers_a_re_registration() {
         assert!(!should_reregister("connection closed", false));
         assert!(!should_reregister(RECONNECT_REQUESTED, false));
+    }
+}
+
+#[cfg(test)]
+mod work_receipt_tests {
+    use super::*;
+
+    fn hosted(id: &str, state: &str, running_since: Option<i64>) -> HostedSession {
+        HostedSession {
+            session_id: id.into(),
+            template: "echo-test".into(),
+            container: format!("kmplify-fabric-{id}"),
+            since: 900,
+            state: state.into(),
+            cpus: 1.0,
+            running_since,
+        }
+    }
+
+    #[test]
+    fn a_running_session_gets_a_receipt_that_verifies_under_the_node_key() {
+        let key = crate::identity::NodeKey::generate();
+        let r = work_receipts(
+            Some(&key),
+            "node-1",
+            &[hosted("s-1", "running", Some(1000))],
+            1090,
+        );
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0]["session"], "s-1");
+        assert_eq!(r[0]["running_s"], 90);
+        assert_eq!(r[0]["ts"], 1090);
+        let canonical =
+            crate::identity::canonical_receipt("node-1", &key.public_hex(), "s-1", 90, 1090);
+        assert!(crate::identity::verify(
+            &key.public_hex(),
+            crate::identity::PURPOSE_NODE_RECEIPT,
+            &canonical,
+            r[0]["sig"].as_str().unwrap()
+        ));
+        // Not under another purpose: a receipt can never be replayed as a hello.
+        assert!(!crate::identity::verify(
+            &key.public_hex(),
+            crate::identity::PURPOSE_NODE_HELLO,
+            &canonical,
+            r[0]["sig"].as_str().unwrap()
+        ));
+    }
+
+    /// Pull time is not compute, and a node without a key says nothing.
+    #[test]
+    fn only_running_time_is_attested_and_only_with_a_key() {
+        let key = crate::identity::NodeKey::generate();
+        let list = [
+            hosted("pulling", "pulling", None),
+            hosted("odd", "running", None),
+            hosted("future", "running", Some(5000)),
+        ];
+        assert!(work_receipts(Some(&key), "n", &list, 1090).is_empty());
+        assert!(work_receipts(None, "n", &[hosted("s", "running", Some(1))], 1090).is_empty());
+    }
+
+    /// The literal the gateway's test also pins, so the two canonical forms
+    /// cannot drift apart silently.
+    #[test]
+    fn the_canonical_form_is_the_one_the_gateway_rebuilds() {
+        assert_eq!(
+            String::from_utf8(crate::identity::canonical_receipt(
+                "n-1", "ab", "s-1", 90, 1090
+            ))
+            .unwrap(),
+            r#"{"node_id":"n-1","pubkey":"ab","running_s":90,"session":"s-1","ts":1090}"#
+        );
     }
 }
