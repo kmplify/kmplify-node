@@ -78,6 +78,9 @@ ratatui = { version = "0.30", optional = true }
 # trap path was broken.
 wasmtime = { version = "48", optional = true, default-features = false, features = ["cranelift", "runtime", "wat"] }
 wasmtime-wasi = { version = "48", optional = true, default-features = false, features = ["p1"] }
+hpke = { version = "0.13", default-features = false, features = ["x25519", "alloc"] }
+aes-gcm = "0.10"
+base64 = "0.22"
 
 [profile.release]
 codegen-units = 16
