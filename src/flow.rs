@@ -1,0 +1,228 @@
+//! Per-stream credit on the gateway link (protocol v4).
+//!
+//! Without it this node sends a relayed response as fast as the container
+//! produces it, into a gateway that can only queue what its consumer has not
+//! read yet. A video download on a phone connection is enough to grow that
+//! queue until the gateway is killed for memory, and every other session on
+//! it dies too.
+//!
+//! The rule is yamux's, in its smallest form. A v4 gateway names a window in
+//! its `welcome`. Each stream starts with that many bytes of credit; sending a
+//! chunk spends credit, and the gateway grants more (`credit` frames) as the
+//! consumer actually drains. A stream with no credit waits, which pushes the
+//! pressure back to where it belongs: the container's own socket.
+//!
+//! A gateway that names no window predates this, and nothing is paced.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+use tokio::sync::Semaphore;
+
+/// Largest payload per chunk frame, before base64. Small enough that many
+/// streams interleave fairly on one socket, large enough that the per-frame
+/// JSON cost is noise.
+pub const CHUNK_BYTES: usize = 256 * 1024;
+
+/// A stream that has waited this long for credit has no reader: the consumer
+/// left and the gateway has nobody to drain for. Give the container its
+/// connection back instead of holding it open forever.
+pub const CREDIT_STALL: Duration = Duration::from_secs(120);
+
+/// Never let a grant (however wrong) push a semaphore toward its ceiling.
+const MAX_GRANT: usize = 64 * 1024 * 1024;
+
+#[derive(Default)]
+struct State {
+    /// The connected gateway's window, or None when it does not pace.
+    window: Option<usize>,
+    streams: HashMap<String, Arc<Semaphore>>,
+}
+
+fn state() -> &'static Mutex<State> {
+    static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(State::default()))
+}
+
+/// A new gateway connection: adopt its window and end every stream of the
+/// previous one. Closing the semaphores wakes their waiters with an error, so
+/// a relay task blocked on credit from a socket that no longer exists ends
+/// now rather than after `CREDIT_STALL`.
+pub fn connected(window: Option<usize>) {
+    if let Ok(mut s) = state().lock() {
+        for sem in s.streams.values() {
+            sem.close();
+        }
+        s.streams.clear();
+        s.window = window.filter(|w| *w > 0);
+    }
+}
+
+/// The window named by a `welcome` frame, if it is a usable number.
+pub fn window_from_welcome(welcome: &serde_json::Value) -> Option<usize> {
+    let w = welcome.get("window")?.as_u64()?;
+    // Below one chunk a stream could never send anything; treat a gateway
+    // that says so as one that does not pace rather than deadlock on it.
+    (w as usize >= CHUNK_BYTES).then_some(w as usize)
+}
+
+/// The sending side of one stream's credit.
+pub struct StreamCredit {
+    id: String,
+    sem: Option<Arc<Semaphore>>,
+}
+
+/// Why a send could not proceed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Stalled {
+    /// No credit arrived within `CREDIT_STALL`.
+    NoReader,
+    /// The gateway connection this stream belonged to is gone.
+    LinkGone,
+}
+
+/// Start pacing a stream. Against a gateway without a window this is free
+/// and `acquire` always succeeds at once.
+pub fn open(stream_id: &str) -> StreamCredit {
+    let sem = state().lock().ok().and_then(|mut s| {
+        let window = s.window?;
+        let sem = Arc::new(Semaphore::new(window));
+        s.streams.insert(stream_id.to_string(), sem.clone());
+        Some(sem)
+    });
+    StreamCredit {
+        id: stream_id.to_string(),
+        sem,
+    }
+}
+
+impl StreamCredit {
+    /// Spend credit for a chunk of `n` bytes, waiting for a grant if needed.
+    pub async fn acquire(&self, n: usize) -> Result<(), Stalled> {
+        let Some(sem) = &self.sem else { return Ok(()) };
+        let n = n.min(u32::MAX as usize) as u32;
+        match tokio::time::timeout(CREDIT_STALL, sem.acquire_many(n)).await {
+            Ok(Ok(permit)) => {
+                // Spent, not borrowed: credit comes back only as a grant.
+                permit.forget();
+                Ok(())
+            }
+            Ok(Err(_)) => Err(Stalled::LinkGone),
+            Err(_) => Err(Stalled::NoReader),
+        }
+    }
+}
+
+impl Drop for StreamCredit {
+    fn drop(&mut self) {
+        if self.sem.is_some() {
+            if let Ok(mut s) = state().lock() {
+                s.streams.remove(&self.id);
+            }
+        }
+    }
+}
+
+/// A `credit` frame arrived: the consumer drained `bytes` of `stream_id`.
+/// Grants for streams that already ended are normal (the last batch is in
+/// flight when the stream closes) and ignored.
+pub fn grant(stream_id: &str, bytes: u64) {
+    let sem = state()
+        .lock()
+        .ok()
+        .and_then(|s| s.streams.get(stream_id).cloned());
+    if let Some(sem) = sem {
+        sem.add_permits((bytes as usize).min(MAX_GRANT));
+    }
+}
+
+/// A `stream_cancel` frame arrived: the consumer of `stream_id` is gone.
+/// Closing the semaphore fails the sender's next `acquire`, which ends the
+/// stream and hands the container its connection back.
+pub fn cancel(stream_id: &str) {
+    let sem = state()
+        .lock()
+        .ok()
+        .and_then(|s| s.streams.get(stream_id).cloned());
+    if let Some(sem) = sem {
+        sem.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // The state is process-global, so these run as ONE test: a second test
+    // calling `connected` concurrently would close this one's streams.
+    #[tokio::test(start_paused = true)]
+    async fn credit_paces_a_stream_and_a_grant_releases_it() {
+        // A gateway that names no window: nothing is paced, ever.
+        connected(None);
+        let free = open("free");
+        for _ in 0..1000 {
+            assert_eq!(free.acquire(CHUNK_BYTES).await, Ok(()));
+        }
+        drop(free);
+
+        // Window of two chunks: two go out, the third waits for a grant.
+        connected(Some(2 * CHUNK_BYTES));
+        let s = open("s-1");
+        assert_eq!(s.acquire(CHUNK_BYTES).await, Ok(()));
+        assert_eq!(s.acquire(CHUNK_BYTES).await, Ok(()));
+        let waiting = tokio::spawn(async move {
+            let r = s.acquire(CHUNK_BYTES).await;
+            (s, r)
+        });
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(!waiting.is_finished(), "sent past its credit");
+        grant("s-1", CHUNK_BYTES as u64);
+        let (s, r) = waiting.await.unwrap();
+        assert_eq!(r, Ok(()));
+
+        // Nobody reading: the stream gives up instead of holding the
+        // container's connection open for good.
+        let started = tokio::time::Instant::now();
+        assert_eq!(s.acquire(CHUNK_BYTES).await, Err(Stalled::NoReader));
+        assert!(started.elapsed() >= CREDIT_STALL);
+
+        // A new connection ends the old one's streams at once.
+        let waiting = tokio::spawn(async move { s.acquire(CHUNK_BYTES).await });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        connected(Some(2 * CHUNK_BYTES));
+        assert_eq!(waiting.await.unwrap(), Err(Stalled::LinkGone));
+
+        // The consumer left: the sender learns at its next chunk, not after
+        // the stall timeout.
+        let gone = open("gone");
+        cancel("gone");
+        assert_eq!(gone.acquire(1).await, Err(Stalled::LinkGone));
+        drop(gone);
+        cancel("never-existed");
+
+        // Grants for a stream that is gone, and absurd grants, are harmless.
+        grant("s-1", 10);
+        let big = open("big");
+        grant("big", u64::MAX);
+        assert_eq!(big.acquire(CHUNK_BYTES).await, Ok(()));
+        drop(big);
+        assert!(state().lock().unwrap().streams.is_empty());
+        connected(None);
+    }
+
+    #[test]
+    fn the_window_is_read_from_the_welcome_or_not_at_all() {
+        assert_eq!(
+            window_from_welcome(&json!({"type": "welcome", "protocol": 4, "window": 4194304})),
+            Some(4194304)
+        );
+        // A pre-v4 gateway, and values no stream could live with.
+        assert_eq!(window_from_welcome(&json!({"type": "welcome"})), None);
+        assert_eq!(window_from_welcome(&json!({"window": 0})), None);
+        assert_eq!(window_from_welcome(&json!({"window": 1024})), None);
+        assert_eq!(window_from_welcome(&json!({"window": "4194304"})), None);
+        assert_eq!(window_from_welcome(&json!({"window": -5})), None);
+    }
+}

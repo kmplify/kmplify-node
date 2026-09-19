@@ -4097,19 +4097,28 @@ async fn ws_open(sink: Arc<Mutex<WsSink>>, sessions: Sessions, relays: RelaySock
     let relays2 = relays.clone();
     let id2 = ws_id.clone();
     tokio::spawn(async move {
+        // v4: while this waits for credit it is not reading the container's
+        // socket, so a consumer that cannot keep up slows the container down
+        // instead of filling the gateway.
+        let credit = crate::flow::open(&id2);
         while let Some(Ok(msg)) = read.next().await {
-            let out = match msg {
-                Message::Text(t) => {
-                    json!({"type": "ws_recv", "ws_id": id2, "data_b64": b64_encode(t.as_bytes()), "binary": false})
-                }
-                Message::Binary(b) => {
-                    json!({"type": "ws_recv", "ws_id": id2, "data_b64": b64_encode(&b), "binary": true})
-                }
+            let (out, size) = match msg {
+                Message::Text(t) => (
+                    json!({"type": "ws_recv", "ws_id": id2, "data_b64": b64_encode(t.as_bytes()), "binary": false}),
+                    t.len(),
+                ),
+                Message::Binary(b) => (
+                    json!({"type": "ws_recv", "ws_id": id2, "data_b64": b64_encode(&b), "binary": true}),
+                    b.len(),
+                ),
                 Message::Close(_) => break,
                 // Ping/Pong are answered by tungstenite itself; forwarding
                 // them would only duplicate keepalives on the gateway link.
                 _ => continue,
             };
+            if credit.acquire(size).await.is_err() {
+                break;
+            }
             send_frame(&sink2, out).await;
         }
         relays2.lock().await.remove(&id2);
@@ -4227,8 +4236,7 @@ async fn relay_http(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            let streaming =
-                ct.starts_with("text/event-stream") || ct.starts_with("application/x-ndjson");
+            let streaming = relay_streams(&ct, resp.content_length());
             if streaming {
                 send_frame(
                     &sink,
@@ -4236,18 +4244,26 @@ async fn relay_http(
                     "status": status, "headers": headers}),
                 )
                 .await;
+                let credit = crate::flow::open(&req_id);
                 let mut stream = resp.bytes_stream();
-                while let Some(chunk) = stream.next().await {
+                'body: while let Some(chunk) = stream.next().await {
                     let Ok(chunk) = chunk else { break };
-                    if chunk.is_empty() {
-                        continue;
+                    // Re-cut to CHUNK_BYTES: the HTTP client hands over
+                    // whatever the socket had, and one frame must neither
+                    // exceed a stream's window nor hog the shared socket.
+                    for piece in chunk.chunks(crate::flow::CHUNK_BYTES) {
+                        if credit.acquire(piece.len()).await.is_err() {
+                            // No reader, or the link went. Dropping `stream`
+                            // closes the container's connection.
+                            break 'body;
+                        }
+                        send_frame(
+                            &sink,
+                            json!({"type": "http_resp_chunk", "req_id": req_id,
+                            "body_b64": b64_encode(piece)}),
+                        )
+                        .await;
                     }
-                    send_frame(
-                        &sink,
-                        json!({"type": "http_resp_chunk", "req_id": req_id,
-                        "body_b64": b64_encode(&chunk)}),
-                    )
-                    .await;
                 }
                 send_frame(&sink, json!({"type": "http_resp_end", "req_id": req_id})).await;
             } else {
@@ -4296,6 +4312,29 @@ async fn relay_http(
             .await;
         }
     }
+}
+
+/// Bodies known to be at most this large still travel as one `http_resp`
+/// frame: a page load is dozens of small assets, and three frames each would
+/// be pure overhead.
+const RELAY_SINGLE_FRAME_MAX: u64 = 256 * 1024;
+
+/// Whether a relayed response is forwarded chunk by chunk.
+///
+/// Before v4 only SSE and NDJSON were, and everything else was read whole
+/// into memory and base64-encoded into one frame: a rendered video or a model
+/// file was held twice over, here and on the gateway, and past the frame cap
+/// it could not be delivered at all. Now everything streams unless it is
+/// KNOWN to be small. An unknown length streams, because "unknown" is exactly
+/// what a large generated download looks like.
+fn relay_streams(content_type: &str, content_length: Option<u64>) -> bool {
+    if content_type.starts_with("text/event-stream")
+        || content_type.starts_with("application/x-ndjson")
+    {
+        // Live streams, however short: buffering them defeats their purpose.
+        return true;
+    }
+    !matches!(content_length, Some(n) if n <= RELAY_SINGLE_FRAME_MAX)
 }
 
 /// Remove every container this node started for the fabric — run on
@@ -4795,6 +4834,11 @@ async fn session(
         // own field rather than folded into `version` because the gateway
         // truncates that one to 32 chars; older gateways ignore this key.
         "worker_version": crate::version_string(),
+        // Node-link protocol level. 4 = this node paces each relayed stream
+        // by the credit the gateway grants (src/flow.rs), streams every large
+        // response instead of buffering it, and announces kept sessions. A
+        // gateway only sends `credit` frames to a node that says so.
+        "protocol": 4,
         // Which SYSTEM this build runs on, from the compiler, not probed at
         // runtime: "macos"/"linux"/"windows" and "aarch64"/"x86_64". The
         // gateway keeps these per node for an anonymous install count by
@@ -4868,6 +4912,9 @@ async fn session(
     // The link is back inside the grace window: the sessions announced in
     // the hello stay, and the deadline that would have removed them is off.
     disarm_grace_reaper();
+    // v4 gateways name a per-stream window; older ones do not, and then
+    // nothing is paced. Also ends every stream of the previous connection.
+    crate::flow::connected(crate::flow::window_from_welcome(&welcome));
     crate::status::set_link(crate::status::Link::Online, String::new());
     crate::status::set_models(&models, &engines);
     log(format!(
@@ -5298,6 +5345,21 @@ async fn session(
                     }
                     Some("http") => {
                         tokio::spawn(relay_http(sink.clone(), sessions.clone(), client.clone(), frame));
+                    }
+                    // Protocol v4: the consumer drained this much of a stream.
+                    // Handled inline: it is a map lookup and must never queue
+                    // behind the traffic it is there to unblock.
+                    Some("credit") => {
+                        if let (Some(stream), Some(bytes)) =
+                            (frame["stream"].as_str(), frame["bytes"].as_u64())
+                        {
+                            crate::flow::grant(stream, bytes);
+                        }
+                    }
+                    Some("stream_cancel") => {
+                        if let Some(stream) = frame["stream"].as_str() {
+                            crate::flow::cancel(stream);
+                        }
                     }
                     // Protocol v2.2 — see ws_open(). Spawned, never awaited
                     // here: dialling the container can block for seconds and
@@ -6812,5 +6874,41 @@ mod session_retention_tests {
             .iter()
             .any(|h| h.session_id == "grace-test-pull"));
         assert!(stopped_cell().lock().await.remove("grace-test-pull"));
+    }
+}
+
+#[cfg(test)]
+mod relay_streaming_tests {
+    use super::*;
+
+    #[test]
+    fn live_streams_always_stream() {
+        assert!(relay_streams("text/event-stream", Some(10)));
+        assert!(relay_streams("application/x-ndjson; charset=utf-8", None));
+    }
+
+    /// The page-load case: dozens of small assets, one frame each.
+    #[test]
+    fn a_body_known_to_be_small_is_one_frame() {
+        assert!(!relay_streams("text/html", Some(0)));
+        assert!(!relay_streams(
+            "application/json",
+            Some(RELAY_SINGLE_FRAME_MAX)
+        ));
+    }
+
+    /// The case this exists for: a 200 MB download must never be buffered,
+    /// and neither may a body whose length nobody announced.
+    #[test]
+    fn large_and_unknown_lengths_stream() {
+        assert!(relay_streams("video/mp4", Some(200 * 1024 * 1024)));
+        assert!(relay_streams("image/png", Some(RELAY_SINGLE_FRAME_MAX + 1)));
+        assert!(relay_streams("application/octet-stream", None));
+    }
+
+    /// A chunk frame has to fit the frame cap after base64, with room.
+    #[test]
+    fn one_chunk_is_far_below_the_frame_cap() {
+        const { assert!(crate::flow::CHUNK_BYTES * 2 < MAX_FRAME_BYTES) };
     }
 }
