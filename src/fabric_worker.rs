@@ -66,6 +66,106 @@ fn reconnect_entropy() -> u64 {
     rand_core::OsRng.next_u64()
 }
 
+/// How long hosted containers outlive a LOST gateway link (protocol v4).
+///
+/// The same number as the gateway's `NODE_RETURN_GRACE_S`: the gateway keeps
+/// a session "running" for this long while its node is absent, so a node
+/// that kept the container for any other span either throws away a session
+/// the gateway was still holding, or burns the owner's GPU for one the
+/// gateway already wrote off.
+///
+/// History, because it explains the shape. Retention was shipped once and
+/// reverted within hours (kmplify-desktop #87) as the SUSPECT in a reconnect
+/// flap that was never proven to be its fault. The revert's stated principle
+/// was sound and is kept: nothing may keep running on an owner's GPU with no
+/// link to stop it by. A grace the NODE enforces on its own clock satisfies
+/// that without the gateway's help: when the deadline passes with no link,
+/// the node removes every container itself. `KMPLIFY_SESSION_GRACE_S=0`
+/// restores the old tear-down-at-once behaviour.
+const SESSION_GRACE_DEFAULT: Duration = Duration::from_secs(180);
+/// An operator may shorten the grace, or lengthen it a little; they may not
+/// turn it into "forever".
+const SESSION_GRACE_MAX: Duration = Duration::from_secs(900);
+
+fn session_grace() -> Duration {
+    parse_session_grace(std::env::var("KMPLIFY_SESSION_GRACE_S").ok().as_deref())
+}
+
+fn parse_session_grace(raw: Option<&str>) -> Duration {
+    match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        None => SESSION_GRACE_DEFAULT,
+        Some(v) => match v.parse::<u64>() {
+            Ok(secs) => Duration::from_secs(secs).min(SESSION_GRACE_MAX),
+            // Unreadable is not "off" and not "forever": it is the default.
+            Err(_) => SESSION_GRACE_DEFAULT,
+        },
+    }
+}
+
+/// Whether the containers survive the end of this connection.
+///
+/// Only a LOST link qualifies. A stop signal, a clean end, and an operator's
+/// own reload all tear down at once, as they always have: those are
+/// decisions, and a decision to stop sharing must not leave a stranger's
+/// container running for three more minutes.
+fn keeps_sessions_across(
+    ended: &Result<(), String>,
+    stopping: bool,
+    grace: Duration,
+    hosted: usize,
+) -> bool {
+    match ended {
+        Ok(()) => false,
+        Err(_) if stopping || grace.is_zero() || hosted == 0 => false,
+        Err(e) => e != RECONNECT_REQUESTED,
+    }
+}
+
+/// The `sessions` list of the hello: what this node still runs, so the
+/// gateway keeps those sessions instead of writing them off, and tells this
+/// node to stop any it no longer knows.
+fn announced_sessions(hosted: &[HostedSession]) -> Value {
+    Value::Array(
+        hosted
+            .iter()
+            .map(|h| json!({"session": h.session_id, "state": h.state}))
+            .collect(),
+    )
+}
+
+fn grace_reaper_cell() -> &'static std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> {
+    static REAPER: std::sync::OnceLock<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
+        std::sync::OnceLock::new();
+    REAPER.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Start the node-side deadline for a lost link. If no gateway connection is
+/// re-established before it passes, every hosted container is removed.
+fn arm_grace_reaper(sessions: Sessions, grace: Duration) {
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+        log(format!(
+            "no gateway link for {}s — removing the sessions kept for its return",
+            grace.as_secs()
+        ));
+        cleanup_sessions(&sessions).await;
+    });
+    if let Ok(mut cell) = grace_reaper_cell().lock() {
+        if let Some(old) = cell.replace(handle) {
+            old.abort();
+        }
+    }
+}
+
+/// The link is back (or the worker is stopping and cleans up itself).
+fn disarm_grace_reaper() {
+    if let Ok(mut cell) = grace_reaper_cell().lock() {
+        if let Some(old) = cell.take() {
+            old.abort();
+        }
+    }
+}
+
 /// Session error that means "the operator asked for this": reconnect at once
 /// and say nothing alarming, rather than logging a lost connection and
 /// sitting out the backoff.
@@ -4211,7 +4311,24 @@ async fn cleanup_sessions(sessions: &Sessions) {
     // Anything still listed here was mid-pull when the connection died —
     // start_workload's own removal never ran, and leaving it published would
     // show the owner a session on their GPU that no longer exists.
-    hosted_cell().lock().await.clear();
+    //
+    // Tombstone each one first. The pull is a detached task and outlives
+    // this call; without the tombstone it finishes minutes later and launches
+    // a container for a session everyone has already written off, registered
+    // in the live map so not even the orphan sweep reaps it. Same mechanism a
+    // `workload_stop` that lands mid-pull has always used.
+    let pulling: Vec<String> = hosted_cell()
+        .lock()
+        .await
+        .drain(..)
+        .map(|h| h.session_id)
+        .collect();
+    if !pulling.is_empty() {
+        let mut stopped = stopped_cell().lock().await;
+        for session in pulling {
+            stopped.insert(session);
+        }
+    }
 }
 
 /// Translate an OpenAI-shaped chat request into Ollama's NATIVE /api/chat
@@ -4696,6 +4813,11 @@ async fn session(
         // Collections replicated here, so the gateway can tell this node to
         // drop any it no longer knows (same reconciliation as sessions).
         "collections": store.collection_ids().await,
+        // Sessions still running here from before this connection (v4). The
+        // gateway keeps the ones it knows and answers `workload_stop` for the
+        // rest; without this list it must assume every session died with
+        // the link. Older gateways ignore the key.
+        "sessions": announced_sessions(&hosted_sessions().await),
         // What this machine actually IS (v2.4): real CPU model, cores and
         // total RAM. Independent of cpu_share, which says only what was
         // volunteered — a GPU peer still has a CPU worth naming.
@@ -4743,6 +4865,9 @@ async fn session(
     if welcome["type"] != "welcome" {
         return Err(format!("gateway refused: {welcome}"));
     }
+    // The link is back inside the grace window: the sessions announced in
+    // the hello stay, and the deadline that would have removed them is off.
+    disarm_grace_reaper();
     crate::status::set_link(crate::status::Link::Online, String::new());
     crate::status::set_models(&models, &engines);
     log(format!(
@@ -5231,9 +5356,22 @@ async fn session(
             }
         }
     };
-    // Whatever ended the session — graceful stop or a dropped gateway —
-    // nothing may keep running on the user's GPU afterwards.
-    cleanup_sessions(&sessions).await;
+    // A stop, a clean end or an operator's reload: nothing may keep running
+    // on the user's GPU afterwards. A LOST link is different (v4): the
+    // containers wait out the grace window for the gateway to return, and
+    // the reaper removes them on this node's own clock if it does not.
+    let grace = session_grace();
+    let hosted = hosted_sessions().await.len();
+    if keeps_sessions_across(&result, *stop.borrow(), grace, hosted) {
+        log(format!(
+            "gateway link lost with {hosted} session(s) hosted — keeping them for {}s",
+            grace.as_secs()
+        ));
+        arm_grace_reaper(sessions.clone(), grace);
+    } else {
+        disarm_grace_reaper();
+        cleanup_sessions(&sessions).await;
+    }
     result
 }
 
@@ -5325,8 +5463,15 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
     // Consecutive failed connections, for the backoff. Reset by a connection
     // that stayed up long enough to count as one.
     let mut failed_attempts: u32 = 0;
+    // Stopping while disconnected: sessions kept for the gateway's return
+    // have nobody coming back for them once this worker is gone.
+    async fn release_kept_sessions() {
+        disarm_grace_reaper();
+        cleanup_sessions(sessions_cell()).await;
+    }
     loop {
         if *stop.borrow() {
+            release_kept_sessions().await;
             return;
         }
         // Re-read before every connection, so a change made in the dashboard
@@ -5348,6 +5493,7 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
             Ok(()) => healed_since_connect = false,
             Err(e) => {
                 if *stop.borrow() {
+                    release_kept_sessions().await;
                     return;
                 }
                 if e == RECONNECT_REQUESTED {
@@ -5391,6 +5537,7 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
             _ = tokio::time::sleep(delay) => {}
             _ = stop.changed() => {
                 if *stop.borrow() {
+                    release_kept_sessions().await;
                     return;
                 }
             }
@@ -6539,5 +6686,131 @@ mod reconnect_backoff_tests {
         let a = reconnect_delay(5, 1);
         let b = reconnect_delay(5, 9_999);
         assert_ne!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod session_retention_tests {
+    use super::*;
+
+    fn lost() -> Result<(), String> {
+        Err("connection closed".to_string())
+    }
+    const GRACE: Duration = Duration::from_secs(180);
+
+    /// The case the whole feature exists for: a gateway redeploy.
+    #[test]
+    fn a_lost_link_keeps_hosted_sessions() {
+        assert!(keeps_sessions_across(&lost(), false, GRACE, 1));
+    }
+
+    /// Decisions tear down at once, exactly as before. An operator who stops
+    /// sharing must not leave a stranger's container running for three more
+    /// minutes, and a reload may be the operator switching sessions OFF.
+    #[test]
+    fn a_stop_a_clean_end_and_a_reload_do_not() {
+        assert!(!keeps_sessions_across(&lost(), true, GRACE, 1));
+        assert!(!keeps_sessions_across(&Ok(()), false, GRACE, 1));
+        assert!(!keeps_sessions_across(
+            &Err(RECONNECT_REQUESTED.to_string()),
+            false,
+            GRACE,
+            1
+        ));
+    }
+
+    #[test]
+    fn nothing_hosted_or_grace_zero_is_the_old_behaviour() {
+        assert!(!keeps_sessions_across(&lost(), false, GRACE, 0));
+        assert!(!keeps_sessions_across(&lost(), false, Duration::ZERO, 3));
+    }
+
+    /// Tied to the gateway's NODE_RETURN_GRACE_S (180 s). A different number
+    /// on either side throws sessions away or burns a GPU for nothing.
+    #[test]
+    fn the_default_grace_matches_the_gateways() {
+        assert_eq!(parse_session_grace(None), Duration::from_secs(180));
+        assert_eq!(parse_session_grace(Some("")), Duration::from_secs(180));
+    }
+
+    #[test]
+    fn an_operator_can_shorten_or_disable_it_but_not_make_it_forever() {
+        assert_eq!(parse_session_grace(Some("0")), Duration::ZERO);
+        assert_eq!(parse_session_grace(Some(" 30 ")), Duration::from_secs(30));
+        assert_eq!(parse_session_grace(Some("999999")), SESSION_GRACE_MAX);
+        // Unreadable is the default, never "off" and never "forever".
+        assert_eq!(parse_session_grace(Some("soon")), Duration::from_secs(180));
+        assert_eq!(parse_session_grace(Some("-5")), Duration::from_secs(180));
+    }
+
+    /// The exact shape gateway `reconcile_node_sessions` reads.
+    #[test]
+    fn the_hello_announces_each_session_with_its_state() {
+        let hosted = vec![
+            HostedSession {
+                session_id: "s-1".into(),
+                template: "comfyui".into(),
+                container: "kmplify-fabric-s-1".into(),
+                since: 0,
+                state: "running".into(),
+                cpus: 2.0,
+            },
+            HostedSession {
+                session_id: "s-2".into(),
+                template: "ollama".into(),
+                container: "kmplify-fabric-s-2".into(),
+                since: 0,
+                state: "pulling".into(),
+                cpus: 1.0,
+            },
+        ];
+        assert_eq!(
+            announced_sessions(&hosted),
+            json!([
+                {"session": "s-1", "state": "running"},
+                {"session": "s-2", "state": "pulling"},
+            ])
+        );
+        assert_eq!(announced_sessions(&[]), json!([]));
+    }
+
+    /// The reaper really removes what was kept, on the node's own clock, and
+    /// a returning link really calls it off.
+    #[tokio::test(start_paused = true)]
+    async fn the_grace_deadline_fires_unless_the_link_returns() {
+        let sessions: Sessions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        hosted_cell().lock().await.push(HostedSession {
+            session_id: "grace-test-pull".into(),
+            template: "echo-test".into(),
+            container: "kmplify-fabric-grace-test-pull".into(),
+            since: 0,
+            state: "pulling".into(),
+            cpus: 1.0,
+        });
+
+        // Link returns in time: nothing is touched.
+        // (A paused clock auto-advances through `sleep` once every task is
+        // idle, which also guarantees the reaper was polled and its timer
+        // registered before time moves. `advance` alone does not.)
+        arm_grace_reaper(sessions.clone(), Duration::from_secs(180));
+        tokio::time::sleep(Duration::from_secs(100)).await;
+        disarm_grace_reaper();
+        tokio::time::sleep(Duration::from_secs(200)).await;
+        assert!(hosted_cell()
+            .lock()
+            .await
+            .iter()
+            .any(|h| h.session_id == "grace-test-pull"));
+
+        // Link never returns: the mid-pull session is dropped AND tombstoned,
+        // so the detached pull cannot launch a container afterwards.
+        arm_grace_reaper(sessions.clone(), Duration::from_secs(180));
+        tokio::time::sleep(Duration::from_secs(181)).await;
+        assert!(!hosted_cell()
+            .lock()
+            .await
+            .iter()
+            .any(|h| h.session_id == "grace-test-pull"));
+        assert!(stopped_cell().lock().await.remove("grace-test-pull"));
     }
 }
