@@ -60,7 +60,11 @@ reqwest = { version = "0.12", default-features = false, features = [
 # is being advertised.
 sysinfo = "0.32"
 sha2 = "0.10.9"
-ed25519-dalek = "2.1.1"
+# Also the node's OWN identity key (src/identity.rs, protocol v3.7): the
+# `rand_core` feature is what lets it generate one; `rand_core/getrandom`
+# is the OS entropy behind that on every platform this ships on.
+ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 # The terminal dashboard (src/tui.rs). Default-on because a headless node
 # without one is operated by reading logs; a packager who wants the smallest
 # possible service binary can still build with --no-default-features.

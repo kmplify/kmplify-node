@@ -602,7 +602,7 @@ falling back to a default the operator did not choose.
 |---|---|---|
 | `PROVIDER_GATEWAY_URL` | the public fabric | Gateway to join. Point it at your own. |
 | `OLLAMA_BASE` | `http://127.0.0.1:11434` | Any OpenAI-compatible endpoint, despite the name. |
-| `PROVIDER_WORKLOADS` | *empty* | Container template ids to host (`vllm-openai`, `vllm-openai-lmcache`, `comfyui`, `comfyui-api`, `ollama`, `ollama-cpu`, `speaches`, `speaches-cpu`). Empty means sessions are off. |
+| `PROVIDER_WORKLOADS` | *empty* | Container template ids to host (`vllm-openai`, `vllm-openai-lmcache`, `comfyui`, `comfyui-api`, `ollama`, `ollama-cpu`, `speaches`, `speaches-cpu`, `floci`, and on managed nodes `n8n`, `jupyter`). Empty means sessions are off. |
 | `PROVIDER_COUNTRY` | *empty* | ISO alpha-2, so consumers can prefer EU capacity. Self-declared, see below. |
 | `PROVIDER_SHARE_INFERENCE` | `true` | Serve model jobs at all. |
 | `PROVIDER_SHARE_CPU` | `false` | Offer CPU and RAM as lendable capacity. |
@@ -650,6 +650,12 @@ gateway behaving:
 - **Containers are boxed**: `--cap-drop ALL`, `--security-opt no-new-privileges`,
   memory and PID caps, and a 127.0.0.1-only port binding. GPU passthrough is
   the only privilege granted.
+- **No-egress sessions are reachable and still sealed**: a template the
+  catalog marks `network: none` runs on a private internal network of its
+  own with a tiny socat guard on the bridge publishing its port (Docker
+  publishes nothing for `--network none` or internal networks by itself).
+  The guard forwards one port inward and nothing else; the workload has no
+  route out and cannot see another session on the same machine.
 - **Ceilings are clamped here.** A session's memory cap, CPU share and readiness
   timeout all arrive as requests and are clamped locally, so a gateway cannot
   pin a container on your machine indefinitely or hand it the whole box.

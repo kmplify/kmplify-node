@@ -44,7 +44,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check licenses bans
+          command: check licenses bans sources
+
+  # Known vulnerabilities in the dependency tree. deny.toml has carried an
+  # [advisories] section all along and nothing ran it, so an RUSTSEC advisory
+  # against a crate this agent links could sit in the tree unnoticed. That
+  # matters more here than in most repositories: this binary runs on other
+  # people's machines and accepts work from a network.
+  #
+  # Its own job on purpose. An advisory published upstream can turn this red
+  # without anybody touching the code, and when that happens the licence and
+  # ban checks should still report their own verdicts rather than be hidden
+  # behind one shared red X.
+  advisories:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
 
   signoff:
     if: github.event_name == 'pull_request'

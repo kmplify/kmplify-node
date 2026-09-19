@@ -25,7 +25,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::{watch, Mutex};
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    connect_async, connect_async_with_config, tungstenite::Message, MaybeTlsStream, WebSocketStream,
+};
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(10);
 
@@ -41,6 +43,31 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// deadline the worker sat "connected" for good while the gateway had long
 /// forgotten it. 45s = four missed pings, comfortably past jitter.
 const GATEWAY_SILENCE_TIMEOUT: Duration = Duration::from_secs(45);
+/// Largest frame this node will send or accept on the gateway socket, and the
+/// cap on a relayed response body. One number across all three
+/// implementations: uvicorn's `--ws-max-size` on the gateway, `MAX_FRAME_BYTES`
+/// in the reference worker, and this. See ../docs/PROTOCOL.md "Frame size".
+///
+/// Why a relayed body has to be capped HERE and not only at the gateway: a
+/// container answering with a 200 MB file becomes one ~267 MB base64 frame,
+/// and a frame over the gateway's limit does not fail that one request, it
+/// closes the socket. Every other session this node is hosting dies with it.
+/// Refusing the single oversized response is the only outcome that keeps the
+/// rest of the node's work alive.
+const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// Frame limits for the gateway socket, matching the gateway's own.
+fn gateway_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(MAX_FRAME_BYTES),
+        max_frame_size: Some(MAX_FRAME_BYTES),
+        ..Default::default()
+    }
+}
+
+/// Room for base64 (4/3) plus the surrounding JSON, so a body at the cap
+/// still produces a frame under it.
+const MAX_RELAY_BODY_BYTES: usize = (MAX_FRAME_BYTES / 4) * 3 - 4096;
 /// How often a quiet image pull reports "still working" upstream.
 const PULL_HEARTBEAT: Duration = Duration::from_secs(20);
 /// Docker daemon liveness probe. Short: it runs on the telemetry path, and a
@@ -543,6 +570,20 @@ impl WorkerConfig {
 pub struct Credentials {
     pub node_id: String,
     pub token: String,
+    /// The node's identity key seed, hex (protocol v3.7, see identity.rs).
+    /// Absent in files written by older builds; `ensure_identity` adds one
+    /// on the next start and the gateway binds it at the next signed hello.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_hex: Option<String>,
+}
+
+impl Credentials {
+    /// The identity key, when the credential carries a usable seed.
+    pub fn key(&self) -> Option<crate::identity::NodeKey> {
+        self.seed_hex
+            .as_deref()
+            .and_then(|s| crate::identity::NodeKey::from_seed_hex(s).ok())
+    }
 }
 
 fn log(msg: impl std::fmt::Display) {
@@ -602,7 +643,19 @@ use std::os::unix::fs::PermissionsExt;
 /// Idempotent: safe to call on every boot.
 pub async fn ensure_identity(gateway_url: &str, creds_path: &Path) -> Result<Credentials, String> {
     if let Ok(bytes) = tokio::fs::read(creds_path).await {
-        if let Ok(c) = serde_json::from_slice::<Credentials>(&bytes) {
+        if let Ok(mut c) = serde_json::from_slice::<Credentials>(&bytes) {
+            if c.key().is_none() {
+                // A credential from before identity keys (v3.7): give it one.
+                // The id and token stay; the gateway binds this key the first
+                // time it sees a signed hello under the still-valid token.
+                c.seed_hex = Some(crate::identity::NodeKey::generate().seed_hex());
+                if let Err(e) = write_private(creds_path, serde_json::to_vec(&c).unwrap()).await {
+                    log(format!(
+                        "could not persist the node's new identity key at {}: {e}",
+                        creds_path.display()
+                    ));
+                }
+            }
             return Ok(c);
         }
     }
@@ -610,14 +663,19 @@ pub async fn ensure_identity(gateway_url: &str, creds_path: &Path) -> Result<Cre
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| e.to_string())?;
+    // The key exists before the node does: registration is signed with it,
+    // so the gateway never has to take "this key is mine" on faith later.
+    let key = crate::identity::NodeKey::generate();
     let resp = client
         .post(format!("{gateway_url}/fabric/register"))
+        .json(&key.register_fields(gateway_url, crate::identity::now_s()))
         .send()
         .await
         .map_err(|e| e.to_string())?
         .error_for_status()
         .map_err(|e| e.to_string())?;
-    let creds: Credentials = resp.json().await.map_err(|e| e.to_string())?;
+    let mut creds: Credentials = resp.json().await.map_err(|e| e.to_string())?;
+    creds.seed_hex = Some(key.seed_hex());
     if let Some(parent) = creds_path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
@@ -658,14 +716,20 @@ pub async fn register_identity(
         Ok(bytes) => serde_json::from_slice(&bytes).ok(),
         Err(_) => None,
     };
-    let body = match &previous {
-        Some(c) => serde_json::json!({
-            "previous_node_id": c.node_id,
-            "previous_token": c.token,
-        }),
-        None => serde_json::json!({}),
-    };
-    let creds: Credentials = client
+    // The identity key survives a re-registration: a key the gateway already
+    // knows is what lets it hand the SAME node id back even when the token
+    // was lost (v3.7 continuity), and a key nobody knows yet is still this
+    // machine's, so there is no reason to mint another.
+    let key = previous
+        .as_ref()
+        .and_then(Credentials::key)
+        .unwrap_or_else(crate::identity::NodeKey::generate);
+    let mut body = key.register_fields(gateway_url, crate::identity::now_s());
+    if let Some(c) = &previous {
+        body["previous_node_id"] = serde_json::json!(c.node_id);
+        body["previous_token"] = serde_json::json!(c.token);
+    }
+    let mut creds: Credentials = client
         .post(format!("{gateway_url}/fabric/register"))
         .json(&body)
         .send()
@@ -676,6 +740,7 @@ pub async fn register_identity(
         .json()
         .await
         .map_err(|e| e.to_string())?;
+    creds.seed_hex = Some(key.seed_hex());
     if let Some(parent) = creds_path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
@@ -1205,6 +1270,289 @@ async fn docker_ok() -> bool {
     )
 }
 
+/// Container runtimes this Docker daemon can run a session under (protocol
+/// v3.5). "container" is plain docker and always present; "gvisor" is
+/// advertised only when `runsc` is registered as a runtime, because the
+/// gateway will only ever schedule a template that REQUIRES that level here
+/// if we say so, and saying so falsely would run it in a plain container.
+async fn docker_runtimes() -> Vec<String> {
+    let probe = crate::proc::command("docker")
+        .args(["info", "--format", "{{json .Runtimes}}"])
+        .output();
+    match tokio::time::timeout(DOCKER_PROBE_TIMEOUT, probe).await {
+        Ok(Ok(o)) if o.status.success() => runtimes_from_info(&String::from_utf8_lossy(&o.stdout)),
+        _ => vec!["container".to_string()],
+    }
+}
+
+/// Pure parser behind `docker_runtimes`: the `.Runtimes` JSON object's keys.
+pub fn runtimes_from_info(json_text: &str) -> Vec<String> {
+    let mut out = vec!["container".to_string()];
+    if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(json_text.trim()) {
+        if map.contains_key("runsc") {
+            out.push("gvisor".to_string());
+        }
+    }
+    out
+}
+
+/// Sandbox level a `workload_start` asks for (protocol v3.5). Absent means
+/// plain container, exactly the pre-v3.5 meaning; unknown names fail closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Isolation {
+    Container,
+    Gvisor,
+    Microvm,
+}
+
+impl Isolation {
+    pub fn from_frame(v: Option<&str>) -> Option<Self> {
+        match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("container") => Some(Self::Container),
+            Some("gvisor") => Some(Self::Gvisor),
+            Some("microvm") => Some(Self::Microvm),
+            Some(_) => None,
+        }
+    }
+}
+
+/// Docker label every session container carries, so an orphan sweep can
+/// tell THIS node's containers from a sibling worker's on the same machine
+/// (the desktop app and a headless node coexist by design).
+const NODE_LABEL: &str = "kmplify.fabric.node";
+
+/// No-egress sessions and how their port still gets published.
+///
+/// Docker publishes no host port for a container on `--network none` and
+/// none for one on an `--internal` network either: `-p` is silently
+/// ignored in both cases (docker 29, Linux and Docker Desktop, measured).
+/// So every no-egress template used to die on this node with "could not
+/// resolve the container's host port" while the reference worker, which
+/// never isolated the network, served it. The portable answer is a guard:
+/// the workload lives on an internal network of its own, with no route
+/// out, and a socat sidecar on the default bridge publishes the port and
+/// forwards it across. The workload can reach the guard, but the guard
+/// forwards one listening port back to the workload and nothing else, so
+/// there is still no path to the internet or to the provider's LAN.
+///
+/// One network PER SESSION, not one shared network: two consumers' no-egress
+/// containers on the same machine must not be able to see each other, and
+/// on a shared internal network they could.
+pub fn noegress_network_name(container: &str) -> String {
+    format!("{container}-net")
+}
+/// The guard image. Pinned by tag, tiny, pulled once per node.
+pub const GUARD_IMAGE: &str = "alpine/socat:1.8.0.0";
+
+/// The guard container that publishes a no-egress session's port.
+pub fn guard_name(container: &str) -> String {
+    format!("{container}-guard")
+}
+
+/// `docker run` arguments for a guard: hardened like a session (no caps,
+/// no privilege escalation, read-only, small ceilings), on the default
+/// bridge so its `-p` is honoured, owned by the same label so the orphan
+/// sweep reaps it with the session. Pure, so the shape is testable.
+pub fn guard_run_args(container: &str, port: u64, ip: &str, label: &str) -> Vec<String> {
+    vec![
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        guard_name(container),
+        "--cap-drop".into(),
+        "ALL".into(),
+        "--security-opt".into(),
+        "no-new-privileges".into(),
+        "--read-only".into(),
+        "--memory".into(),
+        "64m".into(),
+        "--cpus".into(),
+        "0.25".into(),
+        "--pids-limit".into(),
+        "64".into(),
+        "--network".into(),
+        "bridge".into(),
+        "-p".into(),
+        format!("127.0.0.1:0:{port}"),
+        "--label".into(),
+        format!("{NODE_LABEL}={label}"),
+        GUARD_IMAGE.into(),
+        format!("TCP-LISTEN:{port},fork,reuseaddr"),
+        format!("TCP:{ip}:{port}"),
+    ]
+}
+
+async fn ensure_noegress_network(container: &str) -> Result<(), String> {
+    let net = noegress_network_name(container);
+    let inspect = crate::proc::command("docker")
+        .args(["network", "inspect", &net])
+        .output()
+        .await
+        .map_err(|e| format!("docker unavailable: {e}"))?;
+    if inspect.status.success() {
+        return Ok(());
+    }
+    let out = crate::proc::command("docker")
+        .args(["network", "create", "--internal", &net])
+        .output()
+        .await
+        .map_err(|e| format!("docker unavailable: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if err.contains("already exists") {
+        return Ok(());
+    }
+    Err(format!("could not create the no-egress network: {err}"))
+}
+
+/// Start the guard for a running no-egress session container and return
+/// its name. The caller resolves the published host port from the guard.
+async fn start_guard(container: &str, port: u64) -> Result<String, String> {
+    let net = noegress_network_name(container);
+    let ip = crate::proc::command("docker")
+        .args([
+            "inspect",
+            "-f",
+            &format!("{{{{(index .NetworkSettings.Networks \"{net}\").IPAddress}}}}"),
+            container,
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("docker unavailable: {e}"))?;
+    let ip = String::from_utf8_lossy(&ip.stdout).trim().to_string();
+    if ip.is_empty() || ip.contains("no value") {
+        return Err("the session container has no address on the no-egress network".into());
+    }
+    let present = crate::proc::command("docker")
+        .args(["image", "inspect", GUARD_IMAGE])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !present {
+        let pull = tokio::time::timeout(
+            Duration::from_secs(180),
+            crate::proc::command("docker")
+                .args(["pull", GUARD_IMAGE])
+                .output(),
+        )
+        .await
+        .map_err(|_| "pulling the guard image timed out".to_string())?
+        .map_err(|e| format!("docker unavailable: {e}"))?;
+        if !pull.status.success() {
+            return Err(format!(
+                "could not pull the guard image: {}",
+                String::from_utf8_lossy(&pull.stderr).trim()
+            ));
+        }
+    }
+    let guard = guard_name(container);
+    let _ = remove_container(&guard).await;
+    let args = guard_run_args(container, port, &ip, &node_label().await);
+    let out = crate::proc::command("docker")
+        .args(&args)
+        .output()
+        .await
+        .map_err(|e| format!("docker unavailable: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "could not start the guard: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let out = crate::proc::command("docker")
+        .args(["network", "connect", &net, &guard])
+        .output()
+        .await
+        .map_err(|e| format!("docker unavailable: {e}"))?;
+    if !out.status.success() {
+        let _ = remove_container(&guard).await;
+        return Err(format!(
+            "could not attach the guard to the no-egress network: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(guard)
+}
+
+static NODE_LABEL_VALUE: std::sync::OnceLock<Mutex<String>> = std::sync::OnceLock::new();
+
+async fn set_node_label(node_id: &str) {
+    let cell = NODE_LABEL_VALUE.get_or_init(|| Mutex::new(String::new()));
+    *cell.lock().await = node_id[..8.min(node_id.len())].to_string();
+}
+
+async fn node_label() -> String {
+    match NODE_LABEL_VALUE.get() {
+        Some(cell) => cell.lock().await.clone(),
+        None => String::new(),
+    }
+}
+
+/// Which of the containers docker lists under our label are orphans: named
+/// like a session container, not a prefetch helper, and not a session this
+/// process knows. Pure, so it is testable without docker.
+pub fn orphan_names(listed: &[String], live: &[String]) -> Vec<String> {
+    listed
+        .iter()
+        .filter(|n| n.starts_with("kmplify-fabric-"))
+        .filter(|n| !n.starts_with("kmplify-fabric-prefetch-"))
+        .filter(|n| {
+            !live
+                .iter()
+                .any(|l| l == *n || guard_name(l).as_str() == n.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
+/// Remove session containers a previous incarnation of THIS node left
+/// behind. `cleanup_sessions` runs on every exit path of the connection
+/// loop, but a SIGKILLed worker never reaches it, and the container then
+/// holds the provider's GPU with nobody coming back for it. Scoped by label
+/// so a sibling worker on the same machine is never reaped; containers from
+/// builds predating the label are left alone (documented manual repair).
+async fn sweep_orphans(sessions: &Sessions) {
+    let label = node_label().await;
+    if label.is_empty() {
+        return;
+    }
+    let out = crate::proc::command("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("label={NODE_LABEL}={label}"),
+            "--format",
+            "{{.Names}}",
+        ])
+        .output()
+        .await;
+    let Ok(out) = out else { return };
+    if !out.status.success() {
+        return;
+    }
+    let listed: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let live: Vec<String> = sessions
+        .lock()
+        .await
+        .values()
+        .map(|(n, _)| n.clone())
+        .collect();
+    for name in orphan_names(&listed, &live) {
+        match remove_container(&name).await {
+            Ok(()) => log(format!("removed orphaned session container {name}")),
+            Err(e) => log(format!("could not remove orphaned container {name}: {e}")),
+        }
+    }
+}
+
 /// What this node offers as container sessions.
 ///
 /// Gated on a live Docker daemon. Advertising templates while Docker is down
@@ -1220,10 +1568,14 @@ fn workload_capability(
     disk_used_mb: Option<u64>,
     images: &[String],
     inventory_error: Option<&str>,
+    runtimes: &[String],
 ) -> Value {
     let usable = docker_ok && !cfg.workload_templates.is_empty();
     let accel = cfg.accel();
     let mut caps = json!({
+        // Protocol v3.5: sandbox levels this daemon can run a session under.
+        // Plain "container" always; "gvisor" only when runsc is installed.
+        "runtimes": if usable { runtimes.to_vec() } else { vec!["container".to_string()] },
         "enabled": usable,
         // Legacy shape: gateways predating multi-vendor read only this, and
         // for them "GPU" has always meant CUDA. Keep it exactly that narrow
@@ -1631,6 +1983,30 @@ pub const IMAGE_PINS: &[TemplatePin] = &[
         accelerator: Backend::Cpu,
         network: Network::None,
     },
+    // Managed-only app templates (gateway v3.6). The gateway never schedules
+    // them on a peer; the pin keeps a mis-tagged node from running them
+    // under a different image.
+    TemplatePin {
+        template: "n8n",
+        repository: "n8nio/n8n",
+        accelerator: Backend::Cpu,
+        network: Network::Egress,
+    },
+    TemplatePin {
+        template: "jupyter",
+        repository: "quay.io/jupyter/scipy-notebook",
+        accelerator: Backend::Cpu,
+        network: Network::Egress,
+    },
+    // AWS-compatible services in one container (floci). In-process only,
+    // sealed: no egress, the guard publishes 4566, state in a per-consumer
+    // volume. Runs no consumer code, so peers may host it.
+    TemplatePin {
+        template: "floci",
+        repository: "floci/floci",
+        accelerator: Backend::Cpu,
+        network: Network::None,
+    },
     // Speech: one OpenAI-compatible server for BOTH directions, speech to
     // text (/v1/audio/transcriptions, faster-whisper) and text to speech
     // (/v1/audio/speech, Kokoro). Two template ids for the same publisher,
@@ -1890,6 +2266,23 @@ fn trim_log_tail(txt: &str, max_chars: usize) -> String {
 }
 
 async fn remove_container(name: &str) -> Result<(), String> {
+    // A session container may have a guard (no-egress sessions); it goes
+    // with it. Guards end in "-guard" themselves, so this never recurses.
+    if name.starts_with("kmplify-fabric-") && !name.ends_with("-guard") {
+        let _ = docker_rm(&guard_name(name)).await;
+        let res = docker_rm(name).await;
+        // The session's private network goes last, once nothing is on it.
+        // A network that never existed (egress session) is not an error.
+        let _ = crate::proc::command("docker")
+            .args(["network", "rm", &noegress_network_name(name)])
+            .output()
+            .await;
+        return res;
+    }
+    docker_rm(name).await
+}
+
+async fn docker_rm(name: &str) -> Result<(), String> {
     let out = crate::proc::command("docker")
         .args(["rm", "-f", "-v", name])
         .output()
@@ -2881,6 +3274,51 @@ async fn start_workload(
         }
     }
 
+    // Protocol v3.5: the sandbox level the template needs. Refused, never
+    // downgraded: a gateway asking for gVisor on a node without runsc gets
+    // an error, not a plain container wearing the wrong label.
+    let isolation = match Isolation::from_frame(frame["isolation"].as_str()) {
+        Some(i) => i,
+        None => {
+            workload_status(
+                &sink,
+                &session,
+                "error",
+                &format!(
+                    "template requires isolation {:?}, which this node does not understand",
+                    frame["isolation"].as_str().unwrap_or("")
+                ),
+            )
+            .await;
+            return;
+        }
+    };
+    match isolation {
+        Isolation::Container => {}
+        Isolation::Gvisor => {
+            if !docker_runtimes().await.iter().any(|r| r == "gvisor") {
+                workload_status(
+                    &sink,
+                    &session,
+                    "error",
+                    "template requires gvisor isolation but runsc is not a runtime on this node",
+                )
+                .await;
+                return;
+            }
+        }
+        Isolation::Microvm => {
+            workload_status(
+                &sink,
+                &session,
+                "error",
+                "template requires microvm isolation, which this node does not offer",
+            )
+            .await;
+            return;
+        }
+    }
+
     let name = container_name(&session);
     // Settled here rather than at `docker run` because the session is
     // announced below and the owner is shown what it holds from that moment:
@@ -3086,19 +3524,34 @@ async fn start_workload(
         format!("{cpus:.2}"),
         "--pids-limit".into(),
         "512".into(),
-        "-p".into(),
-        format!("127.0.0.1:0:{port}"),
+        // Protocol v3.5: owned-by label for the startup orphan sweep.
+        "--label".into(),
+        format!("{NODE_LABEL}={}", node_label().await),
     ];
+    if isolation == Isolation::Gvisor {
+        args.push("--runtime".into());
+        args.push("runsc".into());
+    }
     // Protocol v3.2. `--network none` leaves the container loopback only: it
     // cannot reach the provider's LAN, cannot call home, cannot exfiltrate
     // what it was given. Most of the catalog cannot run this way because it
     // downloads model weights on first use, so the catalog says which do, and
     // this node's own pin caps that. The published port is a host-side
     // mapping and keeps working either way.
+    // Docker honours `-p` on the default bridge only; a no-egress session
+    // gets its port published by a guard sidecar instead (NOEGRESS_NETWORK).
     let net = network_for(&template, Network::from_frame(frame["network"].as_str()));
     if net == Network::None {
+        if let Err(e) = ensure_noegress_network(&name).await {
+            hosted_remove(&session).await;
+            workload_status(&sink, &session, "error", &e).await;
+            return;
+        }
         args.push("--network".into());
-        args.push("none".into());
+        args.push(noegress_network_name(&name));
+    } else {
+        args.push("-p".into());
+        args.push(format!("127.0.0.1:0:{port}"));
     }
     // Protocol v3.3. A read-only rootfs means a workload cannot rewrite its
     // own image at run time, so whatever it pulls in cannot persist into the
@@ -3192,9 +3645,24 @@ async fn start_workload(
         }
     }
 
+    // No-egress: the guard publishes the port, so the port lookup asks it.
+    let port_owner = if net == Network::None {
+        match start_guard(&name, port).await {
+            Ok(guard) => guard,
+            Err(e) => {
+                let _ = remove_container(&name).await;
+                hosted_remove(&session).await;
+                workload_status(&sink, &session, "error", &e).await;
+                return;
+            }
+        }
+    } else {
+        name.clone()
+    };
+
     // The ephemeral port docker actually bound (127.0.0.1:0 above).
     let host_port = match crate::proc::command("docker")
-        .args(["port", &name, &format!("{port}/tcp")])
+        .args(["port", &port_owner, &format!("{port}/tcp")])
         .output()
         .await
     {
@@ -3518,6 +3986,22 @@ async fn ws_open(sink: Arc<Mutex<WsSink>>, sessions: Sessions, relays: RelaySock
 /// relay into the container. `host` would address the wrong server,
 /// `content-length`/`transfer-encoding` are rewritten by the client that
 /// actually sends the bytes, and the rest are connection management.
+///
+/// Deliberately NOT in this list: `authorization`. A consumer needs no bearer
+/// to reach a session (the session id in the relay path is the capability), so
+/// a client that attaches its fabric key by habit used to hand that key to
+/// whoever operates this machine. That leak is closed at the GATEWAY, which
+/// strips the header unless the template declares `forward_authorization`
+/// because the header is the template's own app token: Jupyter's
+/// `token <JUPYTER_TOKEN>`, n8n's basic auth, and every AWS SDK's
+/// `AWS4-HMAC-SHA256` signature for floci.
+///
+/// Stripping it here as well would be better defence in depth, and cannot be
+/// done yet: the node is not told which template policy applies, so an
+/// unconditional strip here would silently stop those three templates from
+/// authenticating at all. Doing it properly needs the gateway to carry the
+/// per-session flag in the start frame, which is a protocol addition and
+/// belongs with the transport round, not with this one.
 const RELAY_STRIPPED_HEADERS: &[&str] = &[
     "host",
     "connection",
@@ -3633,6 +4117,33 @@ async fn relay_http(
                 send_frame(&sink, json!({"type": "http_resp_end", "req_id": req_id})).await;
             } else {
                 let body = resp.bytes().await.unwrap_or_default();
+                if body.len() > MAX_RELAY_BODY_BYTES {
+                    // 502, not a truncated 200: a half-delivered file that
+                    // claims success is worse than an error, and the consumer
+                    // can act on this message.
+                    log(format!(
+                        "relay: refused a {} byte response from the container \
+                         (cap {MAX_RELAY_BODY_BYTES}); sending it would have \
+                         closed the gateway connection and every session on it",
+                        body.len()
+                    ));
+                    send_frame(
+                        &sink,
+                        json!({"type": "http_resp", "req_id": req_id, "status": 502,
+                        "headers": {}, "body_b64": b64_encode(
+                            format!(
+                                "the workload answered with {} bytes, over the \
+                                 {MAX_RELAY_BODY_BYTES} byte relay limit for a \
+                                 single response. Stream it (text/event-stream \
+                                 or application/x-ndjson) or fetch it in ranges.",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )}),
+                    )
+                    .await;
+                    return;
+                }
                 send_frame(
                     &sink,
                     json!({"type": "http_resp", "req_id": req_id, "status": status,
@@ -4060,6 +4571,16 @@ async fn session(
     // capability it cannot honour. Safe to block here — nothing is connected
     // yet, so there is no read loop to stall.
     let docker_live = docker_ok().await;
+    let runtimes_live = if docker_live {
+        docker_runtimes().await
+    } else {
+        vec!["container".to_string()]
+    };
+    set_node_label(&creds.node_id).await;
+    if docker_live {
+        // Containers a killed predecessor of this node left holding the GPU.
+        sweep_orphans(&sessions_cell().clone()).await;
+    }
     let (disk_live, images_live, inventory_err) = sample_inventory().await;
     if let Some(e) = &inventory_err {
         log(format!("inventory unavailable at connect: {e}"));
@@ -4070,24 +4591,41 @@ async fn session(
         cfg.gateway_url.replacen("http", "ws", 1)
     );
     crate::status::set_link(crate::status::Link::Connecting, ws_url.clone());
-    let (ws, _) = connect_async(&ws_url).await.map_err(|e| e.to_string())?;
+    // Explicit frame limits rather than tungstenite's defaults (64 MiB
+    // message, 16 MiB frame): the gateway enforces 16 MiB, and a node that
+    // would accept more only discovers the mismatch when a large payload
+    // closes the socket mid-session.
+    let (ws, _) = connect_async_with_config(&ws_url, Some(gateway_ws_config()), false)
+        .await
+        .map_err(|e| e.to_string())?;
     let (write, mut read) = ws.split();
     let sink = Arc::new(Mutex::new(write));
     // Register as THE live connection, so frames from session tasks born on
     // an earlier one still reach the gateway (see current_sink_cell).
     *current_sink_cell().write().await = Some(sink.clone());
 
+    // Protocol v3.7: the node's identity key signs the hello, so a gateway
+    // can tell this node from a copy of its token. Older gateways ignore the
+    // three keys; a v3.7 gateway that has bound this key refuses a hello
+    // without them.
+    let identity_fields = creds
+        .key()
+        .map(|k| k.hello_fields(&creds.node_id, crate::identity::now_s()))
+        .unwrap_or(Value::Null);
     let hello = json!({
         "type": "hello",
         "node_id": creds.node_id,
         "token": creds.token,
+        "pubkey": identity_fields.get("pubkey").cloned().unwrap_or(Value::Null),
+        "ts": identity_fields.get("ts").cloned().unwrap_or(Value::Null),
+        "sig": identity_fields.get("sig").cloned().unwrap_or(Value::Null),
         "models": models,
         // Per-model upstream overrides ({model: "colibri"}, protocol v2.5).
         // Empty for single-upstream nodes; older gateways ignore the key.
         "engines": engines,
         "gpu": gpu_info(cfg.accel(), cfg.max_shared_vram_mb).await,
         "workloads": workload_capability(
-            cfg, docker_live, disk_live, &images_live, inventory_err.as_deref(),
+            cfg, docker_live, disk_live, &images_live, inventory_err.as_deref(), &runtimes_live,
         ),
         // Which build is this? Compiled in, so it cannot disagree with what
         // was installed. Costs one field and removes a whole class of
@@ -4488,7 +5026,7 @@ async fn session(
                                 "type": "workloads",
                                 "workloads": workload_capability(
                                     cfg, docker_now, snapshot.0, &snapshot.1,
-                                    snapshot.2.as_deref(),
+                                    snapshot.2.as_deref(), &runtimes_live,
                                 ),
                             });
                             if let Err(e) = sink.lock().await.send(Message::Text(frame.to_string())).await {
@@ -5780,5 +6318,129 @@ mod model_manifest_tests {
         assert_eq!(pct(0, 0), 100.0);
         assert_eq!(pct(5, 10), 50.0);
         assert_eq!(pct(20, 10), 100.0); // a file larger than declared never overflows the bar
+    }
+}
+
+#[cfg(test)]
+mod isolation_and_sweep_tests {
+    use super::{guard_run_args, noegress_network_name};
+    use super::{orphan_names, runtimes_from_info, Isolation};
+
+    #[test]
+    fn runtimes_are_read_from_docker_info_and_container_is_always_first() {
+        assert_eq!(runtimes_from_info(""), vec!["container"]);
+        assert_eq!(runtimes_from_info("not json"), vec!["container"]);
+        let plain = r#"{"io.containerd.runc.v2":{"path":"runc"},"runc":{"path":"runc"}}"#;
+        assert_eq!(runtimes_from_info(plain), vec!["container"]);
+        let with_runsc = r#"{"runc":{"path":"runc"},"runsc":{"path":"/usr/local/bin/runsc"}}"#;
+        assert_eq!(runtimes_from_info(with_runsc), vec!["container", "gvisor"]);
+    }
+
+    #[test]
+    fn isolation_absent_means_container_and_unknown_fails_closed() {
+        assert_eq!(Isolation::from_frame(None), Some(Isolation::Container));
+        assert_eq!(Isolation::from_frame(Some("")), Some(Isolation::Container));
+        assert_eq!(
+            Isolation::from_frame(Some("container")),
+            Some(Isolation::Container)
+        );
+        assert_eq!(
+            Isolation::from_frame(Some("GVisor")),
+            Some(Isolation::Gvisor)
+        );
+        assert_eq!(
+            Isolation::from_frame(Some("microvm")),
+            Some(Isolation::Microvm)
+        );
+        assert_eq!(Isolation::from_frame(Some("firecracker")), None);
+    }
+
+    #[test]
+    fn orphan_sweep_only_reaps_session_containers_this_process_does_not_own() {
+        let listed = vec![
+            "kmplify-fabric-aaaa".to_string(),
+            "kmplify-fabric-bbbb".to_string(),
+            "kmplify-fabric-prefetch-cccc".to_string(),
+            "unrelated".to_string(),
+        ];
+        let live = vec!["kmplify-fabric-bbbb".to_string()];
+        assert_eq!(orphan_names(&listed, &live), vec!["kmplify-fabric-aaaa"]);
+        assert!(orphan_names(&[], &live).is_empty());
+    }
+
+    #[test]
+    fn orphan_sweep_keeps_the_guard_of_a_live_session_and_reaps_a_dead_ones() {
+        let listed = vec![
+            "kmplify-fabric-bbbb".to_string(),
+            "kmplify-fabric-bbbb-guard".to_string(),
+            "kmplify-fabric-aaaa-guard".to_string(),
+        ];
+        let live = vec!["kmplify-fabric-bbbb".to_string()];
+        assert_eq!(
+            orphan_names(&listed, &live),
+            vec!["kmplify-fabric-aaaa-guard"]
+        );
+    }
+
+    #[test]
+    fn guard_publishes_on_the_bridge_and_forwards_to_the_session_address() {
+        let args = guard_run_args("kmplify-fabric-abc", 80, "172.30.0.2", "node-x");
+        let joined = args.join(" ");
+        assert!(joined.contains("--name kmplify-fabric-abc-guard"));
+        assert!(joined.contains("--network bridge -p 127.0.0.1:0:80"));
+        assert!(joined.contains("--cap-drop ALL"));
+        assert!(joined.contains("--label kmplify.fabric.node=node-x"));
+        assert!(joined.ends_with("TCP-LISTEN:80,fork,reuseaddr TCP:172.30.0.2:80"));
+        assert!(!joined.contains(&noegress_network_name("kmplify-fabric-abc")));
+        assert_eq!(
+            noegress_network_name("kmplify-fabric-abc"),
+            "kmplify-fabric-abc-net"
+        );
+    }
+}
+
+#[cfg(test)]
+mod relay_frame_limit_tests {
+    use super::*;
+
+    /// One number across three implementations. The gateway passes
+    /// `--ws-max-size 16777216`, the reference worker passes the same to
+    /// `websockets.connect`, and this is the node's copy. A node that accepts
+    /// more than the gateway does discovers the mismatch when a large payload
+    /// closes the socket, which takes every session on the node with it.
+    #[test]
+    fn the_frame_cap_matches_the_gateways() {
+        assert_eq!(MAX_FRAME_BYTES, 16 * 1024 * 1024);
+        let cfg = gateway_ws_config();
+        assert_eq!(cfg.max_message_size, Some(MAX_FRAME_BYTES));
+        assert_eq!(cfg.max_frame_size, Some(MAX_FRAME_BYTES));
+    }
+
+    /// base64 grows a body by 4/3, so the body cap has to be the SMALLER
+    /// number or a response just under the frame limit still produces a frame
+    /// over it. This is the arithmetic that mistake hides in.
+    #[test]
+    fn a_body_at_the_cap_still_fits_in_a_frame() {
+        let encoded = MAX_RELAY_BODY_BYTES.div_ceil(3) * 4;
+        assert!(
+            encoded < MAX_FRAME_BYTES,
+            "a {MAX_RELAY_BODY_BYTES} byte body encodes to {encoded}, over the \
+             {MAX_FRAME_BYTES} byte frame cap"
+        );
+        // Still a useful size, not a cap so tight it refuses ordinary work.
+        const { assert!(MAX_RELAY_BODY_BYTES < MAX_FRAME_BYTES) };
+        const { assert!(MAX_RELAY_BODY_BYTES > 8 * 1024 * 1024) };
+    }
+
+    /// Consumers do not authenticate to a workload with a fabric key, so the
+    /// gateway strips `authorization` unless the template owns the header.
+    /// The node cannot make that call (it is not told the template policy),
+    /// and must therefore NOT strip it blindly, or floci stops speaking AWS
+    /// and Jupyter stops accepting its own token.
+    #[test]
+    fn the_node_leaves_authorization_to_the_gateway() {
+        assert!(!RELAY_STRIPPED_HEADERS.contains(&"authorization"));
+        assert!(RELAY_STRIPPED_HEADERS.contains(&"proxy-authorization"));
+        assert!(RELAY_STRIPPED_HEADERS.contains(&"host"));
     }
 }
