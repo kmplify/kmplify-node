@@ -910,6 +910,14 @@ fn models_from_openai(body: &Value) -> Vec<String> {
 /// leaving every deployed desktop install on byte-for-byte the path it used
 /// before this fallback existed.
 pub async fn local_models(client: &reqwest::Client, ollama_base: &str) -> Vec<String> {
+    local_models_kind(client, ollama_base).await.0
+}
+
+/// The models at `ollama_base`, and whether Ollama's own API answered
+/// (`true`) or only the OpenAI-compatible listing did (`false`). Jobs for a
+/// server that is not Ollama (vLLM, llama.cpp server, LM Studio, …) must
+/// never be sent Ollama's `/api/chat` or its `keep_alive` field.
+pub async fn local_models_kind(client: &reqwest::Client, ollama_base: &str) -> (Vec<String>, bool) {
     let native = client.get(format!("{ollama_base}/api/tags")).send().await;
     let native_err = match native {
         // Status is checked explicitly: vLLM answers /api/tags with a JSON
@@ -923,7 +931,9 @@ pub async fn local_models(client: &reqwest::Client, ollama_base: &str) -> Vec<St
             // old early-return took that as "an Ollama with no models" and
             // the /v1/models fallback below became unreachable — a node
             // pointed at LM Studio advertised nothing, silently.
-            Ok(body) if body.get("models").is_some() => return models_from_native(&body),
+            Ok(body) if body.get("models").is_some() => {
+                return (models_from_native(&body), true);
+            }
             Ok(_) => "200 without a model list (not an Ollama)".to_string(),
             Err(e) => format!("unreadable body: {e}"),
         },
@@ -933,13 +943,13 @@ pub async fn local_models(client: &reqwest::Client, ollama_base: &str) -> Vec<St
 
     match client.get(format!("{ollama_base}/v1/models")).send().await {
         Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
-            Ok(body) => models_from_openai(&body),
+            Ok(body) => (models_from_openai(&body), false),
             Err(e) => {
                 log(format!(
                     "cannot list models at {ollama_base} — /api/tags: {native_err}; \
                      /v1/models: unreadable body: {e}"
                 ));
-                Vec::new()
+                (Vec::new(), false)
             }
         },
         other => {
@@ -953,7 +963,7 @@ pub async fn local_models(client: &reqwest::Client, ollama_base: &str) -> Vec<St
                 "cannot list models at {ollama_base} — /api/tags: {native_err}; \
                  /v1/models: {compat_err}"
             ));
-            Vec::new()
+            (Vec::new(), false)
         }
     }
 }
@@ -1013,7 +1023,17 @@ pub async fn discover(
     client: &reqwest::Client,
     cfg: &WorkerConfig,
 ) -> (Vec<String>, std::collections::HashMap<String, String>) {
-    let primary = local_models(client, &cfg.ollama_base).await;
+    let (models, engines, _) = discover_kind(client, cfg).await;
+    (models, engines)
+}
+
+/// `discover` plus whether the primary upstream speaks only the OpenAI
+/// shape (`true` when `/api/tags` did not answer and `/v1/models` did).
+pub async fn discover_kind(
+    client: &reqwest::Client,
+    cfg: &WorkerConfig,
+) -> (Vec<String>, std::collections::HashMap<String, String>, bool) {
+    let (primary, is_ollama) = local_models_kind(client, &cfg.ollama_base).await;
     let colibri = colibri_models(client, &cfg.colibri_base, &cfg.colibri_api_key).await;
     let mut engines = std::collections::HashMap::new();
     let mut all = primary.clone();
@@ -1023,7 +1043,7 @@ pub async fn discover(
             all.push(m);
         }
     }
-    (all, engines)
+    (all, engines, !is_ollama)
 }
 
 /// Total VRAM of GPU 0 in MB via nvidia-smi, or None. The one number the
@@ -4260,6 +4280,9 @@ struct JobUpstreams {
     colibri_base: String,
     colibri_api_key: String,
     engines: std::collections::HashMap<String, String>,
+    /// The primary is not Ollama (vLLM, llama.cpp server, LM Studio, …):
+    /// no `/api/chat`, no `keep_alive`, no `think`.
+    primary_openai_only: bool,
 }
 
 async fn run_job(
@@ -4305,7 +4328,8 @@ async fn run_job(
     // is the only place the flag actually takes effect. Ollama-only: colibri
     // has no native endpoint and no hidden reasoning channel to suppress.
     let think = payload.get("think").and_then(Value::as_bool);
-    let native_think = kind == "chat" && think.is_some() && !is_colibri;
+    let openai_only = is_colibri || upstreams.primary_openai_only;
+    let native_think = kind == "chat" && think.is_some() && !openai_only;
     let path = if kind != "chat" {
         "/v1/embeddings"
     } else if native_think {
@@ -4320,12 +4344,12 @@ async fn run_job(
     };
     // keep_alive/num_ctx are Ollama residency knobs; colibri manages its own
     // expert cache and must not receive fields it never defined.
-    let mut payload = if is_colibri {
+    let mut payload = if openai_only {
         payload
     } else {
         keep_peer_model_warm(payload, path)
     };
-    if is_colibri {
+    if openai_only {
         if let Some(obj) = payload.as_object_mut() {
             obj.remove("think");
         }
@@ -4488,10 +4512,10 @@ async fn session(
     // `serving()` is the switch AND the dashboard's live pause: a paused node
     // stays connected, keeps its hosted sessions and its place in the
     // registry, and advertises nothing.
-    let (models, engines) = if serving(cfg) {
-        discover(client, cfg).await
+    let (models, engines, primary_openai_only) = if serving(cfg) {
+        discover_kind(client, cfg).await
     } else {
-        (Vec::new(), std::collections::HashMap::new())
+        (Vec::new(), std::collections::HashMap::new(), false)
     };
     if models.is_empty() && serving(cfg) {
         log("no local models — connecting anyway; jobs will be refused by scheduler");
@@ -5035,6 +5059,7 @@ async fn session(
                             colibri_base: cfg.colibri_base.clone(),
                             colibri_api_key: cfg.colibri_api_key.clone(),
                             engines: current_engines.clone(),
+                            primary_openai_only,
                         };
                         let (sink, client) = (sink.clone(), client.clone());
                         tokio::spawn(async move {
