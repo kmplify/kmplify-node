@@ -117,9 +117,21 @@ impl Backend {
     /// on someone else's machine. An image that genuinely needs more should
     /// be a catalog decision, visible in the template.
     pub fn docker_args(self) -> Vec<String> {
+        self.docker_args_for(None)
+    }
+
+    /// The same flags, but for ONE device when the gateway placed the
+    /// session on a specific card (`gpu_index`, protocol v3.8). Only CUDA
+    /// addresses devices this way; the other vendors keep their device
+    /// nodes, which are per machine. A rig used to hand every container all
+    /// eight cards, and every framework then picked card 0.
+    pub fn docker_args_for(self, device: Option<u32>) -> Vec<String> {
         let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect();
         match self {
-            Backend::Cuda => v(&["--gpus", "all"]),
+            Backend::Cuda => match device {
+                Some(i) => vec!["--gpus".to_string(), format!("device={i}")],
+                None => v(&["--gpus", "all"]),
+            },
             // /dev/kfd is the compute device, /dev/dri the render nodes; the
             // video group is what makes them readable without root.
             Backend::Rocm => v(&[
@@ -163,6 +175,32 @@ pub struct Gpu {
     pub backend: Backend,
     pub name: String,
     pub total_mb: u64,
+    /// Every device of this backend, in index order (protocol v3.8). `name`
+    /// and `total_mb` describe the first one, as they always did; an 8-GPU
+    /// box used to be advertised as its first card and every session landed
+    /// there with `--gpus all`.
+    pub devices: Vec<GpuDevice>,
+}
+
+/// One accelerator, as the gateway places sessions on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpuDevice {
+    pub index: u32,
+    pub name: String,
+    pub total_mb: u64,
+}
+
+impl Gpu {
+    /// A backend whose tooling reports one device (or that we only ever ask
+    /// about one): the device list is that single card.
+    fn single(backend: Backend, name: String, total_mb: u64) -> Self {
+        Gpu {
+            backend,
+            devices: vec![GpuDevice { index: 0, name: name.clone(), total_mb }],
+            name,
+            total_mb,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +215,31 @@ pub(crate) fn parse_nvidia_first(out: &str) -> Option<String> {
     let line = out.lines().find(|l| !l.trim().is_empty())?;
     let field = line.split(',').next()?.trim();
     (!field.is_empty()).then(|| field.to_string())
+}
+
+/// Every data line of `nvidia-smi --query-gpu=index,name,memory.total
+/// --format=csv,noheader,nounits`, as (index, name, total MB). Lines that do
+/// not parse are skipped rather than failing the whole probe; an empty
+/// result means the tool answered nothing usable.
+pub(crate) fn parse_nvidia_rows(out: &str) -> Vec<GpuDevice> {
+    out.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| {
+            let mut it = l.splitn(3, ',').map(str::trim);
+            let index = it.next()?.parse::<u32>().ok()?;
+            let name = it.next()?.to_string();
+            let total_mb = it.next()?.parse::<f64>().ok()? as u64;
+            (!name.is_empty()).then_some(GpuDevice { index, name, total_mb })
+        })
+        .collect()
+}
+
+/// Every data line of a single-column `nounits` reply, in order.
+pub(crate) fn parse_nvidia_mb_all(out: &str) -> Vec<u64> {
+    out.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| l.split(',').next()?.trim().parse::<f64>().ok().map(|v| v as u64))
+        .collect()
 }
 
 /// Megabytes from a `nounits` nvidia-smi field, which is already MB.
@@ -313,6 +376,25 @@ async fn run(bin: &str, args: &[&str]) -> Option<String> {
 }
 
 async fn probe_cuda() -> Option<Gpu> {
+    // One query, every card (v3.8). The first row keeps the role the old
+    // single-card probe gave it; the rest make the multi-GPU rig honest.
+    let rows = run(
+        "nvidia-smi",
+        &["--query-gpu=index,name,memory.total", "--format=csv,noheader,nounits"],
+    )
+    .await
+    .map(|o| parse_nvidia_rows(&o))
+    .unwrap_or_default();
+    if let Some(first) = rows.first() {
+        return Some(Gpu {
+            backend: Backend::Cuda,
+            name: first.name.clone(),
+            total_mb: first.total_mb,
+            devices: rows,
+        });
+    }
+    // Older tooling that refuses the combined query: the two single-column
+    // questions the probe always asked.
     let name = run("nvidia-smi", &["--query-gpu=name", "--format=csv,noheader"])
         .await
         .and_then(|o| parse_nvidia_first(&o))
@@ -323,11 +405,7 @@ async fn probe_cuda() -> Option<Gpu> {
     )
     .await
     .and_then(|o| parse_nvidia_mb(&o))?;
-    Some(Gpu {
-        backend: Backend::Cuda,
-        name,
-        total_mb: total,
-    })
+    Some(Gpu::single(Backend::Cuda, name, total))
 }
 
 async fn probe_rocm() -> Option<Gpu> {
@@ -338,30 +416,26 @@ async fn probe_rocm() -> Option<Gpu> {
                 .await
                 .and_then(|o| parse_rocm_product_csv(&o))
                 .unwrap_or_else(|| "AMD GPU".to_string());
-            return Some(Gpu {
-                backend: Backend::Rocm,
-                name,
-                total_mb: total,
-            });
+            return Some(Gpu::single(Backend::Rocm, name, total));
         }
     }
     let out = run("amd-smi", &["static", "--json"]).await?;
     let (name, mem) = parse_gpu_json(&out)?;
-    Some(Gpu {
-        backend: Backend::Rocm,
-        name: name.unwrap_or_else(|| "AMD GPU".to_string()),
-        total_mb: mem?,
-    })
+    Some(Gpu::single(
+        Backend::Rocm,
+        name.unwrap_or_else(|| "AMD GPU".to_string()),
+        mem?,
+    ))
 }
 
 async fn probe_oneapi() -> Option<Gpu> {
     let out = run("xpu-smi", &["discovery", "-j"]).await?;
     let (name, mem) = parse_gpu_json(&out)?;
-    Some(Gpu {
-        backend: Backend::OneApi,
-        name: name.unwrap_or_else(|| "Intel GPU".to_string()),
-        total_mb: mem.unwrap_or(0),
-    })
+    Some(Gpu::single(
+        Backend::OneApi,
+        name.unwrap_or_else(|| "Intel GPU".to_string()),
+        mem.unwrap_or(0),
+    ))
 }
 
 async fn probe_metal() -> Option<Gpu> {
@@ -375,11 +449,37 @@ async fn probe_metal() -> Option<Gpu> {
         .unwrap_or_else(|| "Apple Silicon".to_string());
     // What the GPU can actually address, not total RAM: unified memory is
     // shared and the GPU is capped well below the machine's total.
-    Some(Gpu {
-        backend: Backend::Metal,
+    Some(Gpu::single(
+        Backend::Metal,
         name,
-        total_mb: super::fabric_worker::gpu_addressable_mb(),
-    })
+        super::fabric_worker::gpu_addressable_mb(),
+    ))
+}
+
+#[cfg(test)]
+mod multi_gpu_tests {
+    use super::*;
+
+    #[test]
+    fn nvidia_rows_cover_every_card() {
+        let out = "0, NVIDIA GeForce RTX 4090, 24564\n1, NVIDIA GeForce RTX 4090, 24564\n\n7, NVIDIA RTX 6000 Ada Generation, 49140\n";
+        let rows = parse_nvidia_rows(out);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], GpuDevice { index: 0, name: "NVIDIA GeForce RTX 4090".into(), total_mb: 24564 });
+        assert_eq!(rows[2].index, 7);
+        assert_eq!(rows[2].total_mb, 49140);
+    }
+
+    #[test]
+    fn nvidia_rows_skip_garbage_lines() {
+        assert!(parse_nvidia_rows("No devices were found").is_empty());
+        assert_eq!(parse_nvidia_rows("0, A, 100\nnonsense\n1, B, 200").len(), 2);
+    }
+
+    #[test]
+    fn used_all_keeps_order() {
+        assert_eq!(parse_nvidia_mb_all("512\n0\n20480\n"), vec![512, 0, 20480]);
+    }
 }
 
 /// Which vendor's driver stack is INSTALLED here, without running anything.
@@ -658,6 +758,22 @@ pub(crate) fn parse_rocm_use_csv(out: &str) -> Option<u8> {
         .map(|v| v.clamp(0.0, 100.0) as u8)
 }
 
+/// Used MB per device, in index order (v3.8). Only CUDA tooling answers
+/// per card; every other backend reports its single figure as a one-entry
+/// list, and an unreadable tool gives an empty one.
+pub async fn used_mb_all(backend: Backend) -> Vec<u64> {
+    if backend == Backend::Cuda {
+        return run(
+            "nvidia-smi",
+            &["--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+        )
+        .await
+        .map(|o| parse_nvidia_mb_all(&o))
+        .unwrap_or_default();
+    }
+    used_mb(backend).await.into_iter().collect()
+}
+
 pub async fn used_mb(backend: Backend) -> Option<u64> {
     match backend {
         Backend::Cuda => run(
@@ -855,6 +971,8 @@ mod parser_tests {
     #[test]
     fn docker_args_stay_narrow() {
         assert_eq!(Backend::Cuda.docker_args(), vec!["--gpus", "all"]);
+        assert_eq!(Backend::Cuda.docker_args_for(Some(3)), vec!["--gpus", "device=3"]);
+        assert_eq!(Backend::Rocm.docker_args_for(Some(3)), Backend::Rocm.docker_args());
         assert!(Backend::Rocm
             .docker_args()
             .contains(&"/dev/kfd".to_string()));
