@@ -241,6 +241,7 @@ fn resolve_config(errs: &mut Vec<String>) -> WorkerConfig {
             .unwrap_or_default(),
         max_shared_cpus: env_num("PROVIDER_MAX_CPUS", errs),
         max_shared_vram_mb: env_num("PROVIDER_MAX_VRAM_MB", errs),
+        max_inference_jobs: env_num("PROVIDER_MAX_INFERENCE_JOBS", errs),
         max_shared_ram_mb: env_num("PROVIDER_MAX_RAM_MB", errs),
         max_shared_disk_gb: env_num("PROVIDER_MAX_DISK_GB", errs),
         // Headless default: a node someone runs on purpose shares inference
@@ -716,6 +717,7 @@ fn render_check_json(cfg: &WorkerConfig, pf: &Preflight) {
             "workloads": cfg.workload_templates,
             "max_cpus": cfg.max_shared_cpus,
             "max_vram_mb": cfg.max_shared_vram_mb,
+            "max_inference_jobs": cfg.max_inference_jobs,
             "max_ram_mb": cfg.max_shared_ram_mb,
             "max_disk_gb": cfg.max_shared_disk_gb,
             "functions": cfg.functions.enabled,
@@ -956,11 +958,12 @@ fn run_set(dir: &std::path::Path, cli: &cli::Cli, from_env: &WorkerConfig) -> i3
         effective.approval_mode
     );
     println!(
-        "ceilings: cpus {} · vram {} · ram {} · disk {}",
+        "ceilings: cpus {} · vram {} · ram {} · disk {} · inference jobs {}",
         ceiling(effective.max_shared_cpus, ""),
         ceiling(effective.max_shared_vram_mb, " MB"),
         ceiling(effective.max_shared_ram_mb, " MB"),
         ceiling(effective.max_shared_disk_gb, " GB"),
+        ceiling(effective.max_inference_jobs, ""),
     );
 
     // Nudge the running node, if there is one. Without this the change would

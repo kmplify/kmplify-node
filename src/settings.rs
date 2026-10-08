@@ -81,6 +81,11 @@ pub struct Settings {
     /// Ceiling on advertised VRAM in MB (`PROVIDER_MAX_VRAM_MB`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_vram_mb: Option<u64>,
+    /// Inference jobs this node takes at once from the pool
+    /// (`PROVIDER_MAX_INFERENCE_JOBS`, protocol v3.8). Unset = 4 per GPU, 2
+    /// on a CPU-only host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_inference_jobs: Option<u32>,
     /// Ceiling on advertised system RAM in MB (`PROVIDER_MAX_RAM_MB`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_ram_mb: Option<u64>,
@@ -206,6 +211,9 @@ impl Settings {
         if let Some(v) = self.max_vram_mb {
             cfg.max_shared_vram_mb = (v > 0).then_some(v);
         }
+        if let Some(v) = self.max_inference_jobs {
+            cfg.max_inference_jobs = (v > 0).then_some(v);
+        }
         if let Some(v) = self.max_ram_mb {
             cfg.max_shared_ram_mb = (v > 0).then_some(v);
         }
@@ -320,6 +328,13 @@ impl Settings {
                 v.to_string(),
             );
         }
+        if let Some(v) = self.max_inference_jobs {
+            note(
+                "PROVIDER_MAX_INFERENCE_JOBS",
+                opt_str(from_env.max_inference_jobs),
+                v.to_string(),
+            );
+        }
         if let Some(v) = self.max_ram_mb {
             note(
                 "PROVIDER_MAX_RAM_MB",
@@ -397,6 +412,7 @@ impl Settings {
             "colibri-key" => self.colibri_api_key = Some(value.to_string()),
             "max-cpus" => self.max_cpus = Some(parse_num::<f64>(key, value)?),
             "max-vram-mb" => self.max_vram_mb = Some(parse_capacity(key, value, Unit::Mb)?),
+            "max-inference-jobs" => self.max_inference_jobs = Some(parse_num::<u32>(key, value)?),
             "max-ram-mb" => self.max_ram_mb = Some(parse_capacity(key, value, Unit::Mb)?),
             "max-disk-gb" => self.max_disk_gb = Some(parse_capacity(key, value, Unit::Gb)?),
             "functions" => self.functions = Some(parse_bool(key, value)?),
@@ -438,6 +454,7 @@ impl Settings {
             "colibri-key" => self.colibri_api_key = None,
             "max-cpus" => self.max_cpus = None,
             "max-vram-mb" => self.max_vram_mb = None,
+            "max-inference-jobs" => self.max_inference_jobs = None,
             "max-ram-mb" => self.max_ram_mb = None,
             "max-disk-gb" => self.max_disk_gb = None,
             "functions" => self.functions = None,
@@ -482,6 +499,7 @@ impl Settings {
         );
         push("max-cpus", self.max_cpus.map(|v| v.to_string()));
         push("max-vram-mb", self.max_vram_mb.map(|v| v.to_string()));
+        push("max-inference-jobs", self.max_inference_jobs.map(|v| v.to_string()));
         push("max-ram-mb", self.max_ram_mb.map(|v| v.to_string()));
         push("max-disk-gb", self.max_disk_gb.map(|v| v.to_string()));
         push("functions", self.functions.map(|v| v.to_string()));
