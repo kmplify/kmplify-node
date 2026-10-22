@@ -60,12 +60,30 @@ ASSET="kmplify-node-${TARGET}"
 # ---- where do assets come from -------------------------------------------
 if [ -n "${KMPLIFY_INSTALL_BASE:-}" ]; then
   BASE="${KMPLIFY_INSTALL_BASE%/}"
+  # Plaintext here means whoever is on the path chooses the binary that ends
+  # up running as a service on this machine. The checksum does not help: it is
+  # fetched over the same connection and would be swapped with it.
+  case "$BASE" in
+    https://*) ;;
+    http://127.0.0.1*|http://localhost*|http://[::1]*) ;;   # local test server
+    *) fail "KMPLIFY_INSTALL_BASE must be https:// (or a loopback address for testing), got: $BASE" ;;
+  esac
 else
   if [ -z "$VERSION" ]; then
-    auth=""
-    [ -n "${GITHUB_TOKEN:-}" ] && auth="-H \"Authorization: Bearer $GITHUB_TOKEN\""
-    VERSION="$(eval curl -fsSL $auth "https://api.github.com/repos/$REPO/releases/latest" \
-      | tr ',' '\n' | grep -m1 '"tag_name"' | cut -d'"' -f4)" || true
+    # No eval. The token was interpolated into a string and re-parsed by the
+    # shell, so a token containing shell metacharacters executed them. curl
+    # reads the header from a file instead, which also keeps it off the
+    # process list where `ps` would show it.
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+      hdr="$(mktemp)"
+      printf 'Authorization: Bearer %s\n' "$GITHUB_TOKEN" > "$hdr"
+      VERSION="$(curl -fsSL -H @"$hdr" "https://api.github.com/repos/$REPO/releases/latest" \
+        | tr ',' '\n' | grep -m1 '"tag_name"' | cut -d'"' -f4)" || true
+      rm -f "$hdr"
+    else
+      VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+        | tr ',' '\n' | grep -m1 '"tag_name"' | cut -d'"' -f4)" || true
+    fi
     [ -n "$VERSION" ] || fail "could not resolve the latest release of $REPO. If none has been published yet, build from source (see README.md) or pass --version vX.Y.Z"
   fi
   BASE="https://github.com/$REPO/releases/download/$VERSION"
@@ -85,6 +103,55 @@ curl -fsSL -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS" \
 if command -v sha256sum >/dev/null 2>&1; then SHA="sha256sum";
 elif command -v shasum >/dev/null 2>&1;  then SHA="shasum -a 256";
 else fail "neither sha256sum nor shasum found; cannot verify the download"; fi
+
+# ---- is SHA256SUMS itself trustworthy -------------------------------------
+#
+# The checksum proves the binary matches the manifest. It proves nothing about
+# the MANIFEST, which arrives over the same connection from the same place: an
+# attacker who can replace one replaces both, and this script would verify the
+# swap against itself and report success. Checksums catch corruption; only a
+# signature catches substitution.
+#
+# RELEASE_PUBKEY below is the release signing key, PEM, embedded in this
+# script. While it is empty the signature is OPTIONAL and its absence is
+# reported rather than fatal — the mechanism ships before the key exists, and
+# the day the key is filled in this becomes mandatory with no other change.
+# See F13 in docs/security/AUDIT-2026-08-24.md.
+#
+# To turn it on, generate an ECDSA P-256 key:
+#
+#     openssl ecparam -name prime256v1 -genkey -noout -out release-key.pem
+#     openssl ec -in release-key.pem -pubout            # paste this below
+#
+# then add the PRIVATE key to the repository as the MINISIGN-free secret
+# `RELEASE_SIGNING_KEY`, which .github/workflows/release.yml signs SHA256SUMS
+# with. Keep it out of this repo and out of the release.
+#
+# ECDSA or RSA, NOT Ed25519 — the modern default is the wrong choice here.
+# `openssl dgst -sha256 -verify` below cannot use an EdDSA key at all
+# ("Explicit digest not allowed with EdDSA operations"), so signing with one
+# would break every install the moment verification became mandatory.
+RELEASE_PUBKEY=""
+
+if [ -n "$RELEASE_PUBKEY" ]; then
+  command -v openssl >/dev/null 2>&1 \
+    || fail "openssl is required to verify the release signature; install it, or build from source"
+  curl -fsSL -o "$TMP/SHA256SUMS.sig" "$BASE/SHA256SUMS.sig" \
+    || fail "download failed: $BASE/SHA256SUMS.sig (this release is not signed; refusing to install)"
+  printf '%s\n' "$RELEASE_PUBKEY" > "$TMP/release.pem"
+  openssl dgst -sha256 -verify "$TMP/release.pem" \
+    -signature "$TMP/SHA256SUMS.sig" "$TMP/SHA256SUMS" >/dev/null 2>&1 \
+    || fail "SHA256SUMS does not verify under the KMPLIFY release key. Someone has \
+substituted the release, or it was published without being signed. NOT installing."
+  say "release signature verified"
+else
+  # Said out loud rather than passed over. An operator piping this into a
+  # shell should know which of the two properties they are getting.
+  say ""
+  say "NOTE: this release is verified by CHECKSUM only, not by signature."
+  say "      That detects a corrupted download, not a substituted one."
+  say ""
+fi
 
 want="$(grep " $ASSET\$" "$TMP/SHA256SUMS" | cut -d' ' -f1)"
 [ -n "$want" ] || fail "SHA256SUMS has no entry for $ASSET"
