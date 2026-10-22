@@ -241,6 +241,7 @@ fn resolve_config(errs: &mut Vec<String>) -> WorkerConfig {
             .unwrap_or_default(),
         max_shared_cpus: env_num("PROVIDER_MAX_CPUS", errs),
         max_shared_vram_mb: env_num("PROVIDER_MAX_VRAM_MB", errs),
+        max_inference_jobs: env_num("PROVIDER_MAX_INFERENCE_JOBS", errs),
         max_shared_ram_mb: env_num("PROVIDER_MAX_RAM_MB", errs),
         max_shared_disk_gb: env_num("PROVIDER_MAX_DISK_GB", errs),
         // Headless default: a node someone runs on purpose shares inference
@@ -539,6 +540,12 @@ fn render_check_text(cfg: &WorkerConfig, pf: &Preflight) {
     println!();
     println!("configuration");
     println!("  gateway    : {}", cfg.gateway_url);
+    if let Err(e) = fabric_worker::check_gateway_url(&cfg.gateway_url) {
+        // Printed here as well as enforced at startup, so `kmplify-node check`
+        // (which the installer runs) reports it while the operator is still
+        // watching, rather than at the first silent refusal to start.
+        println!("               ^ REFUSED: {e}");
+    }
     println!("  creds      : {}", cfg.creds_path.display());
     println!("  ollama     : {}", cfg.ollama_base);
     if !cfg.colibri_base.is_empty() {
@@ -716,6 +723,7 @@ fn render_check_json(cfg: &WorkerConfig, pf: &Preflight) {
             "workloads": cfg.workload_templates,
             "max_cpus": cfg.max_shared_cpus,
             "max_vram_mb": cfg.max_shared_vram_mb,
+            "max_inference_jobs": cfg.max_inference_jobs,
             "max_ram_mb": cfg.max_shared_ram_mb,
             "max_disk_gb": cfg.max_shared_disk_gb,
             "functions": cfg.functions.enabled,
@@ -956,11 +964,12 @@ fn run_set(dir: &std::path::Path, cli: &cli::Cli, from_env: &WorkerConfig) -> i3
         effective.approval_mode
     );
     println!(
-        "ceilings: cpus {} · vram {} · ram {} · disk {}",
+        "ceilings: cpus {} · vram {} · ram {} · disk {} · inference jobs {}",
         ceiling(effective.max_shared_cpus, ""),
         ceiling(effective.max_shared_vram_mb, " MB"),
         ceiling(effective.max_shared_ram_mb, " MB"),
         ceiling(effective.max_shared_disk_gb, " GB"),
+        ceiling(effective.max_inference_jobs, ""),
     );
 
     // Nudge the running node, if there is one. Without this the change would
@@ -1400,7 +1409,13 @@ fn print_peers_json(p: &kmplify_node::peers::Peers, cfg: &WorkerConfig) {
 async fn run_id(cfg: &WorkerConfig) -> i32 {
     match fabric_worker::ensure_identity(&cfg.gateway_url, &cfg.creds_path).await {
         Ok(c) => {
+            // The id on its own line first, exactly as before, so scripts that
+            // read `kmplify-node id` keep working; the address (v3.7) follows
+            // for a person claiming this node from their KMPLIFY account.
             println!("{}", c.node_id);
+            if let Some(key) = c.key() {
+                println!("address: {}", key.address());
+            }
             EXIT_OK
         }
         Err(e) => {
@@ -1431,7 +1446,12 @@ pub(crate) async fn start_node(cfg: WorkerConfig, dir: PathBuf) -> Node {
             status::update(move |s| s.node_id = id);
             // The PUBLIC half, in its own file, so a companion never has to
             // open the credential to learn the node id — see identity.rs.
-            kmplify_node::identity::publish_for(&dir, &c.node_id, &cfg.gateway_url);
+            kmplify_node::identity::publish_for(
+                &dir,
+                &c.node_id,
+                &cfg.gateway_url,
+                c.key().as_ref(),
+            );
             status::push_log(format!(
                 "node identity {}…",
                 &c.node_id[..8.min(c.node_id.len())]
@@ -1478,6 +1498,13 @@ impl Node {
 
 /// Join the fabric and serve until told to stop. Returns the exit code.
 async fn serve(cfg: WorkerConfig, dir: PathBuf) -> i32 {
+    if let Err(e) = fabric_worker::check_gateway_url(&cfg.gateway_url) {
+        // Before ensure_identity, which is the call that would hand the token
+        // over. Exits non-zero so a service manager reports a failed unit
+        // rather than restarting into the same misconfiguration forever.
+        eprintln!("\nERROR: {e}");
+        return EXIT_UNUSABLE;
+    }
     println!("[kmplify-node] joining {}", cfg.gateway_url);
     let node = start_node(cfg, dir).await;
     let snap = status::snapshot();

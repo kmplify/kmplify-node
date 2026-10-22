@@ -1,6 +1,6 @@
 [package]
 name = "kmplify-node"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 # What the dependency floor actually is, now that both lanes ship by default:
 # ratatui asks for 1.88 and wasmtime for 1.95. Claiming 1.77 while the tree
@@ -60,7 +60,11 @@ reqwest = { version = "0.12", default-features = false, features = [
 # is being advertised.
 sysinfo = "0.32"
 sha2 = "0.10.9"
-ed25519-dalek = "2.1.1"
+# Also the node's OWN identity key (src/identity.rs, protocol v3.7): the
+# `rand_core` feature is what lets it generate one; `rand_core/getrandom`
+# is the OS entropy behind that on every platform this ships on.
+ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 # The terminal dashboard (src/tui.rs). Default-on because a headless node
 # without one is operated by reading logs; a packager who wants the smallest
 # possible service binary can still build with --no-default-features.
@@ -74,6 +78,9 @@ ratatui = { version = "0.30", optional = true }
 # trap path was broken.
 wasmtime = { version = "48", optional = true, default-features = false, features = ["cranelift", "runtime", "wat"] }
 wasmtime-wasi = { version = "48", optional = true, default-features = false, features = ["p1"] }
+hpke = { version = "0.13", default-features = false, features = ["x25519", "alloc"] }
+aes-gcm = "0.10"
+base64 = "0.22"
 
 [profile.release]
 codegen-units = 16
@@ -97,3 +104,5 @@ wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
 
 [dev-dependencies]
 wat = "1.243.0"
+# Paused clock for the session-grace reaper test; never in the shipped binary.
+tokio = { version = "1", features = ["test-util"] }

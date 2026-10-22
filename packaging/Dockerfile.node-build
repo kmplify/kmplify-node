@@ -22,6 +22,14 @@ COPY NOTICE LICENSE ./
 COPY src ./src
 # The build stamp reads git; a tarball build simply goes unstamped.
 COPY .git ./.git
+# The stamp inside this container. build.rs asks `git status`, and in here
+# that always answers "dirty": only part of the tree is copied, so every file
+# that is not (README, packaging/...) reads as deleted. The 0.7.0 x86_64 build
+# stamped itself `-dirty` from a clean commit that way. The commit is taken
+# from the copied .git instead; the caller owes the cleanliness of the tree
+# it builds from (check `git status --porcelain` before `docker build`), or
+# passes `--build-arg KMPLIFY_BUILD=<short>[-dirty]` to say otherwise.
+ARG KMPLIFY_BUILD
 # Native per-arch: buildx sets TARGETARCH, so the same file produces the
 # x86_64 binary on amd64 and the aarch64 one on arm64 (Apple Silicon, ARM
 # VPS) without a cross toolchain.
@@ -31,6 +39,8 @@ RUN case "$TARGETARCH" in \
       *)     MUSL_TARGET=x86_64-unknown-linux-musl ;; \
     esac \
  && rustup target add "$MUSL_TARGET" \
+ && export KMPLIFY_BUILD="${KMPLIFY_BUILD:-$(git rev-parse --short HEAD)}" \
+ && echo "build stamp: $KMPLIFY_BUILD" \
  && cargo build --release --target "$MUSL_TARGET" \
  && cp "target/$MUSL_TARGET/release/kmplify-node" /kmplify-node.out
 
