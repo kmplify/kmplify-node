@@ -421,3 +421,421 @@ before and the app reports its own missing files.
 
 Still on the optimization path: an optional P2P data channel (WebRTC/QUIC)
 for heavy image/video traffic.
+
+## Protocol v3.5 — isolation levels, runtimes, owned-by label
+
+- The hello's `workloads` block carries `runtimes`: the sandbox levels this
+  Docker daemon can run a session under. `"container"` (plain docker) is
+  always present; `"gvisor"` is added only when `runsc` is registered as a
+  Docker runtime on the host (`docker info` `.Runtimes`); `"microvm"` is
+  reserved. The gateway only schedules a template whose `isolation` is
+  stronger than `container` onto a node that advertised that level.
+- `workload_start` may carry `isolation` (`container` | `gvisor` |
+  `microvm`; absent = `container`). The node refuses, never downgrades: a
+  `gvisor` request without runsc answers `workload_status: error`; an
+  unknown name fails closed; `microvm` is refused by this build. A `gvisor`
+  session runs with `--runtime runsc` on top of every existing hardening
+  flag.
+- Every session container carries the Docker label
+  `kmplify.fabric.node=<8-char node id>`. On connect, before the hello, the
+  node lists containers under its own label and removes any session
+  container it does not know (a predecessor of this node that was
+  SIGKILLed never reached `cleanup_sessions`). Containers of a sibling
+  worker on the same machine carry a different label and are untouched;
+  containers from builds predating the label are left alone and remain a
+  manual repair.
+- Operator facts (peer/managed, operator, region) are set by the gateway's
+  deployer through its admin API and are never part of this protocol's
+  node-side frames: a node cannot declare itself KMPLIFY-managed.
+
+## Protocol v3.6 — no-egress guard, consumer env, per-consumer volumes
+
+- A `network: none` session used to be unhostable on this node: Docker
+  publishes no host port for a container on `--network none`, and none for
+  one on an `--internal` network either, so `-p` was silently ignored and
+  the session died with "could not resolve the container's host port".
+  Now such a session runs on an internal Docker network of its own,
+  `<container>-net`, and the node starts a guard, `<container>-guard`
+  (`alpine/socat:1.8.0.0`, `--cap-drop ALL`, `no-new-privileges`,
+  read-only, 64 MB, a quarter core), on the default bridge that publishes
+  the port and forwards it to the session's address on that network. The
+  workload keeps no route to the internet or the provider's LAN; the guard
+  forwards one listening port back to it and nothing else. Two sessions on
+  one machine never share a network. The host port is resolved from the
+  guard, the readiness probe and the relay are unchanged, and the guard and
+  the network are removed with the session. Guards carry the owned-by label
+  and are swept with the session they belong to.
+- `workload_start.env` may carry entries the CONSUMER set, already checked
+  by the gateway against the template's `consumer_env` allow-list. The node
+  applies the same key rule it always did (`env_key_ok`), so the frame
+  shape is unchanged.
+- Volume names arrive rendered: the gateway replaced `{consumer}` before
+  sending. The node's rule is unchanged: fabric-namespaced named volumes
+  only.
+- Managed-only templates (`n8n`, `jupyter`) are decided on the gateway
+  from operator facts; the node's pin table lists their repositories so a
+  mis-tagged node still cannot run them under another image.
+
+
+
+## Protocol v3.7 — node identity keys
+
+A node carries an Ed25519 **identity key** (`src/identity.rs`), generated
+before it first registers and kept as a hex seed in `fabric_node.json` beside
+the token. The public half is a `kmpn1…` bech32m address, published in
+`identity.json` and printed by `kmplify-node id`. Contract:
+`kmplify-infrastructure/docs/IDENTITY_KEYS.md` (KIP-1).
+
+* `POST /fabric/register` carries `{ "pubkey", "gateway", "ts", "sig" }`
+  where `sig` is the Ed25519 signature over
+  `"KMPLIFY-ID-v1/node-register\n" + {"gateway":…,"pubkey":…,"ts":…}`
+  (canonical JSON: sorted keys, no whitespace). `ts` must be within 300 s.
+  The response gains `address`. A KNOWN key gets its `node_id` back with a
+  fresh token even without `previous_token` — the signature is the proof.
+  A known `node_id` presented with a *different* key is never re-adopted.
+* The hello frame carries `{ "pubkey", "ts", "sig" }` with `sig` over
+  `"KMPLIFY-ID-v1/node-hello\n" + {"node_id":…,"pubkey":…,"ts":…}`. The
+  first signed hello under a valid token **binds** the key to the node.
+  From then on a hello without a valid signature closes with 4001, exactly
+  like a bad token, so the worker re-registers (with its key) instead of
+  retrying forever.
+* Workers predating v3.7 send none of these fields and keep working
+  token-only; on upgrade they add a seed to their credential file and bind
+  the key at the next hello. Gateways predating v3.7 ignore the fields.
+* The key is not a wallet and never leaves the credential file; the rewards
+  boundary in `docs/REWARDS.md` is unchanged. Claiming a node as "mine" is a
+  signed statement in the operator's KMPLIFY account, not on the fabric.
+
+## v3.8 — one provider per consumer, many consumers per provider
+
+Three facts the fabric used to get wrong, and the frames that fix them.
+
+**Consumer affinity (gateway).** Inference requests were scheduled one by one
+with no memory of who asked; two chats a person sent seconds apart could land
+on two different machines. The gateway now remembers, per consumer (the node
+token plus `X-KMPLIFY-Consumer`, or the anonymous address label), which
+provider the POOL placed them on, and sends their next request there while
+that node is online, serves the model, passes the EU filter and still admits
+them. The binding lives while jobs run and for `FABRIC_CONSUMER_AFFINITY_S`
+(180 s) after the last one ends. Invitations and strict grid selections are
+explicit choices and bypass the memory. A bound consumer keeps queuing on its
+provider even when that provider is at capacity.
+
+**`X-KMPLIFY-Consumer` on inference.** The consumer-side (kmplify-rag-system)
+now sends the person's opaque sub-identity on chat, embeddings, agent and
+video-studio calls, the same derivation the DWS proxy uses. Without it every
+user of a shared deployment was one consumer to the gateway.
+
+**`inference_slots` (hello, node → gateway).** How many inference jobs the
+node takes at once from the pool; omitted = no cap (every pre-v3.8 worker).
+The pool stops placing NEW consumers on a node at its cap and answers
+`503 {"code": "peer_pool_saturated"}` when every serving node is full.
+kmplify-node defaults to 4 per accelerator (Ollama's parallel default before
+it queues) and 2 on a CPU-only host; `PROVIDER_MAX_INFERENCE_JOBS` /
+`max-inference-jobs` set it. `/fabric/nodes` publishes it.
+
+**`cancel` (gateway → node).** `{"type": "cancel", "id": <job id>}` when the
+consumer went away before the node finished (closed the stream, timed out at
+the gateway). The gateway releases the node's `active_jobs` slot the moment the
+consumer leaves, which it did not before (a closed stream left the count one
+too high for the rest of the connection), and the node aborts the upstream
+request so nothing generates for nobody. A node predating v3.8 ignores the
+frame and finishes the job into the void.
+
+**`gpus` / `gpu_count` (hello, node → gateway).** One entry per lent
+accelerator: `{index, name, vram_mb, backend}`, index order. `gpu` stays the
+first device, as every older reader expects; an 8-GPU rig used to advertise
+itself as its first card. `gpus_used_mb` (pong) carries used MB per device.
+`/fabric/nodes` publishes `gpus` (with `free_mb` each), `gpu_count` and
+`vram_total_mb`.
+
+**Per-device placement (`workload_start`).** The gateway reserves VRAM per
+device and sends `gpu_index`; a node passes `--gpus device=N` to the container
+instead of every card (ROCm/oneAPI keep their device nodes). Two half-empty
+cards never add up to one. `cpus` (already in the frame) is now reserved
+against the operator's `cpu_share.threads` ceiling, so eight sessions on a
+24-core box no longer each get the whole ceiling.
+
+**Per-user grid selection (consumer side).** `fabric.preferred_node` was
+deployment-wide and written by an endpoint open to every chat user; the
+selection now lives in usermanagement `user_settings.fabric_preferred_node`
+(migration 041) and rides per request as `X-KMPLIFY-Node`, with the
+deployment value as the superuser default, exactly like the invitation.
+
+**Frames are accepted only from the node that owes them (v3.8).** A `chunk`,
+`done` or `error` for a job, an `http_resp*` for a relayed request, a `ws_*`
+frame for a relayed socket, a `workload_status` for a session and a
+`model_fetch_status` for a fetch are matched against the node the gateway
+dispatched that work to, and dropped (logged with both ids) when another node
+sends them. Ids were the only key before, so a connected provider that learned
+or guessed an id could answer, poison or end another consumer's work. Nothing
+changes for a correct node.
+
+## Protocol v4 — the transport round
+
+Additive. Every item degrades to the earlier behaviour against a peer that
+predates it, so v3.x nodes and gateways keep working.
+
+### Reconnect backoff
+
+Workers redial with exponential backoff and jitter: the step doubles from 1 s
+to a 60 s ceiling while dials keep failing, half of each step is fixed and half
+is random, and a connection that stayed up for 60 s resets it. An operator's
+own reconnect and an identity re-registration dial at once and do not count as
+failures. (Before v4: a flat 10 s, which made every node redial in the same
+instant after a gateway restart.)
+
+### Sessions survive a lost link
+
+A lost link no longer ends a session.
+
+- **Node.** When the gateway link is LOST, the node keeps its session
+  containers for a grace window (`KMPLIFY_SESSION_GRACE_S`, default 180 s,
+  capped at 900 s, `0` = tear down at once as before v4). If no gateway
+  connection is re-established inside the window, the node removes every
+  container on its own clock: nothing keeps running on an owner's hardware
+  with no link to stop it by. A stop signal, a clean end and an operator's
+  reload still tear down immediately. Pulls in flight at a teardown are
+  tombstoned so they cannot launch a container afterwards.
+- **Hello.** The node announces what it still runs:
+  `"sessions": [{"session": "<id>", "state": "pulling|starting|running"}]`.
+  An empty list means "nothing was kept". A pre-v4 node sends no key.
+- **Gateway.** Announced sessions it knows and has not ended are kept (and a
+  phase that advanced during the gap is picked up). Announced sessions it does
+  not know, or has already ended, are answered with `workload_stop`. Sessions
+  it holds that the node did not announce are failed, as since v3.
+- **One grace, two sides.** The node's default equals the gateway's
+  `NODE_RETURN_GRACE_S`. The gateway's grace runs from the moment the NODE
+  went away, not from the session's `state_since`.
+
+### Every large response streams
+
+The node forwards a relayed HTTP response with the `http_resp_start` /
+`http_resp_chunk` / `http_resp_end` trio (v2.1) unless the body is KNOWN to be
+small (`Content-Length` at most 256 KiB), which still travels as one
+`http_resp` frame. Before v4 only SSE and NDJSON streamed and everything else
+was buffered whole and sent as one frame, so a body past the frame cap could
+not be delivered at all. Chunks carry at most 256 KiB of payload. No gateway
+change was needed for this: the trio was always content-type agnostic there.
+
+### Credit-based flow control
+
+Negotiated, per stream, in payload bytes (before base64).
+
+- **Hello** carries `"protocol": 4`. **Welcome** carries `"protocol": 4` and
+  `"window": <bytes>` (default 4 MiB). A node that sees a window paces; a
+  gateway only sends the frames below to a node that announced protocol 4.
+- Each response stream (`req_id`) and each relayed socket (`ws_id`) starts
+  with one window of credit on the node. Sending a chunk or a `ws_recv`
+  spends its payload size; with no credit left the node stops READING the
+  container, so a slow consumer slows the container, not the gateway.
+- Gateway → node `{"type":"credit","stream":"<req_id|ws_id>","bytes":N}`,
+  sent as the consumer actually takes the bytes, batched at half a window.
+- Gateway → node `{"type":"stream_cancel","stream":"<id>"}` when a consumer
+  leaves mid-stream; the node ends the stream at its next chunk and closes
+  the container's connection. A node that gets no credit for 120 s ends the
+  stream by itself.
+- **The bound behind the credit.** The gateway holds at most two windows per
+  stream. A stream that would exceed it (a pre-v4 node, or one ignoring
+  credit, feeding a consumer that is not reading) is ended alone; control
+  frames (`http_resp_end`, `ws_closed`, `ws_error`) are never refused.
+  Inference job queues are bounded by frame count the same way.
+
+### Streamed uploads
+
+Toward a node that announced protocol 4, a relayed request whose body is
+larger than 256 KiB, or of unannounced length (`Transfer-Encoding: chunked`),
+is not sent as one frame:
+
+- `{"type":"http", ..., "body_stream": true, "body_length": N?}` with no
+  `body_b64`. `body_length` is the consumer's `Content-Length` when there was
+  one; the node sends it on to the container so the upload stays a plain
+  sized body rather than a chunked one.
+- `{"type":"http_req_chunk","req_id":...,"body_b64":...}`, 256 KiB of payload
+  each except the last.
+- `{"type":"http_req_end","req_id":...,"abort":bool}`. With `abort` the node
+  fails the request toward the container: half a body must never look like a
+  whole one.
+
+Credit runs the other way here. The gateway starts with one window and sends
+only while it holds credit; the node grants `{"type":"credit","stream":
+"<req_id>","bytes":N}` as the CONTAINER consumes the body, batched at half a
+window, so the consumer uploads exactly as fast as the app reads. The node
+holds at most two windows per upload and fails one that exceeds it. A
+container that answers before its body was fully sent ends the upload at
+once (the answer closes the send window); the rest of the body is dropped
+and `http_req_end` carries `abort: false`.
+
+The most one request may upload is `FABRIC_RELAY_MAX_UPLOAD_BYTES` (default
+1 GiB, `0` = unlimited), refused with `413` from the declared length where
+there is one. A pre-v4 node still gets a single frame and therefore the
+16 MiB cap, and that cap is now enforced while reading, not after.
+
+### Limits
+
+Backstops against a loop or an abusive client, not quality-of-service tuning.
+Each is off at `0`.
+
+- **Per consumer**, inference, embeddings and function invokes:
+  `FABRIC_RATE_INFERENCE_PER_MIN` (default 1200), keyed like the
+  one-live-session rule (the credential, refined by `X-KMPLIFY-Consumer`).
+- **Per session**, the workload relay: `FABRIC_RATE_RELAY_PER_MIN` (default
+  6000; one ComfyUI page load is a couple of hundred requests).
+- Both are token buckets with a ten second burst and answer `429` with
+  `Retry-After` and `{"code":"rate_limited"}`.
+- **Per node**, jobs in flight: twice the node's declared threads, between 8
+  and 64, or `FABRIC_NODE_MAX_INFLIGHT`. The pool scheduler skips a full node.
+  When every provider of a model is full the answer is `429`
+  `{"code":"fabric_busy"}`; when the node a consumer is bound to (invitation,
+  strict pin) is full it is `429` `{"code":"provider_busy"}`. Neither is
+  `503`: the provider is present and healthy, and a client should retry
+  rather than fall back or report it offline.
+
+### Binary bulk frames
+
+Control frames stay JSON. The frames that move payload may be sent as
+WebSocket BINARY messages instead, with the payload raw behind a fixed header:
+
+```
+byte 0       kind    1 http_resp_chunk (node→gw)   2 http_req_chunk (gw→node)
+                     3 ws_recv         (node→gw)   4 ws_send        (gw→node)
+byte 1       flags   bit 0: the relayed WebSocket message was binary
+bytes 2..18  stream id: the 16 raw bytes of the 32 character hex req_id/ws_id
+bytes 18..   payload
+```
+
+Negotiated in both directions: the hello carries `"binary_frames": true`, and
+so does the welcome. Each side sends binary only to a peer that said it reads
+it. The JSON forms (`body_b64`, `data_b64`) remain valid and are what every
+older pairing keeps using; an id that is not 32 hex characters is sent as
+JSON. Credit and the byte bounds count payload bytes identically for both
+forms. Unknown kinds and frames shorter than the header are dropped.
+
+## Protocol v4.1 — trust
+
+### Signed node facts and `signedBy` placement
+
+The deployer facts of v3.5 (`operator_class`, `operator`, `region`) may carry
+a KIP-1 signature, purpose **`node-facts`**, over
+
+```json
+{"node_id": "<full id>", "operator_class": "...", "operator": "...",
+ "region": "...", "signer_pubkey": "<hex>", "signed_at": 1800000000}
+```
+
+- `PUT /v1/admin/nodes/{node}/facts` accepts `signer_pubkey`, `signed_at` and
+  `sig` made OFFLINE by whoever vouches for the facts. A signature that does
+  not verify over exactly these facts and the node's FULL id is a `422`; the
+  facts are never stored "unsigned instead". Without those fields the gateway
+  signs with `FABRIC_FACTS_SIGNING_SEED_HEX` when it has one, and stores the
+  facts unsigned otherwise.
+- The signature is re-verified against the stored row every time the node
+  connects and every time it is listed, so a registry edited behind the API
+  reads as unsigned. New facts always replace the old signature in the same
+  statement.
+- `GET /fabric/nodes` and `GET /v1/admin/nodes` show `facts_signed_by`, the
+  signer's `kmp1…` address.
+- **`X-KMPLIFY-Facts-Signed-By: <kmp1… | 64 hex>[, …]`** joins the placement
+  headers: only nodes whose facts are signed by one of those keys are
+  admitted. Anything unparseable is a `400`, never "no filter". This is
+  Akash's `signedBy` without a chain; an auditor is one more key.
+
+### Country evidence
+
+`country` stays self-declared. With `FABRIC_COUNTRY_EVIDENCE=true` the gateway
+resolves the address a declaring node connects from and records
+`country_verified`: `true`, `false`, or `null` when there is nothing to compare
+(a private or unresolvable address). A node whose declaration was CONTRADICTED
+is not used for EU-only placement (`in_eu` reads false); `null` changes
+nothing.
+
+Off by default, and that is a data-protection decision rather than a technical
+one: the lookup hands the node's IP address to the GeoIP service behind
+`registry.country_from_ip`, today a third party. It is evidence, not
+attestation: it says where an address is routed, a VPN exit passes it, and no
+copy may call it verification of where a machine is.
+
+### Two-sided work receipts
+
+A v4.1 node with an identity key adds `receipts` to every `pong`: one entry per
+session RUNNING on it,
+
+```json
+{"session": "<id>", "running_s": 90, "ts": 1800000000, "sig": "<hex>"}
+```
+
+signed KIP-1, purpose **`node-receipt`**, over
+`{"node_id","pubkey","running_s","session","ts"}`. `running_s` counts whole
+seconds since the container became `running` on that node (pull time is not
+compute) and is CUMULATIVE: a lost pong costs nothing, the next receipt
+supersedes it. The gateway keeps a receipt only if it verifies under the key
+bound to that node at hello, is fresh, names a session that node hosts here,
+and does not go backwards.
+
+On every attestation tick the receipts of the nodes in the in-flight batch are
+filed in `FABRIC_RECEIPTS_DIR/<sequence>.json`, each beside the gateway's own
+count and a `disagrees` flag (more than 30 s and 10 % apart).
+`GET /v1/admin/receipts/{sequence}` serves the file. Anyone holding it can
+verify every line without trusting the gateway.
+
+The attestation batch sent to the rewards service is **unchanged**: its
+canonical bytes are a contract with another service. Carrying node signatures
+inside it is for that contract's v2.
+
+### The isolation ladder, as it stands
+
+| rung | what runs the session | who offers it |
+|---|---|---|
+| `container` | Docker, hardened: all capabilities dropped, `no-new-privileges`, read-only rootfs unless the template opts out, per-session network, memory/CPU/pids caps, `nofile` capped at 65536, and no root inside the container for templates that declare `user` | every node |
+| `gvisor` | the same, under `runsc` | nodes whose Docker lists `runsc` |
+| `microvm` | the same, under Kata Containers: Docker runtimes `kata`, `kata-clh`, `kata-qemu`, `kata-fc`, preferred in that order | nodes with Kata installed; refused everywhere else |
+
+Firecracker (`kata-fc`) has no PCIe and cannot pass a GPU through, by design.
+For a GPU session behind a VM boundary the rungs are Kata with Cloud Hypervisor
+or QEMU (VFIO); gVisor with `nvproxy` is the lighter option on managed NVIDIA
+hosts. An unknown runtime name is never mapped to a rung.
+
+`workload_start` may carry **`user`**: a numeric, non-root `uid[:gid]` the
+container runs as. Declared per template (today `echo-test` only, the one
+image verified to run that way), signed nowhere yet, and enforced by the node:
+a value that is not numeric non-root REFUSES the session rather than running
+it as root, because the catalog asked for the opposite. Most of the catalog
+cannot take it (CUDA images write under `/root`), which is why it is opt-in.
+
+The guard container's image is pinned by the digest of its multi-platform
+index, not by tag.
+
+Not done, and not claimable: a seccomp profile per template family (Docker's
+default profile applies), and `userns-remap`, which is a daemon setting for
+managed hosts rather than something a node can set per session.
+
+## Protocol v5 — envelope encryption over the relay
+
+The inference lane is implemented (2026-09-19); sealed relay sessions, functions and
+vectors are not. [ENVELOPE-ENCRYPTION.md](ENVELOPE-ENCRYPTION.md) is the contract, and
+its "As built" section is what the code does. In short: HPKE (RFC 9180, base mode,
+`DHKEM(X25519, HKDF-SHA256)` / `HKDF-SHA256` / `AES-256-GCM`, one suite) from the
+consumer to the node it chose. The gateway routes on `model` and `stream`, which the
+consumer authenticates, and cannot read the rest.
+
+- **Hello** `"envelope": {"suite":1,"enc_pubkey","key_id","pubkey","ts","sig"}`, KIP-1
+  purpose `node-encryption-key`, verified against the identity key bound to the node.
+  `/fabric/nodes` shows `sealed: true`.
+- **`POST /v1/route`** `{"model"}` → `{"node", "envelope"}`, under the same region,
+  placement and **invitation** headers the request will carry (an invitation names the
+  node, and the answer then carries `"via": "invitation"`);
+  **`GET /v1/nodes/{node}/encryption-key`** for a known node. The CONSUMER verifies the
+  attestation against a node identity it already holds.
+- **Sealed request** to `/v1/chat/completions` or `/v1/embeddings`:
+  `{"model","stream","sealed":{"suite","key_id","ts","enc","ct"}}` and nothing else.
+  Routed only to the node attesting `key_id`. `ts` is the consumer's clock,
+  authenticated; the node opens a request once, and only within 300 s of it, because a
+  replayed request would make it seal a second answer under the same key and nonces.
+- **Sealed answer**: `data: {"sealed":{"n","k","ct"}}` per chunk and for the result;
+  errors carry `sealed` beside a fixed message.
+- Errors: `400 sealed_malformed`, `400 sealed_required` (`FABRIC_REQUIRE_SEALED`),
+  `409 envelope_key_changed`, `503 sealed_recipient_unavailable`, `503 no_sealed_route`.
+
+The node decrypts. This is not zero knowledge and not confidential computing. The only
+sentence it supports is "the relay cannot read it", and only for traffic that is
+actually sealed.

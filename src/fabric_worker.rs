@@ -25,9 +25,146 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::{watch, Mutex};
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    connect_async, connect_async_with_config, tungstenite::Message, MaybeTlsStream, WebSocketStream,
+};
 
-const RECONNECT_DELAY: Duration = Duration::from_secs(10);
+/// Reconnect backoff bounds (protocol v4). The delay doubles from the floor
+/// to the ceiling while connections keep failing, with jitter, and resets
+/// once a connection has stayed up for `RECONNECT_HEALTHY_AFTER`.
+///
+/// This was a flat 10 s. With a few hundred nodes, a gateway restart then
+/// produced a synchronised reconnect storm every ten seconds, each wave
+/// arriving in the same instant the previous one failed in. The flat delay
+/// was also the wrong number at both ends: too slow for the common case (a
+/// gateway redeploy is back within two seconds, and hosted sessions are
+/// waiting on the grace window) and too fast for the rare one (a gateway
+/// that is down for an hour gains nothing from 360 dials per node).
+const RECONNECT_FLOOR: Duration = Duration::from_secs(1);
+const RECONNECT_CEILING: Duration = Duration::from_secs(60);
+/// A connection that lived this long was a real one: the next failure starts
+/// the backoff from the floor again instead of inheriting an old penalty.
+const RECONNECT_HEALTHY_AFTER: Duration = Duration::from_secs(60);
+
+/// How long to wait before dial number `attempt` (0 = first retry).
+///
+/// "Equal jitter": half the exponential step is fixed and half is random.
+/// Full jitter can draw a delay near zero, which turns a backoff back into
+/// a hammer for the unlucky node; no jitter at all is the synchronised
+/// storm this exists to prevent. `entropy` is injected so the arithmetic
+/// is testable.
+fn reconnect_delay(attempt: u32, entropy: u64) -> Duration {
+    let floor = RECONNECT_FLOOR.as_millis() as u64;
+    let ceiling = RECONNECT_CEILING.as_millis() as u64;
+    let step = floor.saturating_mul(1u64 << attempt.min(16)).min(ceiling);
+    let half = step / 2;
+    Duration::from_millis(half + entropy % (half + 1))
+}
+
+fn reconnect_entropy() -> u64 {
+    use rand_core::RngCore;
+    rand_core::OsRng.next_u64()
+}
+
+/// How long hosted containers outlive a LOST gateway link (protocol v4).
+///
+/// The same number as the gateway's `NODE_RETURN_GRACE_S`: the gateway keeps
+/// a session "running" for this long while its node is absent, so a node
+/// that kept the container for any other span either throws away a session
+/// the gateway was still holding, or burns the owner's GPU for one the
+/// gateway already wrote off.
+///
+/// History, because it explains the shape. Retention was shipped once and
+/// reverted within hours (kmplify-desktop #87) as the SUSPECT in a reconnect
+/// flap that was never proven to be its fault. The revert's stated principle
+/// was sound and is kept: nothing may keep running on an owner's GPU with no
+/// link to stop it by. A grace the NODE enforces on its own clock satisfies
+/// that without the gateway's help: when the deadline passes with no link,
+/// the node removes every container itself. `KMPLIFY_SESSION_GRACE_S=0`
+/// restores the old tear-down-at-once behaviour.
+const SESSION_GRACE_DEFAULT: Duration = Duration::from_secs(180);
+/// An operator may shorten the grace, or lengthen it a little; they may not
+/// turn it into "forever".
+const SESSION_GRACE_MAX: Duration = Duration::from_secs(900);
+
+fn session_grace() -> Duration {
+    parse_session_grace(std::env::var("KMPLIFY_SESSION_GRACE_S").ok().as_deref())
+}
+
+fn parse_session_grace(raw: Option<&str>) -> Duration {
+    match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        None => SESSION_GRACE_DEFAULT,
+        Some(v) => match v.parse::<u64>() {
+            Ok(secs) => Duration::from_secs(secs).min(SESSION_GRACE_MAX),
+            // Unreadable is not "off" and not "forever": it is the default.
+            Err(_) => SESSION_GRACE_DEFAULT,
+        },
+    }
+}
+
+/// Whether the containers survive the end of this connection.
+///
+/// Only a LOST link qualifies. A stop signal, a clean end, and an operator's
+/// own reload all tear down at once, as they always have: those are
+/// decisions, and a decision to stop sharing must not leave a stranger's
+/// container running for three more minutes.
+fn keeps_sessions_across(
+    ended: &Result<(), String>,
+    stopping: bool,
+    grace: Duration,
+    hosted: usize,
+) -> bool {
+    match ended {
+        Ok(()) => false,
+        Err(_) if stopping || grace.is_zero() || hosted == 0 => false,
+        Err(e) => e != RECONNECT_REQUESTED,
+    }
+}
+
+/// The `sessions` list of the hello: what this node still runs, so the
+/// gateway keeps those sessions instead of writing them off, and tells this
+/// node to stop any it no longer knows.
+fn announced_sessions(hosted: &[HostedSession]) -> Value {
+    Value::Array(
+        hosted
+            .iter()
+            .map(|h| json!({"session": h.session_id, "state": h.state}))
+            .collect(),
+    )
+}
+
+fn grace_reaper_cell() -> &'static std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> {
+    static REAPER: std::sync::OnceLock<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
+        std::sync::OnceLock::new();
+    REAPER.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Start the node-side deadline for a lost link. If no gateway connection is
+/// re-established before it passes, every hosted container is removed.
+fn arm_grace_reaper(sessions: Sessions, grace: Duration) {
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+        log(format!(
+            "no gateway link for {}s — removing the sessions kept for its return",
+            grace.as_secs()
+        ));
+        cleanup_sessions(&sessions).await;
+    });
+    if let Ok(mut cell) = grace_reaper_cell().lock() {
+        if let Some(old) = cell.replace(handle) {
+            old.abort();
+        }
+    }
+}
+
+/// The link is back (or the worker is stopping and cleans up itself).
+fn disarm_grace_reaper() {
+    if let Ok(mut cell) = grace_reaper_cell().lock() {
+        if let Some(old) = cell.take() {
+            old.abort();
+        }
+    }
+}
 
 /// Session error that means "the operator asked for this": reconnect at once
 /// and say nothing alarming, rather than logging a lost connection and
@@ -41,11 +178,65 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// deadline the worker sat "connected" for good while the gateway had long
 /// forgotten it. 45s = four missed pings, comfortably past jitter.
 const GATEWAY_SILENCE_TIMEOUT: Duration = Duration::from_secs(45);
+/// Largest frame this node will send or accept on the gateway socket, and the
+/// cap on a relayed response body. One number across all three
+/// implementations: uvicorn's `--ws-max-size` on the gateway, `MAX_FRAME_BYTES`
+/// in the reference worker, and this. See ../docs/PROTOCOL.md "Frame size".
+///
+/// Why a relayed body has to be capped HERE and not only at the gateway: a
+/// container answering with a 200 MB file becomes one ~267 MB base64 frame,
+/// and a frame over the gateway's limit does not fail that one request, it
+/// closes the socket. Every other session this node is hosting dies with it.
+/// Refusing the single oversized response is the only outcome that keeps the
+/// rest of the node's work alive.
+const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// Frame limits for the gateway socket, matching the gateway's own.
+fn gateway_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(MAX_FRAME_BYTES),
+        max_frame_size: Some(MAX_FRAME_BYTES),
+        ..Default::default()
+    }
+}
+
+/// Room for base64 (4/3) plus the surrounding JSON, so a body at the cap
+/// still produces a frame under it.
+const MAX_RELAY_BODY_BYTES: usize = (MAX_FRAME_BYTES / 4) * 3 - 4096;
 /// How often a quiet image pull reports "still working" upstream.
 const PULL_HEARTBEAT: Duration = Duration::from_secs(20);
 /// Docker daemon liveness probe. Short: it runs on the telemetry path, and a
 /// daemon that cannot answer in this long is not one that can pull an image.
 const DOCKER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The gateway's close code 4003 means a second process connected with this
+/// node's identity (kmplify-gpu-fabric docs/PROTOCOL.md): the two evict each
+/// other for as long as both run, so the message names the cure rather than
+/// the symptom.
+pub const SUPERSEDED_CLOSE_CODE: u16 = 4003;
+
+fn describe_close(frame: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame>) -> String {
+    match frame {
+        Some(f) if u16::from(f.code) == SUPERSEDED_CLOSE_CODE => {
+            "another process connected with this node's identity and took the link over \
+             (gateway close 4003): two kmplify-nodes are running from one node directory, \
+             or KMPLIFY Desktop is lending the same fabric_node.json. Stop one of them, or \
+             give it its own KMPLIFY_NODE_DIR so it registers an identity of its own"
+                .to_string()
+        }
+        Some(f) => {
+            let reason = f.reason.trim();
+            if reason.is_empty() {
+                format!("gateway closed the connection ({})", u16::from(f.code))
+            } else {
+                format!(
+                    "gateway closed the connection ({}: {reason})",
+                    u16::from(f.code)
+                )
+            }
+        }
+        None => "connection closed".to_string(),
+    }
+}
 /// Telemetry refreshes between disk/image inventory samples. At a 10s ping
 /// that is roughly once a minute — often enough to notice a large download,
 /// rare enough that `docker system df` is not scanning a provider's disk
@@ -96,6 +287,10 @@ pub struct HostedSession {
     /// node's clamp. Surfaced so the provider can see what a peer is
     /// actually holding, not just what the gateway asked for.
     pub cpus: f64,
+    /// Unix seconds when the container became `running`, which is when this
+    /// node's receipts start counting. Distinct from `since`: the minutes a
+    /// session spent pulling an image are not compute anybody is paid for.
+    pub running_since: Option<i64>,
 }
 
 static HOSTED: std::sync::OnceLock<Arc<Mutex<Vec<HostedSession>>>> = std::sync::OnceLock::new();
@@ -259,6 +454,7 @@ async fn hosted_add(session: &str, template: &str, container: &str, state: &str,
         since: chrono_now_secs(),
         state: state.to_string(),
         cpus,
+        running_since: (state == "running").then(chrono_now_secs),
     });
 }
 
@@ -335,7 +531,30 @@ async fn hosted_set_state(session: &str, state: &str) {
         .find(|h| h.session_id == session)
     {
         h.state = state.to_string();
+        if state == "running" && h.running_since.is_none() {
+            h.running_since = Some(chrono_now_secs());
+        }
     }
+}
+
+/// Signed receipts for every session running here right now (protocol v4.1),
+/// or nothing when this node has no identity key to sign with.
+fn work_receipts(
+    key: Option<&crate::identity::NodeKey>,
+    node_id: &str,
+    hosted: &[HostedSession],
+    now: i64,
+) -> Vec<Value> {
+    let Some(key) = key else { return Vec::new() };
+    hosted
+        .iter()
+        .filter(|h| h.state == "running")
+        .filter_map(|h| {
+            let since = h.running_since?;
+            let running_s = u64::try_from(now - since).ok()?;
+            Some(key.receipt(node_id, &h.session_id, running_s, now.max(0) as u64))
+        })
+        .collect()
 }
 
 async fn hosted_remove(session: &str) {
@@ -398,6 +617,7 @@ impl Default for WorkerConfig {
             workload_templates: Vec::new(),
             max_shared_cpus: None,
             max_shared_vram_mb: None,
+            max_inference_jobs: None,
             max_shared_ram_mb: None,
             max_shared_disk_gb: None,
             share_inference: true,
@@ -474,6 +694,12 @@ pub struct WorkerConfig {
     /// VRAM accounting use — so lending less genuinely means peers can place
     /// less here, rather than being asked politely not to.
     pub max_shared_vram_mb: Option<u64>,
+    /// Inference jobs this node takes at once from the pool (protocol
+    /// v3.8, `PROVIDER_MAX_INFERENCE_JOBS`). None = the default of 4 per
+    /// accelerator (what Ollama runs in parallel before it queues), 2 on a
+    /// CPU-only host. A consumer the gateway already bound to this node is
+    /// not held to it; it stops NEW consumers landing on a saturated node.
+    pub max_inference_jobs: Option<u32>,
     /// Ceiling on system RAM advertised in the cpu_share block, from the
     /// sharing settings. None = advertise the machine's total.
     pub max_shared_ram_mb: Option<u64>,
@@ -543,6 +769,20 @@ impl WorkerConfig {
 pub struct Credentials {
     pub node_id: String,
     pub token: String,
+    /// The node's identity key seed, hex (protocol v3.7, see identity.rs).
+    /// Absent in files written by older builds; `ensure_identity` adds one
+    /// on the next start and the gateway binds it at the next signed hello.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_hex: Option<String>,
+}
+
+impl Credentials {
+    /// The identity key, when the credential carries a usable seed.
+    pub fn key(&self) -> Option<crate::identity::NodeKey> {
+        self.seed_hex
+            .as_deref()
+            .and_then(|s| crate::identity::NodeKey::from_seed_hex(s).ok())
+    }
 }
 
 fn log(msg: impl std::fmt::Display) {
@@ -586,9 +826,75 @@ async fn write_private(path: &Path, bytes: Vec<u8>) -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        tokio::fs::write(path, bytes).await
+        tokio::fs::write(path, bytes).await?;
+        restrict_to_current_user(path).await;
+        Ok(())
     }
 }
+
+/// Windows equivalent of the 0600 above: this file, this user, nobody else.
+///
+/// The Unix branch has always been careful and this one was a bare write, so
+/// the node's token inherited whatever the containing directory granted. Under
+/// the default `%USERPROFILE%` that is already per-user and the exposure is
+/// small — but `KMPLIFY_NODE_DIR` is configurable, and pointing a service
+/// install at somewhere like `C:\ProgramData` inherits an ACL that grants
+/// Users read. The token authenticates this machine to the fabric, so "small
+/// under the default" is not the same as restricted. See F10 in
+/// docs/security/AUDIT-2026-08-24.md.
+///
+/// `icacls` rather than a Windows-API crate: this is one call on a path the
+/// process just wrote, the repo already shells out for docker, and a new
+/// dependency (plus unsafe FFI) to set one DACL is a poor trade for an
+/// Apache-2.0 crate other people vendor.
+///
+/// Best effort, like the MySQL session mode in the RAG service: a machine
+/// where icacls is missing or refuses should lose the hardening, not the
+/// node. The warning says which happened.
+#[cfg(windows)]
+async fn restrict_to_current_user(path: &Path) {
+    // /inheritance:r drops the inherited ACEs — without it the grant below is
+    // added to whatever the parent directory already allowed, which is the
+    // thing being removed. Both grants are then required: with inheritance
+    // gone, an ACL naming nobody locks the owner out too.
+    let user = match std::env::var("USERNAME") {
+        Ok(u) if !u.trim().is_empty() => u,
+        _ => {
+            log(format!(
+                "could not restrict {} — USERNAME is not set, so there is no \
+                 account to grant it to; the file keeps the folder's permissions",
+                path.display()
+            ));
+            return;
+        }
+    };
+    let out = crate::proc::command("icacls")
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("{user}:F"))
+        .arg("/grant:r")
+        .arg("SYSTEM:F")
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => log(format!(
+            "could not restrict {}: icacls said {}",
+            path.display(),
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => log(format!(
+            "could not restrict {}: icacls did not run ({e})",
+            path.display()
+        )),
+    }
+}
+
+/// Nothing to do off Windows: the Unix branch above already created the file
+/// with mode 0600.
+#[cfg(all(not(unix), not(windows)))]
+async fn restrict_to_current_user(_path: &Path) {}
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -601,8 +907,23 @@ use std::os::unix::fs::PermissionsExt;
 /// per gateway, regardless of which role(s) it's currently playing.
 /// Idempotent: safe to call on every boot.
 pub async fn ensure_identity(gateway_url: &str, creds_path: &Path) -> Result<Credentials, String> {
+    // Audit F7: every path that could hand the token over goes through here,
+    // so a plaintext public gateway is refused before anything is sent.
+    check_gateway_url(gateway_url)?;
     if let Ok(bytes) = tokio::fs::read(creds_path).await {
-        if let Ok(c) = serde_json::from_slice::<Credentials>(&bytes) {
+        if let Ok(mut c) = serde_json::from_slice::<Credentials>(&bytes) {
+            if c.key().is_none() {
+                // A credential from before identity keys (v3.7): give it one.
+                // The id and token stay; the gateway binds this key the first
+                // time it sees a signed hello under the still-valid token.
+                c.seed_hex = Some(crate::identity::NodeKey::generate().seed_hex());
+                if let Err(e) = write_private(creds_path, serde_json::to_vec(&c).unwrap()).await {
+                    log(format!(
+                        "could not persist the node's new identity key at {}: {e}",
+                        creds_path.display()
+                    ));
+                }
+            }
             return Ok(c);
         }
     }
@@ -610,14 +931,19 @@ pub async fn ensure_identity(gateway_url: &str, creds_path: &Path) -> Result<Cre
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| e.to_string())?;
+    // The key exists before the node does: registration is signed with it,
+    // so the gateway never has to take "this key is mine" on faith later.
+    let key = crate::identity::NodeKey::generate();
     let resp = client
         .post(format!("{gateway_url}/fabric/register"))
+        .json(&key.register_fields(gateway_url, crate::identity::now_s()))
         .send()
         .await
         .map_err(|e| e.to_string())?
         .error_for_status()
         .map_err(|e| e.to_string())?;
-    let creds: Credentials = resp.json().await.map_err(|e| e.to_string())?;
+    let mut creds: Credentials = resp.json().await.map_err(|e| e.to_string())?;
+    creds.seed_hex = Some(key.seed_hex());
     if let Some(parent) = creds_path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
@@ -658,14 +984,20 @@ pub async fn register_identity(
         Ok(bytes) => serde_json::from_slice(&bytes).ok(),
         Err(_) => None,
     };
-    let body = match &previous {
-        Some(c) => serde_json::json!({
-            "previous_node_id": c.node_id,
-            "previous_token": c.token,
-        }),
-        None => serde_json::json!({}),
-    };
-    let creds: Credentials = client
+    // The identity key survives a re-registration: a key the gateway already
+    // knows is what lets it hand the SAME node id back even when the token
+    // was lost (v3.7 continuity), and a key nobody knows yet is still this
+    // machine's, so there is no reason to mint another.
+    let key = previous
+        .as_ref()
+        .and_then(Credentials::key)
+        .unwrap_or_else(crate::identity::NodeKey::generate);
+    let mut body = key.register_fields(gateway_url, crate::identity::now_s());
+    if let Some(c) = &previous {
+        body["previous_node_id"] = serde_json::json!(c.node_id);
+        body["previous_token"] = serde_json::json!(c.token);
+    }
+    let mut creds: Credentials = client
         .post(format!("{gateway_url}/fabric/register"))
         .json(&body)
         .send()
@@ -676,6 +1008,7 @@ pub async fn register_identity(
         .json()
         .await
         .map_err(|e| e.to_string())?;
+    creds.seed_hex = Some(key.seed_hex());
     if let Some(parent) = creds_path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
@@ -872,6 +1205,14 @@ fn models_from_openai(body: &Value) -> Vec<String> {
 /// leaving every deployed desktop install on byte-for-byte the path it used
 /// before this fallback existed.
 pub async fn local_models(client: &reqwest::Client, ollama_base: &str) -> Vec<String> {
+    local_models_kind(client, ollama_base).await.0
+}
+
+/// The models at `ollama_base`, and whether Ollama's own API answered
+/// (`true`) or only the OpenAI-compatible listing did (`false`). Jobs for a
+/// server that is not Ollama (vLLM, llama.cpp server, LM Studio, …) must
+/// never be sent Ollama's `/api/chat` or its `keep_alive` field.
+pub async fn local_models_kind(client: &reqwest::Client, ollama_base: &str) -> (Vec<String>, bool) {
     let native = client.get(format!("{ollama_base}/api/tags")).send().await;
     let native_err = match native {
         // Status is checked explicitly: vLLM answers /api/tags with a JSON
@@ -885,7 +1226,9 @@ pub async fn local_models(client: &reqwest::Client, ollama_base: &str) -> Vec<St
             // old early-return took that as "an Ollama with no models" and
             // the /v1/models fallback below became unreachable — a node
             // pointed at LM Studio advertised nothing, silently.
-            Ok(body) if body.get("models").is_some() => return models_from_native(&body),
+            Ok(body) if body.get("models").is_some() => {
+                return (models_from_native(&body), true);
+            }
             Ok(_) => "200 without a model list (not an Ollama)".to_string(),
             Err(e) => format!("unreadable body: {e}"),
         },
@@ -895,13 +1238,13 @@ pub async fn local_models(client: &reqwest::Client, ollama_base: &str) -> Vec<St
 
     match client.get(format!("{ollama_base}/v1/models")).send().await {
         Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
-            Ok(body) => models_from_openai(&body),
+            Ok(body) => (models_from_openai(&body), false),
             Err(e) => {
                 log(format!(
                     "cannot list models at {ollama_base} — /api/tags: {native_err}; \
                      /v1/models: unreadable body: {e}"
                 ));
-                Vec::new()
+                (Vec::new(), false)
             }
         },
         other => {
@@ -915,7 +1258,7 @@ pub async fn local_models(client: &reqwest::Client, ollama_base: &str) -> Vec<St
                 "cannot list models at {ollama_base} — /api/tags: {native_err}; \
                  /v1/models: {compat_err}"
             ));
-            Vec::new()
+            (Vec::new(), false)
         }
     }
 }
@@ -975,7 +1318,17 @@ pub async fn discover(
     client: &reqwest::Client,
     cfg: &WorkerConfig,
 ) -> (Vec<String>, std::collections::HashMap<String, String>) {
-    let primary = local_models(client, &cfg.ollama_base).await;
+    let (models, engines, _) = discover_kind(client, cfg).await;
+    (models, engines)
+}
+
+/// `discover` plus whether the primary upstream speaks only the OpenAI
+/// shape (`true` when `/api/tags` did not answer and `/v1/models` did).
+pub async fn discover_kind(
+    client: &reqwest::Client,
+    cfg: &WorkerConfig,
+) -> (Vec<String>, std::collections::HashMap<String, String>, bool) {
+    let (primary, is_ollama) = local_models_kind(client, &cfg.ollama_base).await;
     let colibri = colibri_models(client, &cfg.colibri_base, &cfg.colibri_api_key).await;
     let mut engines = std::collections::HashMap::new();
     let mut all = primary.clone();
@@ -985,7 +1338,7 @@ pub async fn discover(
             all.push(m);
         }
     }
-    (all, engines)
+    (all, engines, !is_ollama)
 }
 
 /// Total VRAM of GPU 0 in MB via nvidia-smi, or None. The one number the
@@ -1120,11 +1473,32 @@ async fn gpu_info(backend: crate::gpu::Backend, max_shared_vram_mb: Option<u64>)
             // Advertise only what the operator agreed to lend, and never
             // MORE than the card holds whatever the setting says:
             // over-advertising wins the node sessions it cannot then run.
-            let vram = match max_shared_vram_mb {
-                Some(cap) if cap > 0 => g.total_mb.min(cap),
-                _ => g.total_mb,
+            let cap = |mb: u64| match max_shared_vram_mb {
+                Some(cap) if cap > 0 => mb.min(cap),
+                _ => mb,
             };
-            return json!({ "backend": g.backend.as_str(), "name": g.name, "vram_mb": vram });
+            // Every device (v3.8), the operator's ceiling applied per card:
+            // the ceiling is "how much of a card peers may use", and a rig
+            // owner who lends 20 GB of each 24 GB card means it eight times.
+            let gpus: Vec<Value> = g
+                .devices
+                .iter()
+                .map(|d| {
+                    json!({
+                        "index": d.index,
+                        "name": d.name,
+                        "vram_mb": cap(d.total_mb),
+                        "backend": g.backend.as_str(),
+                    })
+                })
+                .collect();
+            return json!({
+                "backend": g.backend.as_str(),
+                "name": g.name,
+                "vram_mb": cap(g.total_mb),
+                "gpus": gpus,
+                "gpu_count": g.devices.len().max(1),
+            });
         }
         // Configured for an accelerator the probe cannot see. Report CPU
         // rather than a card with 0 MB: the scheduler treats vram_mb as
@@ -1143,6 +1517,21 @@ async fn gpu_info(backend: crate::gpu::Backend, max_shared_vram_mb: Option<u64>)
         model
     };
     json!({ "backend": "cpu", "name": name, "vram_mb": 0 })
+}
+
+/// How many inference jobs this node accepts at once from the pool
+/// (protocol v3.8). The operator's number when set; else 4 per accelerator
+/// (Ollama's parallel default before requests queue) and 2 on a CPU-only
+/// host, where a third parallel generation only makes all of them slower.
+pub(crate) fn inference_slots(cfg: &WorkerConfig, gpu_count: usize) -> u32 {
+    if let Some(n) = cfg.max_inference_jobs {
+        return n.max(1);
+    }
+    if cfg.accel() == crate::gpu::Backend::Cpu {
+        2
+    } else {
+        4 * gpu_count.max(1) as u32
+    }
 }
 
 /// Static CPU/RAM facts for the hello frame.
@@ -1205,6 +1594,368 @@ async fn docker_ok() -> bool {
     )
 }
 
+/// Container runtimes this Docker daemon can run a session under (protocol
+/// v3.5). "container" is plain docker and always present; "gvisor" is
+/// advertised only when `runsc` is registered as a runtime, because the
+/// gateway will only ever schedule a template that REQUIRES that level here
+/// if we say so, and saying so falsely would run it in a plain container.
+async fn docker_runtimes() -> Vec<String> {
+    let probe = crate::proc::command("docker")
+        .args(["info", "--format", "{{json .Runtimes}}"])
+        .output();
+    match tokio::time::timeout(DOCKER_PROBE_TIMEOUT, probe).await {
+        Ok(Ok(o)) if o.status.success() => runtimes_from_info(&String::from_utf8_lossy(&o.stdout)),
+        _ => vec!["container".to_string()],
+    }
+}
+
+/// Pure parser behind `docker_runtimes`: the `.Runtimes` JSON object's keys.
+pub fn runtimes_from_info(json_text: &str) -> Vec<String> {
+    let mut out = vec!["container".to_string()];
+    if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(json_text.trim()) {
+        if map.contains_key("runsc") {
+            out.push("gvisor".to_string());
+        }
+        if microvm_runtime(&map).is_some() {
+            out.push("microvm".to_string());
+        }
+    }
+    out
+}
+
+/// Docker runtime names that put a session behind a real VM boundary, in the
+/// order this node prefers them.
+///
+/// These are the names Kata Containers registers. `kata-clh` (Cloud
+/// Hypervisor) and `kata-qemu` can pass a GPU through with VFIO; `kata-fc`
+/// (Firecracker) cannot, by design: no PCIe. That is why Firecracker is not
+/// simply "the microvm runtime" and why the order puts it last: on a GPU box
+/// the generic name or the VFIO-capable ones are what an operator installed
+/// for a reason. An unknown name is never mapped: a runtime this list does
+/// not know may be anything, and "microvm" is a promise to a consumer.
+const MICROVM_RUNTIMES: &[&str] = &["kata", "kata-clh", "kata-qemu", "kata-fc"];
+
+pub fn microvm_runtime(runtimes: &serde_json::Map<String, Value>) -> Option<&'static str> {
+    MICROVM_RUNTIMES
+        .iter()
+        .copied()
+        .find(|name| runtimes.contains_key(*name))
+}
+
+/// The Kata runtime installed on this host, if any.
+async fn docker_microvm_runtime() -> Option<&'static str> {
+    let probe = crate::proc::command("docker")
+        .args(["info", "--format", "{{json .Runtimes}}"])
+        .output();
+    match tokio::time::timeout(DOCKER_PROBE_TIMEOUT, probe).await {
+        Ok(Ok(o)) if o.status.success() => {
+            match serde_json::from_str::<Value>(String::from_utf8_lossy(&o.stdout).trim()) {
+                Ok(Value::Object(map)) => microvm_runtime(&map),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Sandbox level a `workload_start` asks for (protocol v3.5). Absent means
+/// plain container, exactly the pre-v3.5 meaning; unknown names fail closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Isolation {
+    Container,
+    Gvisor,
+    Microvm,
+}
+
+impl Isolation {
+    pub fn from_frame(v: Option<&str>) -> Option<Self> {
+        match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("container") => Some(Self::Container),
+            Some("gvisor") => Some(Self::Gvisor),
+            Some("microvm") => Some(Self::Microvm),
+            Some(_) => None,
+        }
+    }
+}
+
+/// Docker label every session container carries, so an orphan sweep can
+/// tell THIS node's containers from a sibling worker's on the same machine
+/// (the desktop app and a headless node coexist by design).
+const NODE_LABEL: &str = "kmplify.fabric.node";
+
+/// No-egress sessions and how their port still gets published.
+///
+/// Docker publishes no host port for a container on `--network none` and
+/// none for one on an `--internal` network either: `-p` is silently
+/// ignored in both cases (docker 29, Linux and Docker Desktop, measured).
+/// So every no-egress template used to die on this node with "could not
+/// resolve the container's host port" while the reference worker, which
+/// never isolated the network, served it. The portable answer is a guard:
+/// the workload lives on an internal network of its own, with no route
+/// out, and a socat sidecar on the default bridge publishes the port and
+/// forwards it across. The workload can reach the guard, but the guard
+/// forwards one listening port back to the workload and nothing else, so
+/// there is still no path to the internet or to the provider's LAN.
+///
+/// One network PER SESSION, not one shared network: two consumers' no-egress
+/// containers on the same machine must not be able to see each other, and
+/// on a shared internal network they could.
+pub fn noegress_network_name(container: &str) -> String {
+    format!("{container}-net")
+}
+/// The guard image, pinned by DIGEST. It used to be a tag, and a tag is a
+/// name somebody else can move: this container runs on every node that hosts
+/// a no-egress session and sits in the data path of all of them.
+///
+/// The digest is the multi-platform INDEX of `alpine/socat:1.8.0.0` (amd64,
+/// arm64, arm/v6, arm/v7, ppc64le, s390x), not one platform's manifest.
+/// Pinning a single platform's digest here would make every node of any
+/// other architecture fail its guard pull, and with it every no-egress
+/// session. The tag stays in the reference for the reader; Docker resolves
+/// the digest and ignores it.
+pub const GUARD_IMAGE: &str =
+    "alpine/socat:1.8.0.0@sha256:a6be4c0262b339c53ddad723cdd178a1a13271e1137c65e27f90a08c16de02b8";
+
+/// Open files per session container. Docker's default inherits the daemon's,
+/// which on many hosts is about a million: one container can then exhaust the
+/// host's file table for everyone else on the machine, the owner included.
+/// 65536 is far above what any template in the catalog opens.
+const SESSION_NOFILE: &str = "nofile=65536:65536";
+
+/// A `user` from a workload_start frame, if it is something this node will
+/// pass to `docker run --user`.
+///
+/// NUMERIC only, `uid` or `uid:gid`, and never root. A name would be resolved
+/// inside an image this node does not control, `0` would be a request to run
+/// as root spelled as hardening, and the value arrives over a socket, so
+/// anything else (whitespace, a flag, a path) is refused rather than quoted.
+pub fn session_user(v: Option<&str>) -> Option<String> {
+    let v = v?.trim();
+    let mut parts = v.split(':');
+    let uid = parts.next()?;
+    let gid = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
+    let numeric = |p: &str| !p.is_empty() && p.len() <= 10 && p.bytes().all(|b| b.is_ascii_digit());
+    if !numeric(uid) || gid.is_some_and(|g| !numeric(g)) {
+        return None;
+    }
+    if uid.parse::<u64>().ok()? == 0 {
+        return None;
+    }
+    Some(v.to_string())
+}
+
+/// The guard container that publishes a no-egress session's port.
+pub fn guard_name(container: &str) -> String {
+    format!("{container}-guard")
+}
+
+/// `docker run` arguments for a guard: hardened like a session (no caps,
+/// no privilege escalation, read-only, small ceilings), on the default
+/// bridge so its `-p` is honoured, owned by the same label so the orphan
+/// sweep reaps it with the session. Pure, so the shape is testable.
+pub fn guard_run_args(container: &str, port: u64, ip: &str, label: &str) -> Vec<String> {
+    vec![
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        guard_name(container),
+        "--cap-drop".into(),
+        "ALL".into(),
+        "--security-opt".into(),
+        "no-new-privileges".into(),
+        "--read-only".into(),
+        "--memory".into(),
+        "64m".into(),
+        "--cpus".into(),
+        "0.25".into(),
+        "--pids-limit".into(),
+        "64".into(),
+        "--network".into(),
+        "bridge".into(),
+        "-p".into(),
+        format!("127.0.0.1:0:{port}"),
+        "--label".into(),
+        format!("{NODE_LABEL}={label}"),
+        GUARD_IMAGE.into(),
+        format!("TCP-LISTEN:{port},fork,reuseaddr"),
+        format!("TCP:{ip}:{port}"),
+    ]
+}
+
+async fn ensure_noegress_network(container: &str) -> Result<(), String> {
+    let net = noegress_network_name(container);
+    let inspect = crate::proc::command("docker")
+        .args(["network", "inspect", &net])
+        .output()
+        .await
+        .map_err(|e| format!("docker unavailable: {e}"))?;
+    if inspect.status.success() {
+        return Ok(());
+    }
+    let out = crate::proc::command("docker")
+        .args(["network", "create", "--internal", &net])
+        .output()
+        .await
+        .map_err(|e| format!("docker unavailable: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if err.contains("already exists") {
+        return Ok(());
+    }
+    Err(format!("could not create the no-egress network: {err}"))
+}
+
+/// Start the guard for a running no-egress session container and return
+/// its name. The caller resolves the published host port from the guard.
+async fn start_guard(container: &str, port: u64) -> Result<String, String> {
+    let net = noegress_network_name(container);
+    let ip = crate::proc::command("docker")
+        .args([
+            "inspect",
+            "-f",
+            &format!("{{{{(index .NetworkSettings.Networks \"{net}\").IPAddress}}}}"),
+            container,
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("docker unavailable: {e}"))?;
+    let ip = String::from_utf8_lossy(&ip.stdout).trim().to_string();
+    if ip.is_empty() || ip.contains("no value") {
+        return Err("the session container has no address on the no-egress network".into());
+    }
+    let present = crate::proc::command("docker")
+        .args(["image", "inspect", GUARD_IMAGE])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !present {
+        let pull = tokio::time::timeout(
+            Duration::from_secs(180),
+            crate::proc::command("docker")
+                .args(["pull", GUARD_IMAGE])
+                .output(),
+        )
+        .await
+        .map_err(|_| "pulling the guard image timed out".to_string())?
+        .map_err(|e| format!("docker unavailable: {e}"))?;
+        if !pull.status.success() {
+            return Err(format!(
+                "could not pull the guard image: {}",
+                String::from_utf8_lossy(&pull.stderr).trim()
+            ));
+        }
+    }
+    let guard = guard_name(container);
+    let _ = remove_container(&guard).await;
+    let args = guard_run_args(container, port, &ip, &node_label().await);
+    let out = crate::proc::command("docker")
+        .args(&args)
+        .output()
+        .await
+        .map_err(|e| format!("docker unavailable: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "could not start the guard: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let out = crate::proc::command("docker")
+        .args(["network", "connect", &net, &guard])
+        .output()
+        .await
+        .map_err(|e| format!("docker unavailable: {e}"))?;
+    if !out.status.success() {
+        let _ = remove_container(&guard).await;
+        return Err(format!(
+            "could not attach the guard to the no-egress network: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(guard)
+}
+
+static NODE_LABEL_VALUE: std::sync::OnceLock<Mutex<String>> = std::sync::OnceLock::new();
+
+async fn set_node_label(node_id: &str) {
+    let cell = NODE_LABEL_VALUE.get_or_init(|| Mutex::new(String::new()));
+    *cell.lock().await = node_id[..8.min(node_id.len())].to_string();
+}
+
+async fn node_label() -> String {
+    match NODE_LABEL_VALUE.get() {
+        Some(cell) => cell.lock().await.clone(),
+        None => String::new(),
+    }
+}
+
+/// Which of the containers docker lists under our label are orphans: named
+/// like a session container, not a prefetch helper, and not a session this
+/// process knows. Pure, so it is testable without docker.
+pub fn orphan_names(listed: &[String], live: &[String]) -> Vec<String> {
+    listed
+        .iter()
+        .filter(|n| n.starts_with("kmplify-fabric-"))
+        .filter(|n| !n.starts_with("kmplify-fabric-prefetch-"))
+        .filter(|n| {
+            !live
+                .iter()
+                .any(|l| l == *n || guard_name(l).as_str() == n.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
+/// Remove session containers a previous incarnation of THIS node left
+/// behind. `cleanup_sessions` runs on every exit path of the connection
+/// loop, but a SIGKILLed worker never reaches it, and the container then
+/// holds the provider's GPU with nobody coming back for it. Scoped by label
+/// so a sibling worker on the same machine is never reaped; containers from
+/// builds predating the label are left alone (documented manual repair).
+async fn sweep_orphans(sessions: &Sessions) {
+    let label = node_label().await;
+    if label.is_empty() {
+        return;
+    }
+    let out = crate::proc::command("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("label={NODE_LABEL}={label}"),
+            "--format",
+            "{{.Names}}",
+        ])
+        .output()
+        .await;
+    let Ok(out) = out else { return };
+    if !out.status.success() {
+        return;
+    }
+    let listed: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let live: Vec<String> = sessions
+        .lock()
+        .await
+        .values()
+        .map(|(n, _)| n.clone())
+        .collect();
+    for name in orphan_names(&listed, &live) {
+        match remove_container(&name).await {
+            Ok(()) => log(format!("removed orphaned session container {name}")),
+            Err(e) => log(format!("could not remove orphaned container {name}: {e}")),
+        }
+    }
+}
+
 /// What this node offers as container sessions.
 ///
 /// Gated on a live Docker daemon. Advertising templates while Docker is down
@@ -1220,10 +1971,14 @@ fn workload_capability(
     disk_used_mb: Option<u64>,
     images: &[String],
     inventory_error: Option<&str>,
+    runtimes: &[String],
 ) -> Value {
     let usable = docker_ok && !cfg.workload_templates.is_empty();
     let accel = cfg.accel();
     let mut caps = json!({
+        // Protocol v3.5: sandbox levels this daemon can run a session under.
+        // Plain "container" always; "gvisor" only when runsc is installed.
+        "runtimes": if usable { runtimes.to_vec() } else { vec!["container".to_string()] },
         "enabled": usable,
         // Legacy shape: gateways predating multi-vendor read only this, and
         // for them "GPU" has always meant CUDA. Keep it exactly that narrow
@@ -1279,6 +2034,9 @@ type Sessions = Arc<Mutex<std::collections::HashMap<String, (String, u16)>>>;
 #[derive(Default)]
 struct Telemetry {
     gpu_used_mb: Option<u64>,
+    /// Used MB per accelerator, index order (v3.8). Empty on CPU-only hosts
+    /// and when the vendor tool did not answer.
+    gpus_used_mb: Vec<u64>,
     loaded_models: Vec<Value>,
     /// Model names to advertise. Cached here for the same reason as the rest:
     /// the read loop must never wait on Ollama.
@@ -1550,6 +2308,27 @@ pub struct TemplatePin {
     pub network: Network,
 }
 
+/// The uid:gid a template's container runs as, when the image cannot be left
+/// to pick its own.
+///
+/// Sessions run with every capability dropped and `no-new-privileges`, so an
+/// entrypoint that starts as root and then switches to its service user
+/// (`chroot --userspec`, gosu, su-exec: all need CAP_SETUID/SETGID) dies at
+/// the switch instead of serving. floci is exactly that image: its
+/// entrypoint re-executes itself as uid 1001 and exits 1 under our flags
+/// ("failed switching to floci", seen live on EX44). Starting the container
+/// AS that user skips the switch: the entrypoint sees a non-root uid and
+/// falls straight through to the server. Strictly less privilege than the
+/// image asked for, never more. The state volume is mounted where the image
+/// already owns a directory for uid 1001 (`/app/data`), so a fresh named
+/// volume inherits writable ownership from the image on first mount.
+pub(crate) fn run_as_user(template: &str) -> Option<&'static str> {
+    match template {
+        "floci" | "floci-azure" | "floci-gcp" | "floci-oci" => Some("1001:0"),
+        _ => None,
+    }
+}
+
 /// What a workload container may reach.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Network {
@@ -1628,6 +2407,50 @@ pub const IMAGE_PINS: &[TemplatePin] = &[
     TemplatePin {
         template: "echo-test",
         repository: "traefik/whoami",
+        accelerator: Backend::Cpu,
+        network: Network::None,
+    },
+    // Managed-only app templates (gateway v3.6). The gateway never schedules
+    // them on a peer; the pin keeps a mis-tagged node from running them
+    // under a different image.
+    TemplatePin {
+        template: "n8n",
+        repository: "n8nio/n8n",
+        accelerator: Backend::Cpu,
+        network: Network::Egress,
+    },
+    TemplatePin {
+        template: "jupyter",
+        repository: "quay.io/jupyter/scipy-notebook",
+        accelerator: Backend::Cpu,
+        network: Network::Egress,
+    },
+    // AWS-compatible services in one container (floci). In-process only,
+    // sealed: no egress, the guard publishes 4566, state in a per-consumer
+    // volume. Runs no consumer code, so peers may host it.
+    TemplatePin {
+        template: "floci",
+        repository: "floci/floci",
+        accelerator: Backend::Cpu,
+        network: Network::None,
+    },
+    // The same emulator family for the other three clouds: Azure, Google
+    // Cloud and Oracle. Identical contract (uid 1001, /app/data, sealed).
+    TemplatePin {
+        template: "floci-azure",
+        repository: "floci/floci-az",
+        accelerator: Backend::Cpu,
+        network: Network::None,
+    },
+    TemplatePin {
+        template: "floci-gcp",
+        repository: "floci/floci-gcp",
+        accelerator: Backend::Cpu,
+        network: Network::None,
+    },
+    TemplatePin {
+        template: "floci-oci",
+        repository: "floci/floci-oci",
         accelerator: Backend::Cpu,
         network: Network::None,
     },
@@ -1747,6 +2570,21 @@ fn image_repository(image: &str) -> String {
 /// through, so a gateway cannot introduce a new template id to an old node
 /// and have it run whatever comes attached.
 pub fn image_allowed_for(template: &str, image: &str) -> bool {
+    image_allowed_with(crate::catalog::current().as_ref(), template, image)
+}
+
+/// `image_allowed_for` over an explicit catalog, so the rule can be tested
+/// without touching the process-wide one.
+pub fn image_allowed_with(
+    catalog: Option<&crate::catalog::Catalog>,
+    template: &str,
+    image: &str,
+) -> bool {
+    // A verified catalog may REVOKE a template, compiled-in ones included:
+    // that is how a withdrawn image stops running without a node release.
+    if catalog.is_some_and(|c| c.revoked.contains(template)) {
+        return false;
+    }
     let repo = image_repository(image);
     IMAGE_PINS
         .iter()
@@ -1754,6 +2592,49 @@ pub fn image_allowed_for(template: &str, image: &str) -> bool {
         || extra_image_pins()
             .iter()
             .any(|(t, pinned)| t == template && &repo == pinned)
+        // And it may ADD one this build predates. A catalog entry that
+        // contradicts a compiled-in pin never gets this far: it is refused
+        // when the catalog is verified (src/catalog.rs).
+        || catalog
+            .and_then(|c| c.entries.get(template))
+            .is_some_and(|e| e.repository == repo)
+}
+
+/// The compiled-in repository for a template, for the catalog's conflict
+/// check. Operator extra pins count: they are this owner's own floor.
+pub fn pinned_repository(template: &str) -> Option<String> {
+    IMAGE_PINS
+        .iter()
+        .find(|p| p.template == template)
+        .map(|p| p.repository.to_string())
+        .or_else(|| {
+            extra_image_pins()
+                .iter()
+                .find(|(t, _)| t == template)
+                .map(|(_, r)| r.clone())
+        })
+}
+
+/// The reference this node actually pulls. When the verified catalog pins a
+/// digest for the template, that digest replaces whatever tag (or digest) the
+/// gateway sent: which bytes run here is the publisher's statement, and the
+/// far end of the socket does not get to choose others.
+pub fn image_to_pull(template: &str, image: &str) -> String {
+    image_to_pull_with(crate::catalog::current().as_ref(), template, image)
+}
+
+pub fn image_to_pull_with(
+    catalog: Option<&crate::catalog::Catalog>,
+    template: &str,
+    image: &str,
+) -> String {
+    match catalog
+        .and_then(|c| c.entries.get(template))
+        .and_then(|e| e.digest.as_deref())
+    {
+        Some(digest) => crate::catalog::with_digest(image, digest),
+        None => image.to_string(),
+    }
 }
 
 /// Is this a tmpfs path we will mount under a read-only rootfs?
@@ -1786,10 +2667,26 @@ pub fn tmpfs_path_ok(path: &str) -> bool {
 /// has no ceiling to consult and gets `None`: the safe end, since nothing here
 /// vouches for what it would reach.
 pub fn network_for(template: &str, requested: Network) -> Network {
+    network_with(crate::catalog::current().as_ref(), template, requested)
+}
+
+pub fn network_with(
+    catalog: Option<&crate::catalog::Catalog>,
+    template: &str,
+    requested: Network,
+) -> Network {
     let ceiling = IMAGE_PINS
         .iter()
         .find(|p| p.template == template)
         .map(|p| p.network)
+        // A template this build predates gets the ceiling its publisher
+        // signed. For a compiled-in template the build's own ceiling stands:
+        // a catalog may add, never widen.
+        .or_else(|| {
+            catalog
+                .and_then(|c| c.entries.get(template))
+                .map(|e| e.network)
+        })
         .unwrap_or(Network::None);
     ceiling.min(requested)
 }
@@ -1890,6 +2787,23 @@ fn trim_log_tail(txt: &str, max_chars: usize) -> String {
 }
 
 async fn remove_container(name: &str) -> Result<(), String> {
+    // A session container may have a guard (no-egress sessions); it goes
+    // with it. Guards end in "-guard" themselves, so this never recurses.
+    if name.starts_with("kmplify-fabric-") && !name.ends_with("-guard") {
+        let _ = docker_rm(&guard_name(name)).await;
+        let res = docker_rm(name).await;
+        // The session's private network goes last, once nothing is on it.
+        // A network that never existed (egress session) is not an error.
+        let _ = crate::proc::command("docker")
+            .args(["network", "rm", &noegress_network_name(name)])
+            .output()
+            .await;
+        return res;
+    }
+    docker_rm(name).await
+}
+
+async fn docker_rm(name: &str) -> Result<(), String> {
     let out = crate::proc::command("docker")
         .args(["rm", "-f", "-v", name])
         .output()
@@ -1970,6 +2884,28 @@ pub async fn fabric_disk_used_mb() -> Option<u64> {
 /// had chosen to share everything, and there was nothing anywhere to say
 /// otherwise. Silence is the one thing a capacity signal must never be.
 async fn measure_fabric_disk() -> Result<u64, String> {
+    let df_err = match measure_fabric_disk_via_df().await {
+        Ok(mb) => return Ok(mb),
+        Err(e) => e,
+    };
+    // `docker system df -v` sizes EVERY container and image on the daemon
+    // before it reaches the volumes, and one container whose snapshot the
+    // daemon cannot measure fails the whole report. Seen on Docker Desktop
+    // (containerd snapshotter) as "snapshotter.Usage failed for <id>: ls"
+    // while a stack container was mid-boot: the fabric volumes were fine,
+    // the report just never got to them, and the hello went out with no
+    // disk figure and an inventory_error instead. So measure the volumes
+    // directly: one throwaway container with ONLY the fabric volumes
+    // mounted, read-only, asking `du`. That costs a container spawn, which
+    // is why it is the fallback rather than the default.
+    match measure_fabric_disk_via_du().await {
+        Ok(mb) => Ok(mb),
+        Err(du_err) => Err(format!("{df_err}; direct measure failed too: {du_err}")),
+    }
+}
+
+/// The cheap path: Docker's own per-volume sizes, no filesystem walk of ours.
+async fn measure_fabric_disk_via_df() -> Result<u64, String> {
     let out = crate::proc::command("docker")
         .args(["system", "df", "-v", "--format", "{{json .Volumes}}"])
         .output()
@@ -2019,6 +2955,130 @@ fn parse_docker_size_mb(s: &str) -> u64 {
         _ => return 0,
     };
     mb.round().max(0.0) as u64
+}
+
+/// Longest a direct `du` over the fabric volumes may take. Generous: the
+/// model stores hold few, large files and walk in seconds, but an install
+/// volume with a hundred thousand small files on a busy disk takes longer,
+/// and a measure that gives up too early is a measure that lies.
+const DU_MEASURE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The fabric's volumes, as Docker lists them. Name-filtered by Docker and
+/// then AGAIN by `is_fabric_volume`: `--filter name=` is a substring match,
+/// and only names that pass the mount rule are ever handed to `-v`.
+async fn fabric_volume_names() -> Result<Vec<String>, String> {
+    let out = crate::proc::command("docker")
+        .args([
+            "volume",
+            "ls",
+            "--filter",
+            "name=kmplify-fabric-",
+            "--format",
+            "{{.Name}}",
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("docker unavailable: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "docker volume ls failed: {}",
+            stderr_excerpt(&out.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| is_fabric_volume(l, "/v"))
+        .collect())
+}
+
+/// Arguments for the measuring container: every fabric volume read-only
+/// under /v, nothing else mounted, no network, no capabilities, and
+/// `--pull never` so a missing alpine is an error here rather than a
+/// surprise download on the telemetry path. Pure, so the mount list is
+/// testable.
+fn du_measure_args(volumes: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--memory",
+        "128m",
+        "--pids-limit",
+        "32",
+        "--pull",
+        "never",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    for v in volumes {
+        args.push("-v".into());
+        args.push(format!("{v}:/v/{v}:ro"));
+    }
+    args.push("alpine:3.20".into());
+    args.push("sh".into());
+    args.push("-c".into());
+    // One figure, in KiB: du's per-volume lines summed. stderr is dropped
+    // because a file vanishing mid-walk is a warning, not a failed measure.
+    args.push("du -sk /v/* 2>/dev/null | awk '{s+=$1} END {print s+0}'".into());
+    args
+}
+
+/// The direct measurement `measure_fabric_disk` falls back to.
+async fn measure_fabric_disk_via_du() -> Result<u64, String> {
+    let volumes = fabric_volume_names().await?;
+    if volumes.is_empty() {
+        return Ok(0);
+    }
+    let args = du_measure_args(&volumes);
+    let run = crate::proc::command("docker")
+        .args(&args)
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(DU_MEASURE_TIMEOUT, run)
+        .await
+        .map_err(|_| {
+            format!(
+                "du over {} fabric volume(s) took longer than {}s",
+                volumes.len(),
+                DU_MEASURE_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| format!("docker unavailable: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "docker run (du) failed: {}",
+            stderr_excerpt(&out.stderr)
+        ));
+    }
+    parse_du_total_mb(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// du's KiB total as SI megabytes, the unit `docker system df` reports in,
+/// so the two paths agree on what "used" means.
+fn parse_du_total_mb(stdout: &str) -> Result<u64, String> {
+    let kib: u64 = stdout.trim().parse().map_err(|_| {
+        format!(
+            "unexpected du output: {:?}",
+            stdout.trim().chars().take(80).collect::<String>()
+        )
+    })?;
+    Ok(((kib as f64 * 1024.0) / 1_000_000.0).round() as u64)
+}
+
+/// The start of a subprocess's stderr, for an error message.
+fn stderr_excerpt(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .trim()
+        .chars()
+        .take(160)
+        .collect()
 }
 
 /// Fetch a model the consumer asked for into this machine's model store.
@@ -2607,14 +3667,31 @@ fn env_key_ok(key: &str) -> bool {
 }
 
 async fn send_frame(sink: &Arc<Mutex<WsSink>>, msg: Value) {
-    let text = msg.to_string();
-    if sink
-        .lock()
-        .await
-        .send(Message::Text(text.clone()))
-        .await
-        .is_ok()
-    {
+    send_message(sink, Message::Text(msg.to_string())).await;
+}
+
+/// A bulk payload frame (protocol v4): binary when the gateway said it reads
+/// binary and the id fits the header, the JSON form otherwise. `json` is only
+/// built on the fallback path, which is the point: no base64 on the fast one.
+async fn send_payload(
+    sink: &Arc<Mutex<WsSink>>,
+    kind: u8,
+    flags: u8,
+    stream_id: &str,
+    payload: &[u8],
+    json: impl FnOnce() -> Value,
+) {
+    if crate::wire::peer_reads_binary() {
+        if let Some(frame) = crate::wire::pack(kind, flags, stream_id, payload) {
+            send_message(sink, Message::Binary(frame)).await;
+            return;
+        }
+    }
+    send_frame(sink, json()).await;
+}
+
+async fn send_message(sink: &Arc<Mutex<WsSink>>, msg: Message) {
+    if sink.lock().await.send(msg.clone()).await.is_ok() {
         return;
     }
     // The captured sink belongs to a connection that no longer exists — a
@@ -2626,7 +3703,7 @@ async fn send_frame(sink: &Arc<Mutex<WsSink>>, msg: Value) {
     let current = current_sink_cell().read().await.clone();
     if let Some(current) = current {
         if !Arc::ptr_eq(&current, sink) {
-            let _ = current.lock().await.send(Message::Text(text)).await;
+            let _ = current.lock().await.send(msg).await;
         }
     }
 }
@@ -2847,6 +3924,18 @@ async fn start_workload(
         .await;
         return;
     }
+    // From here on `image` is what this node pulls and runs. With a digest
+    // pinned by the verified catalog that is `repository@sha256:...`, and the
+    // gateway's tag is no longer consulted.
+    let image = {
+        let pinned = image_to_pull(&template, &image);
+        if pinned != image {
+            log(format!(
+                "session {session}: catalog pins {template} to {pinned}"
+            ));
+        }
+        pinned
+    };
     let accel = cfg.accel();
     if let Some(need) = required {
         if need != accel {
@@ -2878,6 +3967,56 @@ async fn start_workload(
             )
             .await;
             return;
+        }
+    }
+
+    // Protocol v3.5: the sandbox level the template needs. Refused, never
+    // downgraded: a gateway asking for gVisor on a node without runsc gets
+    // an error, not a plain container wearing the wrong label.
+    let isolation = match Isolation::from_frame(frame["isolation"].as_str()) {
+        Some(i) => i,
+        None => {
+            workload_status(
+                &sink,
+                &session,
+                "error",
+                &format!(
+                    "template requires isolation {:?}, which this node does not understand",
+                    frame["isolation"].as_str().unwrap_or("")
+                ),
+            )
+            .await;
+            return;
+        }
+    };
+    match isolation {
+        Isolation::Container => {}
+        Isolation::Gvisor => {
+            if !docker_runtimes().await.iter().any(|r| r == "gvisor") {
+                workload_status(
+                    &sink,
+                    &session,
+                    "error",
+                    "template requires gvisor isolation but runsc is not a runtime on this node",
+                )
+                .await;
+                return;
+            }
+        }
+        Isolation::Microvm => {
+            // Real since protocol v4.1: a host with Kata Containers installed
+            // runs the session in a VM. Still refused everywhere else, so a
+            // template that asks for a VM boundary never quietly gets less.
+            if docker_microvm_runtime().await.is_none() {
+                workload_status(
+                    &sink,
+                    &session,
+                    "error",
+                    "template requires microvm isolation but no Kata runtime is installed on this node",
+                )
+                .await;
+                return;
+            }
         }
     }
 
@@ -3086,19 +4225,82 @@ async fn start_workload(
         format!("{cpus:.2}"),
         "--pids-limit".into(),
         "512".into(),
-        "-p".into(),
-        format!("127.0.0.1:0:{port}"),
+        "--ulimit".into(),
+        SESSION_NOFILE.into(),
+        // Protocol v3.5: owned-by label for the startup orphan sweep.
+        "--label".into(),
+        format!("{NODE_LABEL}={}", node_label().await),
     ];
+    // Protocol v4.1: a template whose image is known to run unprivileged says
+    // so, and the container then has no root inside it at all. Opt-in per
+    // template because it cannot be the default: much of the catalog (CUDA
+    // images that write under /root, anything that chowns at start) breaks
+    // without root, and a broken session is not a hardened one. A value this
+    // node does not like is REFUSED, not ignored: the catalog meant the
+    // session to run unprivileged, and running it as root instead would be
+    // the opposite of what was asked.
+    if let Some(raw) = frame["user"].as_str() {
+        match session_user(Some(raw)) {
+            Some(user) => {
+                args.push("--user".into());
+                args.push(user);
+            }
+            None => {
+                workload_status(
+                    &sink,
+                    &session,
+                    "error",
+                    "template asks for a container user this node will not set (numeric non-root uid[:gid] only)",
+                )
+                .await;
+                hosted_remove(&session).await;
+                return;
+            }
+        }
+    } else if let Some(user) = run_as_user(&template) {
+        // The emulator family's entrypoint needs its service user (uid 1001):
+        // with --cap-drop ALL it cannot switch from root itself. Pinned here so
+        // it holds even when the gateway's frame carries no `user`.
+        args.push("--user".into());
+        args.push(user.into());
+    }
+    if isolation == Isolation::Gvisor {
+        args.push("--runtime".into());
+        args.push("runsc".into());
+    }
+    if isolation == Isolation::Microvm {
+        // Checked a moment ago in the isolation match; asked again rather
+        // than threaded through, and failing CLOSED if it vanished meanwhile:
+        // a bogus runtime name makes `docker run` fail, which is the right
+        // outcome for a session that was promised a VM.
+        args.push("--runtime".into());
+        args.push(
+            docker_microvm_runtime()
+                .await
+                .unwrap_or("kata-runtime-missing")
+                .into(),
+        );
+    }
     // Protocol v3.2. `--network none` leaves the container loopback only: it
     // cannot reach the provider's LAN, cannot call home, cannot exfiltrate
     // what it was given. Most of the catalog cannot run this way because it
     // downloads model weights on first use, so the catalog says which do, and
     // this node's own pin caps that. The published port is a host-side
     // mapping and keeps working either way.
+    // Docker honours `-p` on the default bridge only; a no-egress session
+    // gets its port published by a guard sidecar instead (NOEGRESS_NETWORK).
     let net = network_for(&template, Network::from_frame(frame["network"].as_str()));
     if net == Network::None {
+        if let Err(e) = ensure_noegress_network(&name).await {
+            hosted_remove(&session).await;
+            workload_status(&sink, &session, "error", &e).await;
+            return;
+        }
         args.push("--network".into());
-        args.push("none".into());
+        args.push(noegress_network_name(&name));
+    } else {
+        args.push("-p".into());
+        args.push(format!("127.0.0.1:0:{port}"));
     }
     // Protocol v3.3. A read-only rootfs means a workload cannot rewrite its
     // own image at run time, so whatever it pulls in cannot persist into the
@@ -3128,7 +4330,10 @@ async fn start_workload(
     if let Some(need) = required {
         // Per vendor: --gpus all for CUDA, the kfd/dri devices for ROCm,
         // the render node for Intel. None of them widen the sandbox.
-        args.extend(need.docker_args());
+        // The gateway placed this session on ONE card of a multi-GPU box
+        // (`gpu_index`, v3.8): hand the container that card only.
+        let device = frame["gpu_index"].as_u64().map(|v| v as u32);
+        args.extend(need.docker_args_for(device));
     }
     // The named-volume mounts hoisted above, filtered by the same rule that
     // fed the prefetcher: fabric-namespaced named volumes only.
@@ -3192,9 +4397,24 @@ async fn start_workload(
         }
     }
 
+    // No-egress: the guard publishes the port, so the port lookup asks it.
+    let port_owner = if net == Network::None {
+        match start_guard(&name, port).await {
+            Ok(guard) => guard,
+            Err(e) => {
+                let _ = remove_container(&name).await;
+                hosted_remove(&session).await;
+                workload_status(&sink, &session, "error", &e).await;
+                return;
+            }
+        }
+    } else {
+        name.clone()
+    };
+
     // The ephemeral port docker actually bound (127.0.0.1:0 above).
     let host_port = match crate::proc::command("docker")
-        .args(["port", &name, &format!("{port}/tcp")])
+        .args(["port", &port_owner, &format!("{port}/tcp")])
         .output()
         .await
     {
@@ -3494,20 +4714,31 @@ async fn ws_open(sink: Arc<Mutex<WsSink>>, sessions: Sessions, relays: RelaySock
     let relays2 = relays.clone();
     let id2 = ws_id.clone();
     tokio::spawn(async move {
+        // v4: while this waits for credit it is not reading the container's
+        // socket, so a consumer that cannot keep up slows the container down
+        // instead of filling the gateway.
+        let credit = crate::flow::open(&id2);
         while let Some(Ok(msg)) = read.next().await {
-            let out = match msg {
-                Message::Text(t) => {
-                    json!({"type": "ws_recv", "ws_id": id2, "data_b64": b64_encode(t.as_bytes()), "binary": false})
-                }
-                Message::Binary(b) => {
-                    json!({"type": "ws_recv", "ws_id": id2, "data_b64": b64_encode(&b), "binary": true})
-                }
+            let (data, binary) = match msg {
+                Message::Text(t) => (t.into_bytes(), false),
+                Message::Binary(b) => (b, true),
                 Message::Close(_) => break,
                 // Ping/Pong are answered by tungstenite itself; forwarding
                 // them would only duplicate keepalives on the gateway link.
                 _ => continue,
             };
-            send_frame(&sink2, out).await;
+            if credit.acquire(data.len()).await.is_err() {
+                break;
+            }
+            send_payload(
+                &sink2,
+                crate::wire::KIND_WS_RECV,
+                if binary { crate::wire::FLAG_BINARY } else { 0 },
+                &id2,
+                &data,
+                || json!({"type": "ws_recv", "ws_id": id2, "data_b64": b64_encode(&data), "binary": binary}),
+            )
+            .await;
         }
         relays2.lock().await.remove(&id2);
         send_frame(&sink2, json!({"type": "ws_closed", "ws_id": id2})).await;
@@ -3518,6 +4749,22 @@ async fn ws_open(sink: Arc<Mutex<WsSink>>, sessions: Sessions, relays: RelaySock
 /// relay into the container. `host` would address the wrong server,
 /// `content-length`/`transfer-encoding` are rewritten by the client that
 /// actually sends the bytes, and the rest are connection management.
+///
+/// Deliberately NOT in this list: `authorization`. A consumer needs no bearer
+/// to reach a session (the session id in the relay path is the capability), so
+/// a client that attaches its fabric key by habit used to hand that key to
+/// whoever operates this machine. That leak is closed at the GATEWAY, which
+/// strips the header unless the template declares `forward_authorization`
+/// because the header is the template's own app token: Jupyter's
+/// `token <JUPYTER_TOKEN>`, n8n's basic auth, and every AWS SDK's
+/// `AWS4-HMAC-SHA256` signature for floci.
+///
+/// Stripping it here as well would be better defence in depth, and cannot be
+/// done yet: the node is not told which template policy applies, so an
+/// unconditional strip here would silently stop those three templates from
+/// authenticating at all. Doing it properly needs the gateway to carry the
+/// per-session flag in the start frame, which is a protocol addition and
+/// belongs with the transport round, not with this one.
 const RELAY_STRIPPED_HEADERS: &[&str] = &[
     "host",
     "connection",
@@ -3536,8 +4783,22 @@ async fn relay_http(
     sessions: Sessions,
     client: reqwest::Client,
     frame: Value,
+    upload: Option<tokio::sync::mpsc::UnboundedReceiver<crate::flow::BodyItem>>,
 ) {
     let req_id = frame["req_id"].as_str().unwrap_or_default().to_string();
+    // 503 with Retry-After, answered at once: the consumer's client retries,
+    // which is better than queueing here while its own timeout runs.
+    let Some(_slot) = RelaySlot::take() else {
+        crate::flow::upload_end(&req_id, false);
+        send_frame(
+            &sink,
+            json!({"type": "http_resp", "req_id": req_id, "status": 503,
+            "headers": {"retry-after": "1"},
+            "body_b64": b64_encode(b"this provider is handling too many requests at once")}),
+        )
+        .await;
+        return;
+    };
     let session = frame["session"].as_str().unwrap_or_default().to_string();
     let Some((_, host_port)) = sessions.lock().await.get(&session).cloned() else {
         send_frame(
@@ -3579,7 +4840,37 @@ async fn relay_http(
             }
         }
     }
-    if let Some(body) = frame["body_b64"].as_str() {
+    if let Some(rx) = upload {
+        // v4 streamed upload. The body is pulled by the HTTP client as the
+        // CONTAINER reads it; each pull reports the bytes back as credit, so
+        // the consumer uploads exactly as fast as the container consumes.
+        if let Some(n) = frame["body_length"].as_u64() {
+            // A declared length keeps this a plain Content-Length upload;
+            // without it the client falls back to chunked encoding, which
+            // some upload handlers refuse.
+            req = req.header(reqwest::header::CONTENT_LENGTH, n);
+        }
+        let credit_sink = sink.clone();
+        let credit_id = req_id.clone();
+        let body = futures_util::stream::unfold(rx, move |mut rx| {
+            let sink = credit_sink.clone();
+            let id = credit_id.clone();
+            async move {
+                let item = rx.recv().await?;
+                if let Ok(bytes) = &item {
+                    if let Some(grant) = crate::flow::upload_consumed(&id, bytes.len()) {
+                        send_frame(
+                            &sink,
+                            json!({"type": "credit", "stream": id, "bytes": grant}),
+                        )
+                        .await;
+                    }
+                }
+                Some((item, rx))
+            }
+        });
+        req = req.body(reqwest::Body::wrap_stream(body));
+    } else if let Some(body) = frame["body_b64"].as_str() {
         if !body.is_empty() {
             if let Some(bytes) = b64_decode(body) {
                 req = req.body(bytes);
@@ -3587,7 +4878,11 @@ async fn relay_http(
         }
     }
 
-    match req.send().await {
+    let sent = req.send().await;
+    // Whatever happened, the upload is over from this side: late chunks for
+    // it are dropped instead of queued for a request that already ended.
+    crate::flow::upload_end(&req_id, false);
+    match sent {
         Ok(resp) => {
             let status = resp.status().as_u16();
             let mut headers = serde_json::Map::new();
@@ -3608,8 +4903,7 @@ async fn relay_http(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            let streaming =
-                ct.starts_with("text/event-stream") || ct.starts_with("application/x-ndjson");
+            let streaming = relay_streams(&ct, resp.content_length());
             if streaming {
                 send_frame(
                     &sink,
@@ -3617,22 +4911,63 @@ async fn relay_http(
                     "status": status, "headers": headers}),
                 )
                 .await;
+                let credit = crate::flow::open(&req_id);
                 let mut stream = resp.bytes_stream();
-                while let Some(chunk) = stream.next().await {
+                'body: while let Some(chunk) = stream.next().await {
                     let Ok(chunk) = chunk else { break };
-                    if chunk.is_empty() {
-                        continue;
+                    // Re-cut to CHUNK_BYTES: the HTTP client hands over
+                    // whatever the socket had, and one frame must neither
+                    // exceed a stream's window nor hog the shared socket.
+                    for piece in chunk.chunks(crate::flow::CHUNK_BYTES) {
+                        if credit.acquire(piece.len()).await.is_err() {
+                            // No reader, or the link went. Dropping `stream`
+                            // closes the container's connection.
+                            break 'body;
+                        }
+                        send_payload(
+                            &sink,
+                            crate::wire::KIND_HTTP_RESP_CHUNK,
+                            0,
+                            &req_id,
+                            piece,
+                            || {
+                                json!({"type": "http_resp_chunk", "req_id": req_id,
+                                "body_b64": b64_encode(piece)})
+                            },
+                        )
+                        .await;
                     }
-                    send_frame(
-                        &sink,
-                        json!({"type": "http_resp_chunk", "req_id": req_id,
-                        "body_b64": b64_encode(&chunk)}),
-                    )
-                    .await;
                 }
                 send_frame(&sink, json!({"type": "http_resp_end", "req_id": req_id})).await;
             } else {
                 let body = resp.bytes().await.unwrap_or_default();
+                if body.len() > MAX_RELAY_BODY_BYTES {
+                    // 502, not a truncated 200: a half-delivered file that
+                    // claims success is worse than an error, and the consumer
+                    // can act on this message.
+                    log(format!(
+                        "relay: refused a {} byte response from the container \
+                         (cap {MAX_RELAY_BODY_BYTES}); sending it would have \
+                         closed the gateway connection and every session on it",
+                        body.len()
+                    ));
+                    send_frame(
+                        &sink,
+                        json!({"type": "http_resp", "req_id": req_id, "status": 502,
+                        "headers": {}, "body_b64": b64_encode(
+                            format!(
+                                "the workload answered with {} bytes, over the \
+                                 {MAX_RELAY_BODY_BYTES} byte relay limit for a \
+                                 single response. Stream it (text/event-stream \
+                                 or application/x-ndjson) or fetch it in ranges.",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )}),
+                    )
+                    .await;
+                    return;
+                }
                 send_frame(
                     &sink,
                     json!({"type": "http_resp", "req_id": req_id, "status": status,
@@ -3652,6 +4987,193 @@ async fn relay_http(
     }
 }
 
+/// Set once a gateway answered `welcome` on the current connection.
+static WELCOMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the connection that just ended had been accepted by the gateway,
+/// clearing the mark for the next one.
+fn session_was_welcomed() -> bool {
+    WELCOMED.swap(false, std::sync::atomic::Ordering::AcqRel)
+}
+
+/// Whether a rejected identity should be re-registered right now.
+///
+/// Once per REJECTION STREAK, not once per process: `healed` is cleared by
+/// any connection the gateway welcomed. Without a cap at all a gateway that
+/// rejects even a fresh identity would spin register/reject with no delay.
+fn should_reregister(error: &str, healed_since_welcome: bool) -> bool {
+    error == AUTH_REJECTED && !healed_since_welcome
+}
+
+/// The envelope key beside the node's credentials, created on first use.
+/// Deleting the file rotates the key: the next connection makes a new one and
+/// attests it, and requests sealed to the old one get `envelope_key_changed`.
+async fn load_or_create_envelope_key(creds_path: &Path) -> Option<crate::envelope::EnvelopeKey> {
+    let path = creds_path.parent()?.join("envelope_key.json");
+    if let Ok(text) = tokio::fs::read_to_string(&path).await {
+        if let Some(key) = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v["seed"].as_str().map(str::to_string))
+            .and_then(|seed| crate::envelope::EnvelopeKey::from_seed_hex(&seed))
+        {
+            return Some(key);
+        }
+        log("envelope key file is unreadable; making a new key");
+    }
+    let key = crate::envelope::EnvelopeKey::generate();
+    let body = json!({"seed": key.seed_hex(), "created": crate::identity::now_s()}).to_string();
+    match write_private(&path, body.into_bytes()).await {
+        Ok(()) => Some(key),
+        Err(e) => {
+            // No key on disk means a new one every connection, and every
+            // consumer's cached key going stale each time. Better to offer no
+            // envelope at all than one that cannot stay put.
+            log(format!(
+                "could not store the envelope key ({e}); not offering sealed requests"
+            ));
+            None
+        }
+    }
+}
+
+/// Publisher keys this node's owner trusts for the workload catalog.
+fn trusted_publishers() -> Vec<String> {
+    crate::catalog::parse_trusted(&std::env::var("KMPLIFY_TRUSTED_PUBLISHERS").unwrap_or_default())
+}
+
+/// Verify an envelope against this node's trust and floor, and adopt it.
+fn adopt_catalog(
+    envelope: &Value,
+    node_dir: &std::path::Path,
+    trusted: &[String],
+) -> Result<String, String> {
+    let held = crate::catalog::load_held_version(node_dir).max(crate::catalog::version());
+    let (catalog, notes) =
+        crate::catalog::verify(envelope, trusted, held, &pinned_repository, &|image| {
+            image_repository(image)
+        })
+        .map_err(|e| e.to_string())?;
+    for note in notes {
+        log(note);
+    }
+    let summary = format!(
+        "signed catalog v{} from publisher '{}' adopted: {} entr{}, {} revoked",
+        catalog.version,
+        catalog.publisher,
+        catalog.entries.len(),
+        if catalog.entries.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        catalog.revoked.len(),
+    );
+    // Version first: if the write fails the catalog is still adopted for this
+    // run, and the worst case is that a rollback is not caught after a
+    // restart that also lost the cached document, which then refetches.
+    if let Err(e) = crate::catalog::save_held_version(node_dir, catalog.version) {
+        log(format!(
+            "could not persist the catalog version ({e}); rollback protection is per-run only"
+        ));
+    }
+    let _ = std::fs::write(node_dir.join("catalog.json"), envelope.to_string());
+    crate::catalog::install(catalog);
+    Ok(summary)
+}
+
+async fn fetch_catalog(
+    client: &reqwest::Client,
+    gateway_url: &str,
+    node_dir: &std::path::Path,
+    trusted: &[String],
+) -> Result<String, String> {
+    let resp = client
+        .get(format!("{gateway_url}/v1/catalog"))
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("gateway answered {}", resp.status()));
+    }
+    let envelope: Value = resp.json().await.map_err(|e| e.to_string())?;
+    adopt_catalog(&envelope, node_dir, trusted)
+}
+
+/// The catalog this install verified last time, so a restart (or a gateway
+/// that is down) does not lose templates the owner already runs.
+fn restore_catalog(node_dir: &std::path::Path) {
+    let trusted = trusted_publishers();
+    if trusted.is_empty() {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(node_dir.join("catalog.json")) else {
+        return;
+    };
+    let Ok(envelope) = serde_json::from_str::<Value>(&text) else {
+        return;
+    };
+    // Verified again, not believed because it is on our disk: the trust list
+    // may have changed since it was written.
+    match adopt_catalog(&envelope, node_dir, &trusted) {
+        Ok(msg) => log(format!("{msg} (restored from disk)")),
+        Err(e) => log(format!("cached catalog not restored: {e}")),
+    }
+}
+
+/// Relayed requests this node will work on at once. Every `http` frame used to
+/// become a task with nothing counting them, so the only limit on how many
+/// connections, buffers and container sockets a gateway could make this
+/// process hold was the gateway's good behaviour. Generous on purpose: a page
+/// load is a burst of a hundred small requests.
+const MAX_RELAYS_IN_FLIGHT: usize = 256;
+
+static RELAYS_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A slot among `MAX_RELAYS_IN_FLIGHT`, given back when dropped.
+struct RelaySlot;
+
+impl RelaySlot {
+    fn take() -> Option<RelaySlot> {
+        use std::sync::atomic::Ordering;
+        RELAYS_IN_FLIGHT
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_RELAYS_IN_FLIGHT).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| RelaySlot)
+    }
+}
+
+impl Drop for RelaySlot {
+    fn drop(&mut self) {
+        RELAYS_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Bodies known to be at most this large still travel as one `http_resp`
+/// frame: a page load is dozens of small assets, and three frames each would
+/// be pure overhead.
+const RELAY_SINGLE_FRAME_MAX: u64 = 256 * 1024;
+
+/// Whether a relayed response is forwarded chunk by chunk.
+///
+/// Before v4 only SSE and NDJSON were, and everything else was read whole
+/// into memory and base64-encoded into one frame: a rendered video or a model
+/// file was held twice over, here and on the gateway, and past the frame cap
+/// it could not be delivered at all. Now everything streams unless it is
+/// KNOWN to be small. An unknown length streams, because "unknown" is exactly
+/// what a large generated download looks like.
+fn relay_streams(content_type: &str, content_length: Option<u64>) -> bool {
+    if content_type.starts_with("text/event-stream")
+        || content_type.starts_with("application/x-ndjson")
+    {
+        // Live streams, however short: buffering them defeats their purpose.
+        return true;
+    }
+    !matches!(content_length, Some(n) if n <= RELAY_SINGLE_FRAME_MAX)
+}
+
 /// Remove every container this node started for the fabric — run on
 /// disconnect and on stop, so nothing keeps burning the user's GPU after
 /// sharing ends. The gateway independently marks the sessions failed.
@@ -3665,7 +5187,24 @@ async fn cleanup_sessions(sessions: &Sessions) {
     // Anything still listed here was mid-pull when the connection died —
     // start_workload's own removal never ran, and leaving it published would
     // show the owner a session on their GPU that no longer exists.
-    hosted_cell().lock().await.clear();
+    //
+    // Tombstone each one first. The pull is a detached task and outlives
+    // this call; without the tombstone it finishes minutes later and launches
+    // a container for a session everyone has already written off, registered
+    // in the live map so not even the orphan sweep reaps it. Same mechanism a
+    // `workload_stop` that lands mid-pull has always used.
+    let pulling: Vec<String> = hosted_cell()
+        .lock()
+        .await
+        .drain(..)
+        .map(|h| h.session_id)
+        .collect();
+    if !pulling.is_empty() {
+        let mut stopped = stopped_cell().lock().await;
+        for session in pulling {
+            stopped.insert(session);
+        }
+    }
 }
 
 /// Translate an OpenAI-shaped chat request into Ollama's NATIVE /api/chat
@@ -3819,6 +5358,121 @@ struct JobUpstreams {
     colibri_base: String,
     colibri_api_key: String,
     engines: std::collections::HashMap<String, String>,
+    /// This node's envelope key and the identity it is bound to (protocol
+    /// v5), None when the node has no identity key and so offers no envelope.
+    envelope: Option<Arc<NodeEnvelope>>,
+    /// The primary is not Ollama (vLLM, llama.cpp server, LM Studio, …):
+    /// no `/api/chat`, no `keep_alive`, no `think`.
+    primary_openai_only: bool,
+}
+
+/// What a job needs to open a sealed request: the X25519 key, and the
+/// identity public key that every HPKE context is bound to.
+pub struct NodeEnvelope {
+    pub key: crate::envelope::EnvelopeKey,
+    pub node_pubkey_hex: String,
+}
+
+/// Why a sealed job was refused. The strings are CODES a client acts on, not
+/// prose, and none of them says why a ciphertext failed to open.
+const SEALED_KEY_CHANGED: &str = "envelope_key_changed";
+const SEALED_REFUSED: &str = "envelope_refused";
+const SEALED_UNSUPPORTED: &str = "envelope_unsupported";
+
+/// Open the `sealed` block of an inference job into the request it carries.
+///
+/// The clear `model` and `stream` beside it are what the GATEWAY routed and
+/// scheduled by. They are authenticated as aad, and the opened request has to
+/// name the same model and the same streaming mode: a relay that tampers with
+/// either gets a refusal, never a job run under terms the consumer did not
+/// write.
+fn open_sealed_job(
+    envelope: Option<&NodeEnvelope>,
+    kind: &str,
+    payload: &Value,
+    now: u64,
+    replay: &mut crate::envelope::ReplayGuard,
+) -> Result<(Value, crate::envelope::ResponseSealer), &'static str> {
+    use crate::envelope as env;
+    let envelope = envelope.ok_or(SEALED_UNSUPPORTED)?;
+    let sealed = &payload["sealed"];
+    if sealed["suite"].as_u64() != Some(env::SUITE) {
+        return Err(SEALED_UNSUPPORTED);
+    }
+    if sealed["key_id"].as_str() != Some(envelope.key.key_id().as_str()) {
+        // The one failure a client can fix: fetch the new key and seal again.
+        return Err(SEALED_KEY_CHANGED);
+    }
+    let model = payload["model"].as_str().unwrap_or_default();
+    let stream = payload["stream"].as_bool().unwrap_or(false);
+    let enc = sealed["enc"]
+        .as_str()
+        .and_then(env::unb64)
+        .ok_or(SEALED_REFUSED)?;
+    let ct = sealed["ct"]
+        .as_str()
+        .and_then(env::unb64)
+        .ok_or(SEALED_REFUSED)?;
+    let ts = sealed["ts"].as_u64().ok_or(SEALED_REFUSED)?;
+    let (plaintext, sealer) = envelope
+        .key
+        .open(
+            &envelope.node_pubkey_hex,
+            env::LANE_INFERENCE,
+            &enc,
+            &ct,
+            &env::inference_aad(kind, model, stream, ts),
+        )
+        .map_err(|_| SEALED_REFUSED)?;
+    // AFTER it authenticated, so only a genuine request can occupy a slot in
+    // the replay memory, and BEFORE anything runs: see ReplayGuard for why a
+    // second run of the same request must never produce a second answer.
+    if !replay.admit(&enc, ts, now) {
+        return Err(SEALED_REFUSED);
+    }
+    let inner: Value = serde_json::from_slice(&plaintext).map_err(|_| SEALED_REFUSED)?;
+    if !inner.is_object()
+        || inner["model"].as_str() != Some(model)
+        || inner["stream"].as_bool().unwrap_or(false) != stream
+    {
+        return Err(SEALED_REFUSED);
+    }
+    Ok((inner, sealer))
+}
+
+/// One replay memory per PROCESS, not per connection: a relay must not be able
+/// to reset it by dropping the socket.
+fn replay_guard() -> &'static std::sync::Mutex<crate::envelope::ReplayGuard> {
+    static GUARD: std::sync::OnceLock<std::sync::Mutex<crate::envelope::ReplayGuard>> =
+        std::sync::OnceLock::new();
+    GUARD.get_or_init(|| {
+        std::sync::Mutex::new(crate::envelope::ReplayGuard::new(crate::identity::now_s()))
+    })
+}
+
+/// Seal what a job is about to send, when the job was sealed.
+///
+/// Chunks and the final result carry content. So can an error: an upstream
+/// engine's message may quote the prompt back. All three are sealed; the
+/// clear `message` of a sealed error is a fixed string.
+fn seal_job_frame(sealer: &mut crate::envelope::ResponseSealer, mut msg: Value) -> Value {
+    match msg["type"].as_str() {
+        Some(kind @ ("chunk" | "done")) => {
+            let data = serde_json::to_vec(&msg["data"]).unwrap_or_default();
+            msg["data"] = json!({ "sealed": sealer.seal(kind, &data) });
+        }
+        Some("error") => {
+            let detail = msg["message"]
+                .as_str()
+                .unwrap_or_default()
+                .as_bytes()
+                .to_vec();
+            msg["sealed"] = sealer.seal("error", &detail);
+            msg["message"] = json!("the provider reported an error (sealed)");
+        }
+        _ => {}
+    }
+    msg
 }
 
 async fn run_job(
@@ -3829,7 +5483,38 @@ async fn run_job(
 ) {
     let job_id = frame["id"].as_str().unwrap_or_default().to_string();
     let kind = frame["kind"].as_str().unwrap_or_default();
-    let payload = frame["payload"].clone();
+    let mut payload = frame["payload"].clone();
+    // Protocol v5: a sealed job. The gateway forwarded a ciphertext it cannot
+    // read; from here on `payload` is the request the CONSUMER wrote, and
+    // everything this job sends back goes through the sealer.
+    let sealer: Arc<std::sync::Mutex<Option<crate::envelope::ResponseSealer>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    if payload.get("sealed").is_some() {
+        let opened = open_sealed_job(
+            upstreams.envelope.as_deref(),
+            kind,
+            &payload,
+            crate::identity::now_s(),
+            &mut replay_guard().lock().expect("replay guard lock"),
+        );
+        match opened {
+            Ok((inner, s)) => {
+                payload = inner;
+                *sealer.lock().expect("sealer lock") = Some(s);
+            }
+            Err(code) => {
+                crate::status::count_job_error();
+                let _ = sink
+                    .lock()
+                    .await
+                    .send(Message::Text(
+                        json!({"type": "error", "id": job_id, "message": code}).to_string(),
+                    ))
+                    .await;
+                return;
+            }
+        }
+    }
     // Per-model routing: models the discovery tagged "colibri" go to the
     // colibri gateway; everything else takes the unchanged primary path.
     let requested_model = payload
@@ -3839,11 +5524,21 @@ async fn run_job(
         .to_string();
     let is_colibri = upstreams.engines.get(&requested_model).map(String::as_str) == Some("colibri");
 
-    let send = |sink: Arc<Mutex<WsSink>>, msg: Value| async move {
-        if msg["type"] == "error" {
-            crate::status::count_job_error();
+    let send = move |sink: Arc<Mutex<WsSink>>, msg: Value| {
+        let sealer = sealer.clone();
+        async move {
+            if msg["type"] == "error" {
+                crate::status::count_job_error();
+            }
+            // The one place every frame of this job leaves through, so the
+            // one place a sealed job's output is sealed. Nothing below can
+            // forget to.
+            let msg = match sealer.lock().expect("sealer lock").as_mut() {
+                Some(s) => seal_job_frame(s, msg),
+                None => msg,
+            };
+            let _ = sink.lock().await.send(Message::Text(msg.to_string())).await;
         }
-        let _ = sink.lock().await.send(Message::Text(msg.to_string())).await;
     };
 
     if is_colibri && kind != "chat" {
@@ -3864,7 +5559,8 @@ async fn run_job(
     // is the only place the flag actually takes effect. Ollama-only: colibri
     // has no native endpoint and no hidden reasoning channel to suppress.
     let think = payload.get("think").and_then(Value::as_bool);
-    let native_think = kind == "chat" && think.is_some() && !is_colibri;
+    let openai_only = is_colibri || upstreams.primary_openai_only;
+    let native_think = kind == "chat" && think.is_some() && !openai_only;
     let path = if kind != "chat" {
         "/v1/embeddings"
     } else if native_think {
@@ -3879,12 +5575,12 @@ async fn run_job(
     };
     // keep_alive/num_ctx are Ollama residency knobs; colibri manages its own
     // expert cache and must not receive fields it never defined.
-    let mut payload = if is_colibri {
+    let mut payload = if openai_only {
         payload
     } else {
         keep_peer_model_warm(payload, path)
     };
-    if is_colibri {
+    if openai_only {
         if let Some(obj) = payload.as_object_mut() {
             obj.remove("think");
         }
@@ -4047,10 +5743,10 @@ async fn session(
     // `serving()` is the switch AND the dashboard's live pause: a paused node
     // stays connected, keeps its hosted sessions and its place in the
     // registry, and advertises nothing.
-    let (models, engines) = if serving(cfg) {
-        discover(client, cfg).await
+    let (models, engines, primary_openai_only) = if serving(cfg) {
+        discover_kind(client, cfg).await
     } else {
-        (Vec::new(), std::collections::HashMap::new())
+        (Vec::new(), std::collections::HashMap::new(), false)
     };
     if models.is_empty() && serving(cfg) {
         log("no local models — connecting anyway; jobs will be refused by scheduler");
@@ -4060,6 +5756,16 @@ async fn session(
     // capability it cannot honour. Safe to block here — nothing is connected
     // yet, so there is no read loop to stall.
     let docker_live = docker_ok().await;
+    let runtimes_live = if docker_live {
+        docker_runtimes().await
+    } else {
+        vec!["container".to_string()]
+    };
+    set_node_label(&creds.node_id).await;
+    if docker_live {
+        // Containers a killed predecessor of this node left holding the GPU.
+        sweep_orphans(&sessions_cell().clone()).await;
+    }
     let (disk_live, images_live, inventory_err) = sample_inventory().await;
     if let Some(e) = &inventory_err {
         log(format!("inventory unavailable at connect: {e}"));
@@ -4070,24 +5776,78 @@ async fn session(
         cfg.gateway_url.replacen("http", "ws", 1)
     );
     crate::status::set_link(crate::status::Link::Connecting, ws_url.clone());
-    let (ws, _) = connect_async(&ws_url).await.map_err(|e| e.to_string())?;
+    // Explicit frame limits rather than tungstenite's defaults (64 MiB
+    // message, 16 MiB frame): the gateway enforces 16 MiB, and a node that
+    // would accept more only discovers the mismatch when a large payload
+    // closes the socket mid-session.
+    let (ws, _) = connect_async_with_config(&ws_url, Some(gateway_ws_config()), false)
+        .await
+        .map_err(|e| e.to_string())?;
     let (write, mut read) = ws.split();
     let sink = Arc::new(Mutex::new(write));
+    // Inference jobs in flight on this connection, by gateway job id, so a
+    // `cancel` frame can abort one (v3.8).
+    let inflight: Arc<
+        std::sync::Mutex<std::collections::HashMap<String, tokio::task::AbortHandle>>,
+    > = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     // Register as THE live connection, so frames from session tasks born on
     // an earlier one still reach the gateway (see current_sink_cell).
     *current_sink_cell().write().await = Some(sink.clone());
 
+    // Protocol v3.7: the node's identity key signs the hello, so a gateway
+    // can tell this node from a copy of its token. Older gateways ignore the
+    // three keys; a v3.7 gateway that has bound this key refuses a hello
+    // without them.
+    let identity_fields = creds
+        .key()
+        .map(|k| k.hello_fields(&creds.node_id, crate::identity::now_s()))
+        .unwrap_or(Value::Null);
+    // Protocol v5: this node's encryption key, attested by its identity key.
+    // Only a node WITH an identity key offers the envelope: an encryption key
+    // nobody vouches for is one a relay could substitute.
+    let node_envelope: Option<Arc<NodeEnvelope>> = match creds.key() {
+        Some(identity) => load_or_create_envelope_key(&cfg.creds_path)
+            .await
+            .map(|key| {
+                Arc::new(NodeEnvelope {
+                    key,
+                    node_pubkey_hex: identity.public_hex(),
+                })
+            }),
+        None => None,
+    };
+    let envelope_attestation = match (&node_envelope, creds.key()) {
+        (Some(e), Some(identity)) => e.key.attestation(&identity, crate::identity::now_s()),
+        _ => Value::Null,
+    };
+    let gpu_facts = gpu_info(cfg.accel(), cfg.max_shared_vram_mb).await;
+    let gpu_count = gpu_facts
+        .get("gpu_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(if cfg.accel() == crate::gpu::Backend::Cpu {
+            0
+        } else {
+            1
+        }) as usize;
     let hello = json!({
         "type": "hello",
         "node_id": creds.node_id,
         "token": creds.token,
+        "pubkey": identity_fields.get("pubkey").cloned().unwrap_or(Value::Null),
+        "ts": identity_fields.get("ts").cloned().unwrap_or(Value::Null),
+        "sig": identity_fields.get("sig").cloned().unwrap_or(Value::Null),
         "models": models,
         // Per-model upstream overrides ({model: "colibri"}, protocol v2.5).
         // Empty for single-upstream nodes; older gateways ignore the key.
         "engines": engines,
-        "gpu": gpu_info(cfg.accel(), cfg.max_shared_vram_mb).await,
+        "gpu": gpu_facts,
+        // Every accelerator and the parallel-job cap (v3.8). Older gateways
+        // ignore the three keys.
+        "gpus": gpu_facts.get("gpus").cloned().unwrap_or(Value::Array(Vec::new())),
+        "gpu_count": gpu_count,
+        "inference_slots": inference_slots(cfg, gpu_count),
         "workloads": workload_capability(
-            cfg, docker_live, disk_live, &images_live, inventory_err.as_deref(),
+            cfg, docker_live, disk_live, &images_live, inventory_err.as_deref(), &runtimes_live,
         ),
         // Which build is this? Compiled in, so it cannot disagree with what
         // was installed. Costs one field and removes a whole class of
@@ -4105,6 +5865,21 @@ async fn session(
         // own field rather than folded into `version` because the gateway
         // truncates that one to 32 chars; older gateways ignore this key.
         "worker_version": crate::version_string(),
+        // Node-link protocol level. 4 = this node paces each relayed stream
+        // by the credit the gateway grants (src/flow.rs), streams every large
+        // response instead of buffering it, and announces kept sessions. A
+        // gateway only sends `credit` frames to a node that says so.
+        "protocol": 4,
+        // v5: the key consumers may seal requests to, signed by the identity
+        // key above. Null when this node has no identity key.
+        "envelope": envelope_attestation,
+        // Highest signed catalog this node holds, 0 when it trusts no
+        // publisher (src/catalog.rs). Lets an operator see which nodes have
+        // picked up a new catalog without asking them.
+        "catalog_version": crate::catalog::version(),
+        // Bulk payload frames may be sent to this node as WebSocket binary
+        // messages (src/wire.rs). The JSON forms stay valid.
+        "binary_frames": true,
         // Which SYSTEM this build runs on, from the compiler, not probed at
         // runtime: "macos"/"linux"/"windows" and "aarch64"/"x86_64". The
         // gateway keeps these per node for an anonymous install count by
@@ -4123,6 +5898,11 @@ async fn session(
         // Collections replicated here, so the gateway can tell this node to
         // drop any it no longer knows (same reconciliation as sessions).
         "collections": store.collection_ids().await,
+        // Sessions still running here from before this connection (v4). The
+        // gateway keeps the ones it knows and answers `workload_stop` for the
+        // rest; without this list it must assume every session died with
+        // the link. Older gateways ignore the key.
+        "sessions": announced_sessions(&hosted_sessions().await),
         // What this machine actually IS (v2.4): real CPU model, cores and
         // total RAM. Independent of cpu_share, which says only what was
         // volunteered — a GPU peer still has a CPU worth naming.
@@ -4170,6 +5950,39 @@ async fn session(
     if welcome["type"] != "welcome" {
         return Err(format!("gateway refused: {welcome}"));
     }
+    // The gateway accepted this identity. `run` reads this to know the
+    // connection was a real one (see healed_since_connect there).
+    WELCOMED.store(true, std::sync::atomic::Ordering::Release);
+    // The link is back inside the grace window: the sessions announced in
+    // the hello stay, and the deadline that would have removed them is off.
+    disarm_grace_reaper();
+    // v4 gateways name a per-stream window; older ones do not, and then
+    // nothing is paced. Also ends every stream of the previous connection.
+    crate::flow::connected(crate::flow::window_from_welcome(&welcome));
+    crate::wire::set_peer_reads_binary(welcome["binary_frames"].as_bool().unwrap_or(false));
+    // The signed workload catalog (src/catalog.rs). Only a node whose owner
+    // named a publisher to trust looks at it at all; then it is fetched when
+    // the gateway advertises something newer than what is held. Off the
+    // session loop: a slow or absent catalog must not delay serving.
+    {
+        let offered = welcome["catalog_version"].as_u64().unwrap_or(0);
+        let trusted = trusted_publishers();
+        if !trusted.is_empty() && offered > crate::catalog::version() {
+            let client = client.clone();
+            let gateway_url = cfg.gateway_url.clone();
+            let node_dir = cfg
+                .creds_path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_default();
+            tokio::spawn(async move {
+                match fetch_catalog(&client, &gateway_url, &node_dir, &trusted).await {
+                    Ok(msg) => log(msg),
+                    Err(e) => log(format!("signed catalog not adopted: {e}")),
+                }
+            });
+        }
+    }
     crate::status::set_link(crate::status::Link::Online, String::new());
     crate::status::set_models(&models, &engines);
     log(format!(
@@ -4207,6 +6020,8 @@ async fn session(
     // Per-connection: a dropped gateway link invalidates every relayed
     // socket, so these die with it rather than outliving the connection that
     // owns their ws_ids.
+    // Parsed once per connection, not once per pong.
+    let receipt_key = creds.key();
     let relays: RelaySockets = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let telemetry: Arc<Mutex<Telemetry>> = Arc::new(Mutex::new(Telemetry {
         docker_ok: docker_live,
@@ -4241,12 +6056,14 @@ async fn session(
         let accel = cfg.accel();
         tokio::spawn(async move {
             let used = crate::gpu::used_mb(accel).await;
+            let used_all = crate::gpu::used_mb_all(accel).await;
             let resident = loaded_models(&client, &base).await;
             let names = local_models(&client, &base).await;
             let (disk, imgs, err) = sample_inventory().await;
             let mut t = telemetry.lock().await;
             t.inventory_error = err;
             t.gpu_used_mb = used;
+            t.gpus_used_mb = used_all;
             t.loaded_models = resident;
             t.disk_used_mb = disk;
             t.images = imgs;
@@ -4345,7 +6162,43 @@ async fn session(
                 last_rx = tokio::time::Instant::now();
                 let Some(msg) = msg else { break Err("connection closed".into()) };
                 let msg = match msg { Ok(m) => m, Err(e) => break Err(e.to_string()) };
-                let Message::Text(text) = msg else { continue };
+                // v4 bulk frames: payload raw behind a fixed header, no JSON
+                // and no base64 (src/wire.rs). Same effect as the JSON arms
+                // `http_req_chunk` and `ws_send` further down.
+                if let Message::Binary(raw) = &msg {
+                    if let Some(f) = crate::wire::unpack(raw) {
+                        match f.kind {
+                            crate::wire::KIND_HTTP_REQ_CHUNK => {
+                                crate::flow::upload_push(&f.stream_id, f.payload.to_vec());
+                            }
+                            crate::wire::KIND_WS_SEND => {
+                                let out = if f.flags & crate::wire::FLAG_BINARY != 0 {
+                                    Message::Binary(f.payload.to_vec())
+                                } else {
+                                    Message::Text(String::from_utf8_lossy(f.payload).into_owned())
+                                };
+                                let mut map = relays.lock().await;
+                                if let Some(tx) = map.get(&f.stream_id) {
+                                    if tx.send(out).is_err() {
+                                        map.remove(&f.stream_id);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
+                // A close frame says WHY the gateway hung up, and the one
+                // reason an operator can act on is 4003: another process
+                // presented this node's identity and took the link over.
+                // Reported as such rather than as a bare "connection closed"
+                // followed by an endless reconnect duel.
+                let text = match msg {
+                    Message::Text(t) => t,
+                    Message::Close(frame) => break Err(describe_close(frame.as_ref())),
+                    _ => continue,
+                };
                 let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue };
                 match frame["type"].as_str() {
                     Some("ping") => {
@@ -4377,6 +6230,9 @@ async fn session(
                             if let Some(used) = t.gpu_used_mb {
                                 p["gpu_used_mb"] = json!(used);
                             }
+                            if !t.gpus_used_mb.is_empty() {
+                                p["gpus_used_mb"] = json!(t.gpus_used_mb);
+                            }
                             // ALWAYS sent, empty included. The empty list is
                             // the news "nothing is resident anymore" — it was
                             // skipped here, so the gateway (which treats an
@@ -4386,6 +6242,21 @@ async fn session(
                             // peer GPUs" list with entries stuck at
                             // "expiring now" forever.
                             p["loaded_models"] = json!(t.loaded_models);
+                            // v4.1: this node's own signed word on how long
+                            // each session has run here, so a compute
+                            // attestation rests on two signatures and not
+                            // only the gateway's. Absent key = older gateway
+                            // semantics: a gateway that does not know the
+                            // field ignores it.
+                            let receipts = work_receipts(
+                                receipt_key.as_ref(),
+                                &creds.node_id,
+                                &hosted_sessions().await,
+                                chrono_now_secs(),
+                            );
+                            if !receipts.is_empty() {
+                                p["receipts"] = json!(receipts);
+                            }
                             // Live CPU/RAM, so a CPU peer is as current as a
                             // GPU one (which has had vram_used_mb all along).
                             // Read from the background sampler — a snapshot,
@@ -4413,6 +6284,7 @@ async fn session(
                             let accel = cfg.accel();
                             tokio::spawn(async move {
                                 let used = crate::gpu::used_mb(accel).await;
+                                let used_all = crate::gpu::used_mb_all(accel).await;
                                 let resident = loaded_models(&client, &base).await;
                                 let names = local_models(&client, &base).await;
                                 let dok = docker_ok().await;
@@ -4443,6 +6315,7 @@ async fn session(
                                     t.inventory_error = err;
                                 }
                                 t.gpu_used_mb = used;
+                                t.gpus_used_mb = used_all;
                                 t.loaded_models = resident;
                                 if !names.is_empty() {
                                     t.models = names;
@@ -4488,7 +6361,7 @@ async fn session(
                                 "type": "workloads",
                                 "workloads": workload_capability(
                                     cfg, docker_now, snapshot.0, &snapshot.1,
-                                    snapshot.2.as_deref(),
+                                    snapshot.2.as_deref(), &runtimes_live,
                                 ),
                             });
                             if let Err(e) = sink.lock().await.send(Message::Text(frame.to_string())).await {
@@ -4573,12 +6446,35 @@ async fn session(
                             colibri_base: cfg.colibri_base.clone(),
                             colibri_api_key: cfg.colibri_api_key.clone(),
                             engines: current_engines.clone(),
+                            envelope: node_envelope.clone(),
+                            primary_openai_only,
                         };
                         let (sink, client) = (sink.clone(), client.clone());
-                        tokio::spawn(async move {
-                            let _counted = crate::status::JobGuard::start(&model);
-                            run_job(sink, client, upstreams, frame).await;
+                        let job_id = frame["id"].as_str().unwrap_or_default().to_string();
+                        let running = inflight.clone();
+                        let handle = tokio::spawn({
+                            let job_id = job_id.clone();
+                            let running = running.clone();
+                            async move {
+                                let _counted = crate::status::JobGuard::start(&model);
+                                run_job(sink, client, upstreams, frame).await;
+                                running.lock().unwrap().remove(&job_id);
+                            }
                         });
+                        if !job_id.is_empty() {
+                            running.lock().unwrap().insert(job_id, handle.abort_handle());
+                        }
+                    }
+                    Some("cancel") => {
+                        // The consumer is gone (v3.8): the gateway released
+                        // its slot and asks this node to stop generating for
+                        // nobody. Aborting the task drops the upstream HTTP
+                        // stream, and Ollama stops on a closed connection.
+                        let job_id = frame["id"].as_str().unwrap_or_default();
+                        if let Some(h) = inflight.lock().unwrap().remove(job_id) {
+                            h.abort();
+                            log(format!("job {} cancelled: consumer left", &job_id[..job_id.len().min(8)]));
+                        }
                     }
                     Some("workload_start") => {
                         tokio::spawn(start_workload(sink.clone(), sessions.clone(), stopped.clone(), cfg.clone(), frame));
@@ -4599,7 +6495,42 @@ async fn session(
                         ));
                     }
                     Some("http") => {
-                        tokio::spawn(relay_http(sink.clone(), sessions.clone(), client.clone(), frame));
+                        // v4 streamed upload: register the body channel HERE,
+                        // in the read loop, because the chunks follow this
+                        // frame immediately and a spawned task may not have
+                        // run yet when the first one arrives.
+                        let upload = frame["body_stream"]
+                            .as_bool()
+                            .unwrap_or(false)
+                            .then(|| crate::flow::upload_open(frame["req_id"].as_str().unwrap_or_default()));
+                        tokio::spawn(relay_http(sink.clone(), sessions.clone(), client.clone(), frame, upload));
+                    }
+                    Some("http_req_chunk") => {
+                        let id = frame["req_id"].as_str().unwrap_or_default();
+                        if let Some(bytes) = frame["body_b64"].as_str().and_then(b64_decode) {
+                            crate::flow::upload_push(id, bytes);
+                        }
+                    }
+                    Some("http_req_end") => {
+                        crate::flow::upload_end(
+                            frame["req_id"].as_str().unwrap_or_default(),
+                            frame["abort"].as_bool().unwrap_or(false),
+                        );
+                    }
+                    // Protocol v4: the consumer drained this much of a stream.
+                    // Handled inline: it is a map lookup and must never queue
+                    // behind the traffic it is there to unblock.
+                    Some("credit") => {
+                        if let (Some(stream), Some(bytes)) =
+                            (frame["stream"].as_str(), frame["bytes"].as_u64())
+                        {
+                            crate::flow::grant(stream, bytes);
+                        }
+                    }
+                    Some("stream_cancel") => {
+                        if let Some(stream) = frame["stream"].as_str() {
+                            crate::flow::cancel(stream);
+                        }
                     }
                     // Protocol v2.2 — see ws_open(). Spawned, never awaited
                     // here: dialling the container can block for seconds and
@@ -4658,10 +6589,96 @@ async fn session(
             }
         }
     };
-    // Whatever ended the session — graceful stop or a dropped gateway —
-    // nothing may keep running on the user's GPU afterwards.
-    cleanup_sessions(&sessions).await;
+    // A stop, a clean end or an operator's reload: nothing may keep running
+    // on the user's GPU afterwards. A LOST link is different (v4): the
+    // containers wait out the grace window for the gateway to return, and
+    // the reaper removes them on this node's own clock if it does not.
+    let grace = session_grace();
+    let hosted = hosted_sessions().await.len();
+    if keeps_sessions_across(&result, *stop.borrow(), grace, hosted) {
+        log(format!(
+            "gateway link lost with {hosted} session(s) hosted — keeping them for {}s",
+            grace.as_secs()
+        ));
+        arm_grace_reaper(sessions.clone(), grace);
+    } else {
+        disarm_grace_reaper();
+        cleanup_sessions(&sessions).await;
+    }
     result
+}
+
+/// Is this a host where plaintext http is a reasonable thing to allow?
+///
+/// Loopback and private ranges only: a LAN cluster's master and a developer's
+/// own box are the legitimate cases for http, and neither leaves the machine
+/// or the building. Anything routable is on the public internet as far as this
+/// node can tell.
+fn host_is_local_or_private(host: &str) -> bool {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".local") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        Ok(std::net::IpAddr::V6(v6)) => {
+            // is_unique_local / is_unicast_link_local are still unstable, so
+            // check the prefixes directly: fc00::/7 and fe80::/10.
+            let o = v6.octets();
+            v6.is_loopback() || (o[0] & 0xfe) == 0xfc || (o[0] == 0xfe && (o[1] & 0xc0) == 0x80)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Refuse a gateway this node would talk to in the clear.
+///
+/// The control channel derived from this URL carries the node's registration
+/// token and the job frames that decide what `docker run` is handed. Over
+/// plaintext both are readable and both are writable by anyone on the path, so
+/// a http:// gateway is not a weaker deployment, it is one where the fabric's
+/// instructions come from whoever is closest to the wire.
+///
+/// Nothing enforced this before: `gateway_url.replacen("http", "ws", 1)` turned
+/// http into ws without comment, so a misconfigured PROVIDER_GATEWAY_URL simply
+/// worked, quietly. See docs/security/AUDIT-2026-08-24.md, F7.
+///
+/// http to a loopback or private address stays allowed, because a LAN master
+/// and a dev box are real and neither is on the internet.
+pub fn check_gateway_url(url: &str) -> Result<(), String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("gateway URL is empty".to_string());
+    }
+    if url.starts_with("https://") {
+        return Ok(());
+    }
+    if let Some(rest) = url.strip_prefix("http://") {
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        // Strip any userinfo, then the port, leaving the host.
+        let hostport = authority.rsplit('@').next().unwrap_or(authority);
+        let host = if hostport.starts_with('[') {
+            hostport
+                .split(']')
+                .next()
+                .unwrap_or("")
+                .trim_start_matches('[')
+        } else {
+            hostport.split(':').next().unwrap_or("")
+        };
+        if host_is_local_or_private(host) {
+            return Ok(());
+        }
+        return Err(format!(
+            "refusing to use gateway {url}: it is plaintext http to a public address. \
+             The node's registration token and every job instruction would travel in the \
+             clear, readable and MODIFIABLE by anyone on the path. Use https://, or a \
+             loopback/LAN address if this is a local gateway."
+        ));
+    }
+    Err(format!(
+        "refusing to use gateway {url}: expected an http:// or https:// URL"
+    ))
 }
 
 /// Run the worker until `stop` is signalled true; reconnects with backoff
@@ -4702,12 +6719,20 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
     // headless provider would have advertised an empty CPU model and no
     // usage at all — exactly the "CPU peers have no detail" complaint, on
     // the deployment where nobody is watching a window to notice.
+    // Checked before anything connects or registers. Returning rather than
+    // continuing on a warning is the point: a node that carries on in
+    // plaintext has already sent its token by the time anyone reads the log.
+    if let Err(e) = check_gateway_url(&cfg.gateway_url) {
+        log(format!("FATAL: {e}"));
+        return;
+    }
     crate::hostcpu::start();
     // The dashboard reads the CONFIG from here too, so what it shows is what
     // this worker was actually handed rather than what the reader's own
     // environment resolves to — the two differ the moment a service unit and
     // an operator's shell disagree.
     publish_config(&cfg);
+    restore_catalog(&node_dir);
     if cfg.vectors.enabled {
         let loaded = vectors_store(&cfg).load().await;
         if loaded > 0 {
@@ -4749,8 +6774,18 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
     // change made while the gateway is unreachable would otherwise sit out
     // the full backoff before anyone noticed it.
     let mut wake = control().subscribe();
+    // Consecutive failed connections, for the backoff. Reset by a connection
+    // that stayed up long enough to count as one.
+    let mut failed_attempts: u32 = 0;
+    // Stopping while disconnected: sessions kept for the gateway's return
+    // have nobody coming back for them once this worker is gone.
+    async fn release_kept_sessions() {
+        disarm_grace_reaper();
+        cleanup_sessions(sessions_cell()).await;
+    }
     loop {
         if *stop.borrow() {
+            release_kept_sessions().await;
             return;
         }
         // Re-read before every connection, so a change made in the dashboard
@@ -4759,10 +6794,31 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
         cfg = baseline.clone();
         crate::settings::Settings::load(&node_dir).apply(&mut cfg);
         publish_config(&cfg);
-        match session(&client, &cfg, &mut stop).await {
+        let dialled_at = std::time::Instant::now();
+        let outcome = session(&client, &cfg, &mut stop).await;
+        if dialled_at.elapsed() >= RECONNECT_HEALTHY_AFTER {
+            failed_attempts = 0;
+        }
+        // Computed here so the log lines below can name it; only COUNTED at
+        // the sleep, because the `continue` paths (operator asked, identity
+        // healed) dial again at once and are not failures to back off from.
+        let delay = reconnect_delay(failed_attempts, reconnect_entropy());
+        // "Reset after any session that actually ran", which the comment
+        // above always promised and the code never did: the flag was cleared
+        // only on Ok(()), and session() returns Ok only when the worker is
+        // stopping. So a node healed a rejected identity exactly ONCE per
+        // process lifetime. The second time its gateway lost the registry
+        // (a redeploy with a fresh volume is enough) it logged "rejected even
+        // a freshly registered identity" with a growing backoff until a human
+        // restarted it. Found on the local rig by wiping the gateway twice.
+        if session_was_welcomed() {
+            healed_since_connect = false;
+        }
+        match outcome {
             Ok(()) => healed_since_connect = false,
             Err(e) => {
                 if *stop.borrow() {
+                    release_kept_sessions().await;
                     return;
                 }
                 if e == RECONNECT_REQUESTED {
@@ -4772,7 +6828,7 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
                     continue;
                 }
                 crate::status::set_link(crate::status::Link::Retrying, e.clone());
-                if e == AUTH_REJECTED && !healed_since_connect {
+                if should_reregister(&e, healed_since_connect) {
                     // The gateway does not know this node id — retrying with
                     // it can only fail identically, forever. Mint a fresh
                     // identity for THIS gateway and reconnect immediately; an
@@ -4790,21 +6846,23 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
                     }
                 } else if e == AUTH_REJECTED {
                     log(format!(
-                        "gateway rejected even a freshly registered identity; retrying in {}s",
-                        RECONNECT_DELAY.as_secs()
+                        "gateway rejected even a freshly registered identity; retrying in {:.1}s",
+                        delay.as_secs_f32()
                     ));
                 } else {
                     log(format!(
-                        "connection lost ({e}); retrying in {}s",
-                        RECONNECT_DELAY.as_secs()
+                        "connection lost ({e}); retrying in {:.1}s",
+                        delay.as_secs_f32()
                     ));
                 }
             }
         }
+        failed_attempts = failed_attempts.saturating_add(1);
         tokio::select! {
-            _ = tokio::time::sleep(RECONNECT_DELAY) => {}
+            _ = tokio::time::sleep(delay) => {}
             _ = stop.changed() => {
                 if *stop.borrow() {
+                    release_kept_sessions().await;
                     return;
                 }
             }
@@ -5474,6 +7532,18 @@ mod template_accelerator_tests {
             }
         }
     }
+
+    #[test]
+    fn floci_runs_as_its_service_user_never_root() {
+        // cap-drop ALL breaks root-then-switch entrypoints; floci starts as
+        // uid 1001 directly and every other template keeps the image default.
+        for t in ["floci", "floci-azure", "floci-gcp", "floci-oci"] {
+            assert_eq!(super::run_as_user(t), Some("1001:0"), "{t}");
+        }
+        for t in ["ollama-cpu", "n8n", "jupyter", "echo-test", "speaches-cpu"] {
+            assert_eq!(super::run_as_user(t), None, "{t}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5780,5 +7850,1245 @@ mod model_manifest_tests {
         assert_eq!(pct(0, 0), 100.0);
         assert_eq!(pct(5, 10), 50.0);
         assert_eq!(pct(20, 10), 100.0); // a file larger than declared never overflows the bar
+    }
+}
+
+#[cfg(test)]
+mod isolation_and_sweep_tests {
+    use super::{guard_run_args, noegress_network_name};
+    use super::{orphan_names, runtimes_from_info, Isolation};
+
+    #[test]
+    fn runtimes_are_read_from_docker_info_and_container_is_always_first() {
+        assert_eq!(runtimes_from_info(""), vec!["container"]);
+        assert_eq!(runtimes_from_info("not json"), vec!["container"]);
+        let plain = r#"{"io.containerd.runc.v2":{"path":"runc"},"runc":{"path":"runc"}}"#;
+        assert_eq!(runtimes_from_info(plain), vec!["container"]);
+        let with_runsc = r#"{"runc":{"path":"runc"},"runsc":{"path":"/usr/local/bin/runsc"}}"#;
+        assert_eq!(runtimes_from_info(with_runsc), vec!["container", "gvisor"]);
+    }
+
+    #[test]
+    fn isolation_absent_means_container_and_unknown_fails_closed() {
+        assert_eq!(Isolation::from_frame(None), Some(Isolation::Container));
+        assert_eq!(Isolation::from_frame(Some("")), Some(Isolation::Container));
+        assert_eq!(
+            Isolation::from_frame(Some("container")),
+            Some(Isolation::Container)
+        );
+        assert_eq!(
+            Isolation::from_frame(Some("GVisor")),
+            Some(Isolation::Gvisor)
+        );
+        assert_eq!(
+            Isolation::from_frame(Some("microvm")),
+            Some(Isolation::Microvm)
+        );
+        assert_eq!(Isolation::from_frame(Some("firecracker")), None);
+    }
+
+    #[test]
+    fn orphan_sweep_only_reaps_session_containers_this_process_does_not_own() {
+        let listed = vec![
+            "kmplify-fabric-aaaa".to_string(),
+            "kmplify-fabric-bbbb".to_string(),
+            "kmplify-fabric-prefetch-cccc".to_string(),
+            "unrelated".to_string(),
+        ];
+        let live = vec!["kmplify-fabric-bbbb".to_string()];
+        assert_eq!(orphan_names(&listed, &live), vec!["kmplify-fabric-aaaa"]);
+        assert!(orphan_names(&[], &live).is_empty());
+    }
+
+    #[test]
+    fn orphan_sweep_keeps_the_guard_of_a_live_session_and_reaps_a_dead_ones() {
+        let listed = vec![
+            "kmplify-fabric-bbbb".to_string(),
+            "kmplify-fabric-bbbb-guard".to_string(),
+            "kmplify-fabric-aaaa-guard".to_string(),
+        ];
+        let live = vec!["kmplify-fabric-bbbb".to_string()];
+        assert_eq!(
+            orphan_names(&listed, &live),
+            vec!["kmplify-fabric-aaaa-guard"]
+        );
+    }
+
+    #[test]
+    fn guard_publishes_on_the_bridge_and_forwards_to_the_session_address() {
+        let args = guard_run_args("kmplify-fabric-abc", 80, "172.30.0.2", "node-x");
+        let joined = args.join(" ");
+        assert!(joined.contains("--name kmplify-fabric-abc-guard"));
+        assert!(joined.contains("--network bridge -p 127.0.0.1:0:80"));
+        assert!(joined.contains("--cap-drop ALL"));
+        assert!(joined.contains("--label kmplify.fabric.node=node-x"));
+        assert!(joined.ends_with("TCP-LISTEN:80,fork,reuseaddr TCP:172.30.0.2:80"));
+        assert!(!joined.contains(&noegress_network_name("kmplify-fabric-abc")));
+        assert_eq!(
+            noegress_network_name("kmplify-fabric-abc"),
+            "kmplify-fabric-abc-net"
+        );
+    }
+}
+
+#[cfg(test)]
+mod relay_frame_limit_tests {
+    use super::*;
+
+    /// One number across three implementations. The gateway passes
+    /// `--ws-max-size 16777216`, the reference worker passes the same to
+    /// `websockets.connect`, and this is the node's copy. A node that accepts
+    /// more than the gateway does discovers the mismatch when a large payload
+    /// closes the socket, which takes every session on the node with it.
+    #[test]
+    fn the_frame_cap_matches_the_gateways() {
+        assert_eq!(MAX_FRAME_BYTES, 16 * 1024 * 1024);
+        let cfg = gateway_ws_config();
+        assert_eq!(cfg.max_message_size, Some(MAX_FRAME_BYTES));
+        assert_eq!(cfg.max_frame_size, Some(MAX_FRAME_BYTES));
+    }
+
+    /// base64 grows a body by 4/3, so the body cap has to be the SMALLER
+    /// number or a response just under the frame limit still produces a frame
+    /// over it. This is the arithmetic that mistake hides in.
+    #[test]
+    fn a_body_at_the_cap_still_fits_in_a_frame() {
+        let encoded = MAX_RELAY_BODY_BYTES.div_ceil(3) * 4;
+        assert!(
+            encoded < MAX_FRAME_BYTES,
+            "a {MAX_RELAY_BODY_BYTES} byte body encodes to {encoded}, over the \
+             {MAX_FRAME_BYTES} byte frame cap"
+        );
+        // Still a useful size, not a cap so tight it refuses ordinary work.
+        const { assert!(MAX_RELAY_BODY_BYTES < MAX_FRAME_BYTES) };
+        const { assert!(MAX_RELAY_BODY_BYTES > 8 * 1024 * 1024) };
+    }
+
+    /// Consumers do not authenticate to a workload with a fabric key, so the
+    /// gateway strips `authorization` unless the template owns the header.
+    /// The node cannot make that call (it is not told the template policy),
+    /// and must therefore NOT strip it blindly, or floci stops speaking AWS
+    /// and Jupyter stops accepting its own token.
+    #[test]
+    fn the_node_leaves_authorization_to_the_gateway() {
+        assert!(!RELAY_STRIPPED_HEADERS.contains(&"authorization"));
+        assert!(RELAY_STRIPPED_HEADERS.contains(&"proxy-authorization"));
+        assert!(RELAY_STRIPPED_HEADERS.contains(&"host"));
+    }
+}
+
+#[cfg(test)]
+mod reconnect_backoff_tests {
+    use super::*;
+
+    /// The first retry is fast: a gateway redeploy is back within seconds and
+    /// hosted sessions are waiting on the grace window.
+    #[test]
+    fn the_first_retry_is_under_a_second() {
+        for e in [0u64, 1, 499, 500, u64::MAX] {
+            let d = reconnect_delay(0, e);
+            assert!(
+                d >= Duration::from_millis(500) && d <= Duration::from_secs(1),
+                "{d:?}"
+            );
+        }
+    }
+
+    /// Never near zero (a hammer) and never past the ceiling.
+    #[test]
+    fn every_delay_stays_between_half_the_step_and_the_step() {
+        for attempt in 0..40u32 {
+            let step = (1000u64 << attempt.min(16)).min(60_000);
+            for e in [0u64, 7, 12_345, u64::MAX] {
+                let ms = reconnect_delay(attempt, e).as_millis() as u64;
+                assert!(
+                    ms >= step / 2 && ms <= step,
+                    "attempt {attempt}: {ms}ms vs step {step}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn it_reaches_the_ceiling_and_stays_there() {
+        assert!(reconnect_delay(6, u64::MAX - 1) <= RECONNECT_CEILING);
+        assert!(reconnect_delay(30, 0) >= Duration::from_secs(30));
+        assert!(reconnect_delay(u32::MAX, u64::MAX) <= RECONNECT_CEILING);
+    }
+
+    /// Two nodes that fail in the same instant must not dial in the same
+    /// instant: that is the whole point of the jitter.
+    #[test]
+    fn different_entropy_spreads_the_fleet() {
+        let a = reconnect_delay(5, 1);
+        let b = reconnect_delay(5, 9_999);
+        assert_ne!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod session_retention_tests {
+    use super::*;
+
+    fn lost() -> Result<(), String> {
+        Err("connection closed".to_string())
+    }
+    const GRACE: Duration = Duration::from_secs(180);
+
+    /// The case the whole feature exists for: a gateway redeploy.
+    #[test]
+    fn a_lost_link_keeps_hosted_sessions() {
+        assert!(keeps_sessions_across(&lost(), false, GRACE, 1));
+    }
+
+    /// Decisions tear down at once, exactly as before. An operator who stops
+    /// sharing must not leave a stranger's container running for three more
+    /// minutes, and a reload may be the operator switching sessions OFF.
+    #[test]
+    fn a_stop_a_clean_end_and_a_reload_do_not() {
+        assert!(!keeps_sessions_across(&lost(), true, GRACE, 1));
+        assert!(!keeps_sessions_across(&Ok(()), false, GRACE, 1));
+        assert!(!keeps_sessions_across(
+            &Err(RECONNECT_REQUESTED.to_string()),
+            false,
+            GRACE,
+            1
+        ));
+    }
+
+    #[test]
+    fn nothing_hosted_or_grace_zero_is_the_old_behaviour() {
+        assert!(!keeps_sessions_across(&lost(), false, GRACE, 0));
+        assert!(!keeps_sessions_across(&lost(), false, Duration::ZERO, 3));
+    }
+
+    /// Tied to the gateway's NODE_RETURN_GRACE_S (180 s). A different number
+    /// on either side throws sessions away or burns a GPU for nothing.
+    #[test]
+    fn the_default_grace_matches_the_gateways() {
+        assert_eq!(parse_session_grace(None), Duration::from_secs(180));
+        assert_eq!(parse_session_grace(Some("")), Duration::from_secs(180));
+    }
+
+    #[test]
+    fn an_operator_can_shorten_or_disable_it_but_not_make_it_forever() {
+        assert_eq!(parse_session_grace(Some("0")), Duration::ZERO);
+        assert_eq!(parse_session_grace(Some(" 30 ")), Duration::from_secs(30));
+        assert_eq!(parse_session_grace(Some("999999")), SESSION_GRACE_MAX);
+        // Unreadable is the default, never "off" and never "forever".
+        assert_eq!(parse_session_grace(Some("soon")), Duration::from_secs(180));
+        assert_eq!(parse_session_grace(Some("-5")), Duration::from_secs(180));
+    }
+
+    /// The exact shape gateway `reconcile_node_sessions` reads.
+    #[test]
+    fn the_hello_announces_each_session_with_its_state() {
+        let hosted = vec![
+            HostedSession {
+                session_id: "s-1".into(),
+                template: "comfyui".into(),
+                container: "kmplify-fabric-s-1".into(),
+                since: 0,
+                state: "running".into(),
+                cpus: 2.0,
+                running_since: None,
+            },
+            HostedSession {
+                session_id: "s-2".into(),
+                template: "ollama".into(),
+                container: "kmplify-fabric-s-2".into(),
+                since: 0,
+                state: "pulling".into(),
+                cpus: 1.0,
+                running_since: None,
+            },
+        ];
+        assert_eq!(
+            announced_sessions(&hosted),
+            json!([
+                {"session": "s-1", "state": "running"},
+                {"session": "s-2", "state": "pulling"},
+            ])
+        );
+        assert_eq!(announced_sessions(&[]), json!([]));
+    }
+
+    /// The reaper really removes what was kept, on the node's own clock, and
+    /// a returning link really calls it off.
+    #[tokio::test(start_paused = true)]
+    async fn the_grace_deadline_fires_unless_the_link_returns() {
+        let sessions: Sessions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        hosted_cell().lock().await.push(HostedSession {
+            session_id: "grace-test-pull".into(),
+            template: "echo-test".into(),
+            container: "kmplify-fabric-grace-test-pull".into(),
+            since: 0,
+            state: "pulling".into(),
+            cpus: 1.0,
+            running_since: None,
+        });
+
+        // Link returns in time: nothing is touched.
+        // (A paused clock auto-advances through `sleep` once every task is
+        // idle, which also guarantees the reaper was polled and its timer
+        // registered before time moves. `advance` alone does not.)
+        arm_grace_reaper(sessions.clone(), Duration::from_secs(180));
+        tokio::time::sleep(Duration::from_secs(100)).await;
+        disarm_grace_reaper();
+        tokio::time::sleep(Duration::from_secs(200)).await;
+        assert!(hosted_cell()
+            .lock()
+            .await
+            .iter()
+            .any(|h| h.session_id == "grace-test-pull"));
+
+        // Link never returns: the mid-pull session is dropped AND tombstoned,
+        // so the detached pull cannot launch a container afterwards.
+        arm_grace_reaper(sessions.clone(), Duration::from_secs(180));
+        tokio::time::sleep(Duration::from_secs(181)).await;
+        assert!(!hosted_cell()
+            .lock()
+            .await
+            .iter()
+            .any(|h| h.session_id == "grace-test-pull"));
+        assert!(stopped_cell().lock().await.remove("grace-test-pull"));
+    }
+}
+
+#[cfg(test)]
+mod relay_streaming_tests {
+    use super::*;
+
+    #[test]
+    fn live_streams_always_stream() {
+        assert!(relay_streams("text/event-stream", Some(10)));
+        assert!(relay_streams("application/x-ndjson; charset=utf-8", None));
+    }
+
+    /// The page-load case: dozens of small assets, one frame each.
+    #[test]
+    fn a_body_known_to_be_small_is_one_frame() {
+        assert!(!relay_streams("text/html", Some(0)));
+        assert!(!relay_streams(
+            "application/json",
+            Some(RELAY_SINGLE_FRAME_MAX)
+        ));
+    }
+
+    /// The case this exists for: a 200 MB download must never be buffered,
+    /// and neither may a body whose length nobody announced.
+    #[test]
+    fn large_and_unknown_lengths_stream() {
+        assert!(relay_streams("video/mp4", Some(200 * 1024 * 1024)));
+        assert!(relay_streams("image/png", Some(RELAY_SINGLE_FRAME_MAX + 1)));
+        assert!(relay_streams("application/octet-stream", None));
+    }
+
+    /// A chunk frame has to fit the frame cap after base64, with room.
+    #[test]
+    fn one_chunk_is_far_below_the_frame_cap() {
+        const { assert!(crate::flow::CHUNK_BYTES * 2 < MAX_FRAME_BYTES) };
+    }
+}
+
+#[cfg(test)]
+mod streamed_upload_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A "container": reads exactly Content-Length bytes, slowly enough that
+    /// the upload has to be paced, and answers with their SHA-256.
+    async fn hashing_http_server() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                sock.read_exact(&mut byte).await.unwrap();
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+            let len: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .expect("a declared length keeps the upload un-chunked")
+                .trim()
+                .parse()
+                .unwrap();
+            let mut hasher = Sha256::new();
+            let mut got = 0usize;
+            let mut buf = vec![0u8; 64 * 1024];
+            while got < len {
+                let n = sock.read(&mut buf).await.unwrap();
+                assert!(n > 0, "body ended at {got} of {len}");
+                hasher.update(&buf[..n]);
+                got += n;
+            }
+            let body = format!("{got}:{:x}", hasher.finalize());
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+        port
+    }
+
+    /// A "gateway": accepts the node's socket and hands back every frame.
+    async fn gateway_socket() -> (
+        Arc<Mutex<WsSink>>,
+        tokio::sync::mpsc::UnboundedReceiver<Value>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(sock).await.unwrap();
+            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                let _ = tx.send(serde_json::from_str::<Value>(&t).unwrap());
+            }
+        });
+        let (ws, _) = connect_async(&url).await.unwrap();
+        let (write, _read) = ws.split();
+        (Arc::new(Mutex::new(write)), rx)
+    }
+
+    /// 24 MiB through a 1 MiB window: byte-exact at the container, credit
+    /// reported back for it, and never more than two windows queued here.
+    #[tokio::test]
+    async fn a_large_upload_reaches_the_container_byte_exact_under_credit() {
+        let _serial = crate::flow::TEST_LOCK.lock().await;
+        const WINDOW: usize = 1024 * 1024;
+        const TOTAL: usize = 24 * 1024 * 1024;
+        crate::flow::connected(Some(WINDOW));
+
+        let port = hashing_http_server().await;
+        let (sink, mut frames) = gateway_socket().await;
+        let sessions: Sessions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert("s-up".into(), ("kmplify-fabric-s-up".into(), port));
+
+        let frame = json!({
+            "type": "http", "session": "s-up", "req_id": "r-up", "method": "POST",
+            "path": "/upload", "query": "", "headers": {"content-type": "application/octet-stream"},
+            "body_stream": true, "body_length": TOTAL,
+        });
+        let rx = crate::flow::upload_open("r-up");
+        let relay = tokio::spawn(relay_http(
+            sink,
+            sessions,
+            reqwest::Client::new(),
+            frame,
+            Some(rx),
+        ));
+
+        // The gateway's side of the bargain: send while there is credit,
+        // wait for a grant when there is not.
+        let mut expect = Sha256::new();
+        let mut credit = WINDOW;
+        let mut sent = 0usize;
+        let mut granted = 0u64;
+        let mut response = None;
+        while sent < TOTAL {
+            let n = crate::flow::CHUNK_BYTES.min(TOTAL - sent);
+            while credit < n {
+                let f = frames
+                    .recv()
+                    .await
+                    .expect("the node stopped granting credit");
+                if f["type"] == "credit" {
+                    assert_eq!(f["stream"], "r-up");
+                    credit += f["bytes"].as_u64().unwrap() as usize;
+                    granted += f["bytes"].as_u64().unwrap();
+                }
+            }
+            let chunk: Vec<u8> = (0..n).map(|i| ((sent + i) % 251) as u8).collect();
+            expect.update(&chunk);
+            assert!(
+                crate::flow::upload_push("r-up", chunk),
+                "refused inside its credit"
+            );
+            credit -= n;
+            sent += n;
+        }
+        crate::flow::upload_end("r-up", false);
+
+        while response.is_none() {
+            let f = frames.recv().await.expect("no response frame");
+            match f["type"].as_str() {
+                Some("credit") => granted += f["bytes"].as_u64().unwrap(),
+                Some("http_resp") => response = Some(f),
+                _ => {}
+            }
+        }
+        relay.await.unwrap();
+        let response = response.unwrap();
+        assert_eq!(response["status"], 200);
+        let body =
+            String::from_utf8(b64_decode(response["body_b64"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(body, format!("{TOTAL}:{:x}", expect.finalize()));
+        // What is GUARANTEED, and no more: the sender starts with one window,
+        // so it cannot have sent everything unless at least TOTAL - WINDOW
+        // came back as grants. `>` here was a race, not an invariant: credit
+        // frames the node sends after its response arrive after this test
+        // has stopped reading, and whether the last batch is counted depends
+        // on scheduling. It passed on the Mac it was written on and failed on
+        // CI's Linux and Windows runners, with the upload itself byte-exact.
+        assert!(
+            granted as usize >= TOTAL - WINDOW,
+            "granted only {granted} of {TOTAL}"
+        );
+        assert!(granted as usize <= TOTAL, "granted more than was sent");
+        crate::flow::connected(None);
+    }
+
+    /// An aborted upload must reach the container as a FAILED request.
+    #[tokio::test]
+    async fn an_aborted_upload_fails_the_request_instead_of_sending_half_a_body() {
+        let _serial = crate::flow::TEST_LOCK.lock().await;
+        crate::flow::connected(Some(1024 * 1024));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut sink = Vec::new();
+            let _ = sock.read_to_end(&mut sink).await;
+        });
+        let (sink, mut frames) = gateway_socket().await;
+        let sessions: Sessions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert("s-ab".into(), ("kmplify-fabric-s-ab".into(), port));
+        let frame = json!({
+            "type": "http", "session": "s-ab", "req_id": "r-ab", "method": "POST",
+            "path": "/upload", "query": "", "headers": {}, "body_stream": true,
+            "body_length": 10 * 1024 * 1024,
+        });
+        let rx = crate::flow::upload_open("r-ab");
+        let relay = tokio::spawn(relay_http(
+            sink,
+            sessions,
+            reqwest::Client::new(),
+            frame,
+            Some(rx),
+        ));
+        assert!(crate::flow::upload_push("r-ab", vec![7u8; 1024]));
+        crate::flow::upload_end("r-ab", true);
+        let resp = loop {
+            let f = frames.recv().await.expect("no response frame");
+            if f["type"] == "http_resp" {
+                break f;
+            }
+        };
+        relay.await.unwrap();
+        assert_eq!(resp["status"], 502);
+        crate::flow::connected(None);
+    }
+}
+
+#[cfg(test)]
+mod relay_slot_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// Slots run out at the cap and come back when a relay ends, including
+    /// when it ends by being dropped mid-flight.
+    #[test]
+    fn slots_are_bounded_and_returned() {
+        let _serial = crate::flow::TEST_LOCK.blocking_lock();
+        let before = RELAYS_IN_FLIGHT.load(Ordering::Acquire);
+        let mut held = Vec::new();
+        while let Some(slot) = RelaySlot::take() {
+            held.push(slot);
+            assert!(held.len() <= MAX_RELAYS_IN_FLIGHT);
+        }
+        assert_eq!(before + held.len(), MAX_RELAYS_IN_FLIGHT);
+        assert!(RelaySlot::take().is_none());
+        held.pop();
+        assert!(RelaySlot::take().is_some());
+        drop(held);
+        assert_eq!(RELAYS_IN_FLIGHT.load(Ordering::Acquire), before);
+    }
+}
+
+#[cfg(test)]
+mod signed_catalog_enforcement_tests {
+    use super::*;
+    use crate::catalog::{Catalog, Entry};
+
+    const DIGEST: &str = "sha256:abababababababababababababababababababababababababababababababab";
+
+    fn catalog() -> Catalog {
+        let mut c = Catalog {
+            version: 7,
+            publisher: "kmplify".into(),
+            ..Default::default()
+        };
+        c.entries.insert(
+            "brand-new".into(),
+            Entry {
+                repository: "good/brand-new".into(),
+                network: Network::Egress,
+                digest: Some(DIGEST.into()),
+            },
+        );
+        c.entries.insert(
+            "quiet-new".into(),
+            Entry {
+                repository: "good/quiet".into(),
+                network: Network::None,
+                digest: None,
+            },
+        );
+        c.revoked.insert("ollama".into());
+        c
+    }
+
+    /// The point of the whole lane: a template this build has never heard of
+    /// runs, under its publisher's repository and nothing else.
+    #[test]
+    fn a_signed_entry_admits_a_template_this_build_predates() {
+        let c = catalog();
+        assert!(!image_allowed_with(None, "brand-new", "good/brand-new:1"));
+        assert!(image_allowed_with(
+            Some(&c),
+            "brand-new",
+            "good/brand-new:1"
+        ));
+        assert!(image_allowed_with(
+            Some(&c),
+            "brand-new",
+            "docker.io/good/brand-new:2"
+        ));
+        assert!(!image_allowed_with(
+            Some(&c),
+            "brand-new",
+            "evil/brand-new:1"
+        ));
+        assert!(!image_allowed_with(
+            Some(&c),
+            "quiet-new",
+            "good/brand-new:1"
+        ));
+    }
+
+    /// Withdrawing an image without a node release.
+    #[test]
+    fn revocation_beats_even_a_compiled_in_pin() {
+        let c = catalog();
+        assert!(image_allowed_with(None, "ollama", "ollama/ollama:latest"));
+        assert!(!image_allowed_with(
+            Some(&c),
+            "ollama",
+            "ollama/ollama:latest"
+        ));
+        // Everything else compiled in is untouched by an unrelated catalog.
+        assert!(image_allowed_with(
+            Some(&c),
+            "echo-test",
+            "traefik/whoami:latest"
+        ));
+    }
+
+    /// Which bytes run here is the publisher's statement, not the gateway's.
+    #[test]
+    fn a_pinned_digest_replaces_whatever_tag_the_gateway_sent() {
+        let c = catalog();
+        assert_eq!(
+            image_to_pull_with(Some(&c), "brand-new", "good/brand-new:latest"),
+            format!("good/brand-new@{DIGEST}")
+        );
+        assert_eq!(
+            image_to_pull_with(Some(&c), "quiet-new", "good/quiet:3"),
+            "good/quiet:3"
+        );
+        assert_eq!(
+            image_to_pull_with(None, "brand-new", "good/brand-new:latest"),
+            "good/brand-new:latest"
+        );
+    }
+
+    #[test]
+    fn a_catalog_sets_the_ceiling_only_for_templates_it_added() {
+        let c = catalog();
+        assert_eq!(
+            network_with(Some(&c), "brand-new", Network::Egress),
+            Network::Egress
+        );
+        assert_eq!(
+            network_with(Some(&c), "quiet-new", Network::Egress),
+            Network::None
+        );
+        assert_eq!(
+            network_with(None, "brand-new", Network::Egress),
+            Network::None
+        );
+        // echo-test is compiled in with no network; nothing signed widens it.
+        let mut wide = catalog();
+        wide.entries.insert(
+            "echo-test".into(),
+            Entry {
+                repository: "traefik/whoami".into(),
+                network: Network::Egress,
+                digest: None,
+            },
+        );
+        assert_eq!(
+            network_with(Some(&wide), "echo-test", Network::Egress),
+            Network::None
+        );
+    }
+
+    /// Kata's names mean a VM; nothing else does, and an unknown runtime is
+    /// never promoted to a promise made to a consumer.
+    #[test]
+    fn kata_runtimes_are_the_microvm_rung_and_nothing_else_is() {
+        assert_eq!(runtimes_from_info(r#"{"runc":{}}"#), vec!["container"]);
+        assert_eq!(
+            runtimes_from_info(r#"{"runc":{},"runsc":{},"kata-clh":{}}"#),
+            vec!["container", "gvisor", "microvm"]
+        );
+        assert_eq!(
+            runtimes_from_info(r#"{"runc":{},"totally-a-vm":{},"firecracker":{}}"#),
+            vec!["container"]
+        );
+        let both: serde_json::Map<String, Value> =
+            serde_json::from_str(r#"{"kata-fc":{},"kata-qemu":{}}"#).unwrap();
+        // Firecracker last: it cannot pass a GPU through.
+        assert_eq!(microvm_runtime(&both), Some("kata-qemu"));
+    }
+}
+
+#[cfg(test)]
+mod identity_heal_tests {
+    use super::*;
+
+    /// The regression: gateway loses its registry, node heals, runs for a
+    /// week, gateway loses it again. The second time has to heal too.
+    #[test]
+    fn a_welcomed_connection_re_arms_the_heal() {
+        let mut healed = false;
+        // First loss: heal.
+        assert!(should_reregister(AUTH_REJECTED, healed));
+        healed = true;
+        // Rejected again straight away: do NOT spin, back off instead.
+        assert!(!should_reregister(AUTH_REJECTED, healed));
+        // The gateway then welcomes a connection...
+        WELCOMED.store(true, std::sync::atomic::Ordering::Release);
+        if session_was_welcomed() {
+            healed = false;
+        }
+        // ...so the next registry loss heals again.
+        assert!(should_reregister(AUTH_REJECTED, healed));
+        // The mark is consumed: a later failed dial is not "welcomed".
+        assert!(!session_was_welcomed());
+    }
+
+    #[test]
+    fn only_a_rejected_identity_triggers_a_re_registration() {
+        assert!(!should_reregister("connection closed", false));
+        assert!(!should_reregister(RECONNECT_REQUESTED, false));
+    }
+}
+
+#[cfg(test)]
+mod work_receipt_tests {
+    use super::*;
+
+    fn hosted(id: &str, state: &str, running_since: Option<i64>) -> HostedSession {
+        HostedSession {
+            session_id: id.into(),
+            template: "echo-test".into(),
+            container: format!("kmplify-fabric-{id}"),
+            since: 900,
+            state: state.into(),
+            cpus: 1.0,
+            running_since,
+        }
+    }
+
+    #[test]
+    fn a_running_session_gets_a_receipt_that_verifies_under_the_node_key() {
+        let key = crate::identity::NodeKey::generate();
+        let r = work_receipts(
+            Some(&key),
+            "node-1",
+            &[hosted("s-1", "running", Some(1000))],
+            1090,
+        );
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0]["session"], "s-1");
+        assert_eq!(r[0]["running_s"], 90);
+        assert_eq!(r[0]["ts"], 1090);
+        let canonical =
+            crate::identity::canonical_receipt("node-1", &key.public_hex(), "s-1", 90, 1090);
+        assert!(crate::identity::verify(
+            &key.public_hex(),
+            crate::identity::PURPOSE_NODE_RECEIPT,
+            &canonical,
+            r[0]["sig"].as_str().unwrap()
+        ));
+        // Not under another purpose: a receipt can never be replayed as a hello.
+        assert!(!crate::identity::verify(
+            &key.public_hex(),
+            crate::identity::PURPOSE_NODE_HELLO,
+            &canonical,
+            r[0]["sig"].as_str().unwrap()
+        ));
+    }
+
+    /// Pull time is not compute, and a node without a key says nothing.
+    #[test]
+    fn only_running_time_is_attested_and_only_with_a_key() {
+        let key = crate::identity::NodeKey::generate();
+        let list = [
+            hosted("pulling", "pulling", None),
+            hosted("odd", "running", None),
+            hosted("future", "running", Some(5000)),
+        ];
+        assert!(work_receipts(Some(&key), "n", &list, 1090).is_empty());
+        assert!(work_receipts(None, "n", &[hosted("s", "running", Some(1))], 1090).is_empty());
+    }
+
+    /// The literal the gateway's test also pins, so the two canonical forms
+    /// cannot drift apart silently.
+    #[test]
+    fn the_canonical_form_is_the_one_the_gateway_rebuilds() {
+        assert_eq!(
+            String::from_utf8(crate::identity::canonical_receipt(
+                "n-1", "ab", "s-1", 90, 1090
+            ))
+            .unwrap(),
+            r#"{"node_id":"n-1","pubkey":"ab","running_s":90,"session":"s-1","ts":1090}"#
+        );
+    }
+}
+
+#[cfg(test)]
+mod container_hardening_tests {
+    use super::*;
+
+    #[test]
+    fn a_numeric_non_root_user_is_accepted() {
+        assert_eq!(session_user(Some("65534")).as_deref(), Some("65534"));
+        assert_eq!(session_user(Some("1001:0")).as_deref(), Some("1001:0"));
+        assert_eq!(
+            session_user(Some(" 1000:1000 ")).as_deref(),
+            Some("1000:1000")
+        );
+    }
+
+    /// The value arrives over a socket and becomes a docker argument.
+    #[test]
+    fn root_names_and_anything_clever_are_refused() {
+        for bad in [
+            "0",
+            "0:0",
+            "00",
+            "root",
+            "nobody",
+            "",
+            ":",
+            "1000:",
+            ":1000",
+            "1:2:3",
+            "1000 --privileged",
+            "-1",
+            "1000;id",
+            "99999999999",
+            "1e3",
+        ] {
+            assert_eq!(session_user(Some(bad)), None, "{bad:?}");
+        }
+        assert_eq!(session_user(None), None);
+    }
+
+    /// A tag is a name somebody else can move; the guard sits in the data
+    /// path of every no-egress session on the node.
+    #[test]
+    fn the_guard_image_is_pinned_by_digest() {
+        let (_, digest) = GUARD_IMAGE
+            .split_once("@sha256:")
+            .expect("pinned by digest");
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(GUARD_IMAGE.starts_with("alpine/socat:"));
+    }
+}
+
+#[cfg(test)]
+mod sealed_job_tests {
+    use super::*;
+    use base64::Engine;
+
+    const NODE_PUBKEY: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+    /// The timestamp the Python client authenticated in the pinned request.
+    const SEALED_AT: u64 = 1_800_000_000;
+
+    fn guard() -> crate::envelope::ReplayGuard {
+        crate::envelope::ReplayGuard::new(SEALED_AT - 10)
+    }
+
+    /// `open_sealed_job` at the moment the pinned request was fresh.
+    fn open_now(
+        e: Option<&NodeEnvelope>,
+        kind: &str,
+        payload: &Value,
+    ) -> Result<(Value, crate::envelope::ResponseSealer), &'static str> {
+        open_sealed_job(e, kind, payload, SEALED_AT + 1, &mut guard())
+    }
+
+    fn envelope() -> NodeEnvelope {
+        NodeEnvelope {
+            key: crate::envelope::EnvelopeKey::from_seed_hex(
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+            )
+            .unwrap(),
+            node_pubkey_hex: NODE_PUBKEY.into(),
+        }
+    }
+
+    /// The job payload exactly as the gateway forwards it, sealed by the
+    /// Python reference client (the literal src/envelope.rs also pins).
+    fn sealed_payload() -> Value {
+        let b64 = |hex: &str| {
+            base64::engine::general_purpose::STANDARD
+                .encode(crate::functions::hex_decode(hex).unwrap())
+        };
+        json!({
+            "model": "llama3.1:8b", "stream": true,
+            "sealed": {"suite": 1, "key_id": "01520b9fd72dc69a", "ts": SEALED_AT, "enc": b64("37fda3567bdbd628e88668c3c8d7e97d1d1253b6d4ea6d44c150f741f1bf4431"), "ct": b64("00e4c3a6a39797dfae9350fa0c89888de245e831a4d9e5f127702ae711af08b0588522efb7ba03cdae8e7c530056cc536e308460447fae3349eaa50dc27493b1d2b339036afa5169a35b401e29f43840d592f9b183e0ae978eec0d33616dbf68bebceb74c1563f0811")},
+        })
+    }
+
+    #[test]
+    fn a_sealed_job_becomes_the_request_the_consumer_wrote() {
+        let (inner, _) = open_now(Some(&envelope()), "chat", &sealed_payload()).unwrap();
+        assert_eq!(inner["messages"][0]["content"], "hello node");
+        assert_eq!(inner["model"], "llama3.1:8b");
+    }
+
+    /// The gateway forwards `model` and `stream` in the clear and schedules by
+    /// them. Changing either must not run the job under terms the consumer
+    /// did not write.
+    #[test]
+    fn a_relay_that_changes_the_routing_metadata_gets_a_refusal() {
+        let e = envelope();
+        let mut swapped = sealed_payload();
+        swapped["model"] = json!("gpt-oss:120b");
+        assert_eq!(
+            open_now(Some(&e), "chat", &swapped).err(),
+            Some(SEALED_REFUSED)
+        );
+        let mut unstreamed = sealed_payload();
+        unstreamed["stream"] = json!(false);
+        assert_eq!(
+            open_now(Some(&e), "chat", &unstreamed).err(),
+            Some(SEALED_REFUSED)
+        );
+        assert_eq!(
+            open_now(Some(&e), "embeddings", &sealed_payload()).err(),
+            Some(SEALED_REFUSED)
+        );
+    }
+
+    /// A rotated key is the one failure a client can fix, so it is the one
+    /// that says what it is. Everything else is the same refusal.
+    #[test]
+    fn refusals_are_codes_and_only_a_key_change_is_distinguishable() {
+        let e = envelope();
+        let mut rotated = sealed_payload();
+        rotated["sealed"]["key_id"] = json!("ffffffffffffffff");
+        assert_eq!(
+            open_now(Some(&e), "chat", &rotated).err(),
+            Some(SEALED_KEY_CHANGED)
+        );
+        let mut suite = sealed_payload();
+        suite["sealed"]["suite"] = json!(2);
+        assert_eq!(
+            open_now(Some(&e), "chat", &suite).err(),
+            Some(SEALED_UNSUPPORTED)
+        );
+        assert_eq!(
+            open_now(None, "chat", &sealed_payload()).err(),
+            Some(SEALED_UNSUPPORTED)
+        );
+        let mut junk = sealed_payload();
+        junk["sealed"]["ct"] = json!("not base64 !!");
+        assert_eq!(
+            open_now(Some(&e), "chat", &junk).err(),
+            Some(SEALED_REFUSED)
+        );
+    }
+
+    /// The relay replays a captured request. It must be refused BEFORE a job
+    /// runs: a second answer under the same key and nonces breaks AES-GCM.
+    #[test]
+    fn a_replayed_sealed_job_is_refused_before_anything_runs() {
+        let e = envelope();
+        let mut g = guard();
+        assert!(
+            open_sealed_job(Some(&e), "chat", &sealed_payload(), SEALED_AT + 1, &mut g).is_ok()
+        );
+        assert_eq!(
+            open_sealed_job(Some(&e), "chat", &sealed_payload(), SEALED_AT + 2, &mut g).err(),
+            Some(SEALED_REFUSED)
+        );
+        // Stale, or from before this process started: refused as well.
+        assert_eq!(
+            open_sealed_job(
+                Some(&e),
+                "chat",
+                &sealed_payload(),
+                SEALED_AT + 10_000,
+                &mut guard()
+            )
+            .err(),
+            Some(SEALED_REFUSED)
+        );
+        let mut restarted = crate::envelope::ReplayGuard::new(SEALED_AT + 5);
+        assert_eq!(
+            open_sealed_job(
+                Some(&e),
+                "chat",
+                &sealed_payload(),
+                SEALED_AT + 6,
+                &mut restarted
+            )
+            .err(),
+            Some(SEALED_REFUSED)
+        );
+        // The timestamp is authenticated: a relay cannot freshen it.
+        let mut freshened = sealed_payload();
+        freshened["sealed"]["ts"] = json!(SEALED_AT + 9_000);
+        assert_eq!(
+            open_sealed_job(
+                Some(&e),
+                "chat",
+                &freshened,
+                SEALED_AT + 9_001,
+                &mut guard()
+            )
+            .err(),
+            Some(SEALED_REFUSED)
+        );
+    }
+
+    /// Every frame that can carry content is sealed, in order, and nothing
+    /// readable is left beside the ciphertext.
+    #[test]
+    fn everything_a_sealed_job_sends_back_is_sealed() {
+        let (_, mut sealer) = open_now(Some(&envelope()), "chat", &sealed_payload()).unwrap();
+        let chunk = seal_job_frame(
+            &mut sealer,
+            json!({"type": "chunk", "id": "j", "data": {"choices": [{"delta": {"content": "secret answer"}}]}}),
+        );
+        assert_eq!(chunk["id"], "j");
+        assert_eq!(chunk["data"]["sealed"]["n"], 0);
+        assert_eq!(chunk["data"]["sealed"]["k"], "chunk");
+        assert!(!chunk.to_string().contains("secret answer"));
+        let err = seal_job_frame(
+            &mut sealer,
+            json!({"type": "error", "id": "j", "message": "upstream said: your prompt 'secret' was too long"}),
+        );
+        assert!(!err.to_string().contains("secret"));
+        assert_eq!(err["sealed"]["n"], 1);
+        assert_eq!(err["sealed"]["k"], "error");
+        let done = seal_job_frame(
+            &mut sealer,
+            json!({"type": "done", "id": "j", "data": null}),
+        );
+        assert_eq!(done["data"]["sealed"]["n"], 2);
+        // Frames with no content pass through untouched.
+        let other = json!({"type": "pong"});
+        assert_eq!(seal_job_frame(&mut sealer, other.clone()), other);
+    }
+}
+
+#[cfg(test)]
+mod gateway_tls_tests {
+    //! Audit F7: the node would talk to its gateway in the clear.
+    //!
+    //! `gateway_url.replacen("http", "ws", 1)` turned http into ws with no
+    //! comment and no check, so a misconfigured PROVIDER_GATEWAY_URL simply
+    //! worked. That channel carries the node's registration token and the job
+    //! frames that decide what `docker run` is handed, so in plaintext both
+    //! are readable AND writable by anyone on the path.
+
+    use super::*;
+
+    #[test]
+    fn https_is_always_fine() {
+        assert!(check_gateway_url("https://fabric.kmplify.io").is_ok());
+        assert!(check_gateway_url("https://fabric.kmplify.io/").is_ok());
+        assert!(check_gateway_url("https://gw.example.com:8443/base").is_ok());
+    }
+
+    #[test]
+    fn plaintext_to_a_public_address_is_refused() {
+        for url in [
+            "http://fabric.kmplify.io",
+            "http://example.com/fabric",
+            "http://8.8.8.8:9000",
+        ] {
+            let err = check_gateway_url(url).expect_err("{url} should be refused");
+            assert!(
+                err.contains("plaintext"),
+                "unhelpful error for {url}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn plaintext_to_loopback_and_lan_still_works() {
+        // A LAN cluster's master and a developer's own box are real, and
+        // neither leaves the building. Refusing these would push people to
+        // disable the check rather than fix anything.
+        for url in [
+            "http://localhost:4321",
+            "http://127.0.0.1:4321/fabric",
+            "http://[::1]:4321",
+            "http://192.168.1.42:18100",
+            "http://10.1.2.3:8080",
+            "http://172.16.5.4:8080",
+            "http://mymachine.local:4321",
+        ] {
+            assert!(
+                check_gateway_url(url).is_ok(),
+                "{url} was refused but is local/private"
+            );
+        }
+    }
+
+    #[test]
+    fn a_public_host_cannot_hide_behind_userinfo() {
+        // http://127.0.0.1@evil.example.com/ connects to evil.example.com.
+        // Parsing the host as "everything before the first colon" would read
+        // it as loopback and wave it through.
+        let err = check_gateway_url("http://127.0.0.1@evil.example.com/fabric")
+            .expect_err("userinfo must not disguise the host");
+        assert!(err.contains("plaintext"), "{err}");
+    }
+
+    #[test]
+    fn a_public_host_cannot_hide_behind_a_path() {
+        let err = check_gateway_url("http://evil.example.com/127.0.0.1")
+            .expect_err("a path must not be read as the host");
+        assert!(err.contains("plaintext"), "{err}");
+    }
+
+    #[test]
+    fn nonsense_is_refused_rather_than_assumed() {
+        assert!(check_gateway_url("").is_err());
+        assert!(check_gateway_url("   ").is_err());
+        assert!(check_gateway_url("fabric.kmplify.io").is_err());
+        assert!(check_gateway_url("ws://fabric.kmplify.io").is_err());
+        assert!(check_gateway_url("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn the_shipped_default_passes_its_own_rule() {
+        // If the public fabric URL ever changed to http, this is the test that
+        // would say so rather than every node silently going plaintext.
+        assert!(check_gateway_url(crate::PUBLIC_FABRIC_URL).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod disk_measure_tests {
+    use super::*;
+
+    /// The fallback runs unattended on a provider's machine, so it must mount
+    /// nothing but fabric volumes, read-only, with no network and no pull.
+    #[test]
+    fn du_fallback_mounts_only_fabric_volumes_read_only() {
+        let vols = vec![
+            "kmplify-fabric-comfyui-models".to_string(),
+            "kmplify-fabric-ollama".to_string(),
+        ];
+        let args = du_measure_args(&vols);
+        let mounts: Vec<&String> = args.iter().filter(|a| a.contains(":/v/")).collect();
+        assert_eq!(mounts.len(), 2);
+        for m in mounts {
+            assert!(m.starts_with("kmplify-fabric-"), "{m}");
+            assert!(m.ends_with(":ro"), "{m}");
+        }
+        assert!(args.windows(2).any(|w| w[0] == "--pull" && w[1] == "never"));
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "--network" && w[1] == "none"));
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "--cap-drop" && w[1] == "ALL"));
+        assert!(args.contains(&"alpine:3.20".to_string()));
+        assert!(args.last().unwrap().starts_with("du -sk /v/*"));
+    }
+
+    /// No fabric volumes means nothing to mount: the caller short-circuits to
+    /// zero, and the arg builder must not produce a bare `-v`.
+    #[test]
+    fn du_fallback_with_no_volumes_mounts_nothing() {
+        let args = du_measure_args(&[]);
+        assert!(!args.iter().any(|a| a == "-v"));
+    }
+
+    /// du reports KiB; docker reports SI megabytes. The two measures feed
+    /// the same disk_used_mb, so they have to agree on the unit.
+    #[test]
+    fn du_total_is_reported_in_docker_units() {
+        assert_eq!(parse_du_total_mb("0\n").unwrap(), 0);
+        // 1 GiB of KiB blocks is 1074 SI megabytes, which is what
+        // `docker system df` prints for the same bytes.
+        assert_eq!(parse_du_total_mb("1048576\n").unwrap(), 1074);
+        assert!(parse_du_total_mb("du: cannot access").is_err());
+        assert!(parse_du_total_mb("").is_err());
+    }
+}
+
+#[cfg(test)]
+mod close_frame_tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+
+    /// 4003 is the one close an operator can fix; it must be spelled out.
+    #[test]
+    fn superseded_close_names_the_duplicate_identity() {
+        let f = CloseFrame {
+            code: CloseCode::from(SUPERSEDED_CLOSE_CODE),
+            reason: "".into(),
+        };
+        let msg = describe_close(Some(&f));
+        assert!(msg.contains("identity"), "{msg}");
+        assert!(msg.contains("KMPLIFY_NODE_DIR"), "{msg}");
+    }
+
+    /// Every other close carries its code and reason through unchanged.
+    #[test]
+    fn other_closes_carry_code_and_reason() {
+        let f = CloseFrame {
+            code: CloseCode::from(4002),
+            reason: "no pong".into(),
+        };
+        assert_eq!(
+            describe_close(Some(&f)),
+            "gateway closed the connection (4002: no pong)"
+        );
+        let f = CloseFrame {
+            code: CloseCode::from(4002),
+            reason: "".into(),
+        };
+        assert_eq!(
+            describe_close(Some(&f)),
+            "gateway closed the connection (4002)"
+        );
+        assert_eq!(describe_close(None), "connection closed");
     }
 }
