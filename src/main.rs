@@ -539,6 +539,12 @@ fn render_check_text(cfg: &WorkerConfig, pf: &Preflight) {
     println!();
     println!("configuration");
     println!("  gateway    : {}", cfg.gateway_url);
+    if let Err(e) = fabric_worker::check_gateway_url(&cfg.gateway_url) {
+        // Printed here as well as enforced at startup, so `kmplify-node check`
+        // (which the installer runs) reports it while the operator is still
+        // watching, rather than at the first silent refusal to start.
+        println!("               ^ REFUSED: {e}");
+    }
     println!("  creds      : {}", cfg.creds_path.display());
     println!("  ollama     : {}", cfg.ollama_base);
     if !cfg.colibri_base.is_empty() {
@@ -1489,6 +1495,13 @@ impl Node {
 
 /// Join the fabric and serve until told to stop. Returns the exit code.
 async fn serve(cfg: WorkerConfig, dir: PathBuf) -> i32 {
+    if let Err(e) = fabric_worker::check_gateway_url(&cfg.gateway_url) {
+        // Before ensure_identity, which is the call that would hand the token
+        // over. Exits non-zero so a service manager reports a failed unit
+        // rather than restarting into the same misconfiguration forever.
+        eprintln!("\nERROR: {e}");
+        return EXIT_UNUSABLE;
+    }
     println!("[kmplify-node] joining {}", cfg.gateway_url);
     let node = start_node(cfg, dir).await;
     let snap = status::snapshot();
