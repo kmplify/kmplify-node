@@ -12,6 +12,9 @@ fabric_node.json
 /dist-node
 /dist
 
+# Release installers (.dmg, .msi, ...) are release assets, never source.
+/out
+
 # The catalog modules' own build output. The .wasm the fabric serves is
 # committed in the GATEWAY's repository (it is what gets signed); what lives
 # here is the source that produces it.
