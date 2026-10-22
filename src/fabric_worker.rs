@@ -208,6 +208,35 @@ const PULL_HEARTBEAT: Duration = Duration::from_secs(20);
 /// Docker daemon liveness probe. Short: it runs on the telemetry path, and a
 /// daemon that cannot answer in this long is not one that can pull an image.
 const DOCKER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The gateway's close code 4003 means a second process connected with this
+/// node's identity (kmplify-gpu-fabric docs/PROTOCOL.md): the two evict each
+/// other for as long as both run, so the message names the cure rather than
+/// the symptom.
+pub const SUPERSEDED_CLOSE_CODE: u16 = 4003;
+
+fn describe_close(frame: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame>) -> String {
+    match frame {
+        Some(f) if u16::from(f.code) == SUPERSEDED_CLOSE_CODE => {
+            "another process connected with this node's identity and took the link over \
+             (gateway close 4003): two kmplify-nodes are running from one node directory, \
+             or KMPLIFY Desktop is lending the same fabric_node.json. Stop one of them, or \
+             give it its own KMPLIFY_NODE_DIR so it registers an identity of its own"
+                .to_string()
+        }
+        Some(f) => {
+            let reason = f.reason.trim();
+            if reason.is_empty() {
+                format!("gateway closed the connection ({})", u16::from(f.code))
+            } else {
+                format!(
+                    "gateway closed the connection ({}: {reason})",
+                    u16::from(f.code)
+                )
+            }
+        }
+        None => "connection closed".to_string(),
+    }
+}
 /// Telemetry refreshes between disk/image inventory samples. At a 10s ping
 /// that is roughly once a minute — often enough to notice a large download,
 /// rare enough that `docker system df` is not scanning a provider's disk
@@ -2279,6 +2308,27 @@ pub struct TemplatePin {
     pub network: Network,
 }
 
+/// The uid:gid a template's container runs as, when the image cannot be left
+/// to pick its own.
+///
+/// Sessions run with every capability dropped and `no-new-privileges`, so an
+/// entrypoint that starts as root and then switches to its service user
+/// (`chroot --userspec`, gosu, su-exec: all need CAP_SETUID/SETGID) dies at
+/// the switch instead of serving. floci is exactly that image: its
+/// entrypoint re-executes itself as uid 1001 and exits 1 under our flags
+/// ("failed switching to floci", seen live on EX44). Starting the container
+/// AS that user skips the switch: the entrypoint sees a non-root uid and
+/// falls straight through to the server. Strictly less privilege than the
+/// image asked for, never more. The state volume is mounted where the image
+/// already owns a directory for uid 1001 (`/app/data`), so a fresh named
+/// volume inherits writable ownership from the image on first mount.
+pub(crate) fn run_as_user(template: &str) -> Option<&'static str> {
+    match template {
+        "floci" | "floci-azure" | "floci-gcp" | "floci-oci" => Some("1001:0"),
+        _ => None,
+    }
+}
+
 /// What a workload container may reach.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Network {
@@ -2381,6 +2431,26 @@ pub const IMAGE_PINS: &[TemplatePin] = &[
     TemplatePin {
         template: "floci",
         repository: "floci/floci",
+        accelerator: Backend::Cpu,
+        network: Network::None,
+    },
+    // The same emulator family for the other three clouds: Azure, Google
+    // Cloud and Oracle. Identical contract (uid 1001, /app/data, sealed).
+    TemplatePin {
+        template: "floci-azure",
+        repository: "floci/floci-az",
+        accelerator: Backend::Cpu,
+        network: Network::None,
+    },
+    TemplatePin {
+        template: "floci-gcp",
+        repository: "floci/floci-gcp",
+        accelerator: Backend::Cpu,
+        network: Network::None,
+    },
+    TemplatePin {
+        template: "floci-oci",
+        repository: "floci/floci-oci",
         accelerator: Backend::Cpu,
         network: Network::None,
     },
@@ -2814,6 +2884,28 @@ pub async fn fabric_disk_used_mb() -> Option<u64> {
 /// had chosen to share everything, and there was nothing anywhere to say
 /// otherwise. Silence is the one thing a capacity signal must never be.
 async fn measure_fabric_disk() -> Result<u64, String> {
+    let df_err = match measure_fabric_disk_via_df().await {
+        Ok(mb) => return Ok(mb),
+        Err(e) => e,
+    };
+    // `docker system df -v` sizes EVERY container and image on the daemon
+    // before it reaches the volumes, and one container whose snapshot the
+    // daemon cannot measure fails the whole report. Seen on Docker Desktop
+    // (containerd snapshotter) as "snapshotter.Usage failed for <id>: ls"
+    // while a stack container was mid-boot: the fabric volumes were fine,
+    // the report just never got to them, and the hello went out with no
+    // disk figure and an inventory_error instead. So measure the volumes
+    // directly: one throwaway container with ONLY the fabric volumes
+    // mounted, read-only, asking `du`. That costs a container spawn, which
+    // is why it is the fallback rather than the default.
+    match measure_fabric_disk_via_du().await {
+        Ok(mb) => Ok(mb),
+        Err(du_err) => Err(format!("{df_err}; direct measure failed too: {du_err}")),
+    }
+}
+
+/// The cheap path: Docker's own per-volume sizes, no filesystem walk of ours.
+async fn measure_fabric_disk_via_df() -> Result<u64, String> {
     let out = crate::proc::command("docker")
         .args(["system", "df", "-v", "--format", "{{json .Volumes}}"])
         .output()
@@ -2863,6 +2955,130 @@ fn parse_docker_size_mb(s: &str) -> u64 {
         _ => return 0,
     };
     mb.round().max(0.0) as u64
+}
+
+/// Longest a direct `du` over the fabric volumes may take. Generous: the
+/// model stores hold few, large files and walk in seconds, but an install
+/// volume with a hundred thousand small files on a busy disk takes longer,
+/// and a measure that gives up too early is a measure that lies.
+const DU_MEASURE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The fabric's volumes, as Docker lists them. Name-filtered by Docker and
+/// then AGAIN by `is_fabric_volume`: `--filter name=` is a substring match,
+/// and only names that pass the mount rule are ever handed to `-v`.
+async fn fabric_volume_names() -> Result<Vec<String>, String> {
+    let out = crate::proc::command("docker")
+        .args([
+            "volume",
+            "ls",
+            "--filter",
+            "name=kmplify-fabric-",
+            "--format",
+            "{{.Name}}",
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("docker unavailable: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "docker volume ls failed: {}",
+            stderr_excerpt(&out.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| is_fabric_volume(l, "/v"))
+        .collect())
+}
+
+/// Arguments for the measuring container: every fabric volume read-only
+/// under /v, nothing else mounted, no network, no capabilities, and
+/// `--pull never` so a missing alpine is an error here rather than a
+/// surprise download on the telemetry path. Pure, so the mount list is
+/// testable.
+fn du_measure_args(volumes: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--memory",
+        "128m",
+        "--pids-limit",
+        "32",
+        "--pull",
+        "never",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    for v in volumes {
+        args.push("-v".into());
+        args.push(format!("{v}:/v/{v}:ro"));
+    }
+    args.push("alpine:3.20".into());
+    args.push("sh".into());
+    args.push("-c".into());
+    // One figure, in KiB: du's per-volume lines summed. stderr is dropped
+    // because a file vanishing mid-walk is a warning, not a failed measure.
+    args.push("du -sk /v/* 2>/dev/null | awk '{s+=$1} END {print s+0}'".into());
+    args
+}
+
+/// The direct measurement `measure_fabric_disk` falls back to.
+async fn measure_fabric_disk_via_du() -> Result<u64, String> {
+    let volumes = fabric_volume_names().await?;
+    if volumes.is_empty() {
+        return Ok(0);
+    }
+    let args = du_measure_args(&volumes);
+    let run = crate::proc::command("docker")
+        .args(&args)
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(DU_MEASURE_TIMEOUT, run)
+        .await
+        .map_err(|_| {
+            format!(
+                "du over {} fabric volume(s) took longer than {}s",
+                volumes.len(),
+                DU_MEASURE_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| format!("docker unavailable: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "docker run (du) failed: {}",
+            stderr_excerpt(&out.stderr)
+        ));
+    }
+    parse_du_total_mb(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// du's KiB total as SI megabytes, the unit `docker system df` reports in,
+/// so the two paths agree on what "used" means.
+fn parse_du_total_mb(stdout: &str) -> Result<u64, String> {
+    let kib: u64 = stdout.trim().parse().map_err(|_| {
+        format!(
+            "unexpected du output: {:?}",
+            stdout.trim().chars().take(80).collect::<String>()
+        )
+    })?;
+    Ok(((kib as f64 * 1024.0) / 1_000_000.0).round() as u64)
+}
+
+/// The start of a subprocess's stderr, for an error message.
+fn stderr_excerpt(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .trim()
+        .chars()
+        .take(160)
+        .collect()
 }
 
 /// Fetch a model the consumer asked for into this machine's model store.
@@ -4041,6 +4257,12 @@ async fn start_workload(
                 return;
             }
         }
+    } else if let Some(user) = run_as_user(&template) {
+        // The emulator family's entrypoint needs its service user (uid 1001):
+        // with --cap-drop ALL it cannot switch from root itself. Pinned here so
+        // it holds even when the gateway's frame carries no `user`.
+        args.push("--user".into());
+        args.push(user.into());
     }
     if isolation == Isolation::Gvisor {
         args.push("--runtime".into());
@@ -5967,7 +6189,16 @@ async fn session(
                     }
                     continue;
                 }
-                let Message::Text(text) = msg else { continue };
+                // A close frame says WHY the gateway hung up, and the one
+                // reason an operator can act on is 4003: another process
+                // presented this node's identity and took the link over.
+                // Reported as such rather than as a bare "connection closed"
+                // followed by an endless reconnect duel.
+                let text = match msg {
+                    Message::Text(t) => t,
+                    Message::Close(frame) => break Err(describe_close(frame.as_ref())),
+                    _ => continue,
+                };
                 let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue };
                 match frame["type"].as_str() {
                     Some("ping") => {
@@ -7299,6 +7530,18 @@ mod template_accelerator_tests {
             for t in hostable_templates(b) {
                 assert!(IMAGE_PINS.iter().any(|p| p.template == t), "{t} unpinned");
             }
+        }
+    }
+
+    #[test]
+    fn floci_runs_as_its_service_user_never_root() {
+        // cap-drop ALL breaks root-then-switch entrypoints; floci starts as
+        // uid 1001 directly and every other template keeps the image default.
+        for t in ["floci", "floci-azure", "floci-gcp", "floci-oci"] {
+            assert_eq!(super::run_as_user(t), Some("1001:0"), "{t}");
+        }
+        for t in ["ollama-cpu", "n8n", "jupyter", "echo-test", "speaches-cpu"] {
+            assert_eq!(super::run_as_user(t), None, "{t}");
         }
     }
 }
@@ -8755,5 +8998,97 @@ mod gateway_tls_tests {
         // If the public fabric URL ever changed to http, this is the test that
         // would say so rather than every node silently going plaintext.
         assert!(check_gateway_url(crate::PUBLIC_FABRIC_URL).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod disk_measure_tests {
+    use super::*;
+
+    /// The fallback runs unattended on a provider's machine, so it must mount
+    /// nothing but fabric volumes, read-only, with no network and no pull.
+    #[test]
+    fn du_fallback_mounts_only_fabric_volumes_read_only() {
+        let vols = vec![
+            "kmplify-fabric-comfyui-models".to_string(),
+            "kmplify-fabric-ollama".to_string(),
+        ];
+        let args = du_measure_args(&vols);
+        let mounts: Vec<&String> = args.iter().filter(|a| a.contains(":/v/")).collect();
+        assert_eq!(mounts.len(), 2);
+        for m in mounts {
+            assert!(m.starts_with("kmplify-fabric-"), "{m}");
+            assert!(m.ends_with(":ro"), "{m}");
+        }
+        assert!(args.windows(2).any(|w| w[0] == "--pull" && w[1] == "never"));
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "--network" && w[1] == "none"));
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "--cap-drop" && w[1] == "ALL"));
+        assert!(args.contains(&"alpine:3.20".to_string()));
+        assert!(args.last().unwrap().starts_with("du -sk /v/*"));
+    }
+
+    /// No fabric volumes means nothing to mount: the caller short-circuits to
+    /// zero, and the arg builder must not produce a bare `-v`.
+    #[test]
+    fn du_fallback_with_no_volumes_mounts_nothing() {
+        let args = du_measure_args(&[]);
+        assert!(!args.iter().any(|a| a == "-v"));
+    }
+
+    /// du reports KiB; docker reports SI megabytes. The two measures feed
+    /// the same disk_used_mb, so they have to agree on the unit.
+    #[test]
+    fn du_total_is_reported_in_docker_units() {
+        assert_eq!(parse_du_total_mb("0\n").unwrap(), 0);
+        // 1 GiB of KiB blocks is 1074 SI megabytes, which is what
+        // `docker system df` prints for the same bytes.
+        assert_eq!(parse_du_total_mb("1048576\n").unwrap(), 1074);
+        assert!(parse_du_total_mb("du: cannot access").is_err());
+        assert!(parse_du_total_mb("").is_err());
+    }
+}
+
+#[cfg(test)]
+mod close_frame_tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+
+    /// 4003 is the one close an operator can fix; it must be spelled out.
+    #[test]
+    fn superseded_close_names_the_duplicate_identity() {
+        let f = CloseFrame {
+            code: CloseCode::from(SUPERSEDED_CLOSE_CODE),
+            reason: "".into(),
+        };
+        let msg = describe_close(Some(&f));
+        assert!(msg.contains("identity"), "{msg}");
+        assert!(msg.contains("KMPLIFY_NODE_DIR"), "{msg}");
+    }
+
+    /// Every other close carries its code and reason through unchanged.
+    #[test]
+    fn other_closes_carry_code_and_reason() {
+        let f = CloseFrame {
+            code: CloseCode::from(4002),
+            reason: "no pong".into(),
+        };
+        assert_eq!(
+            describe_close(Some(&f)),
+            "gateway closed the connection (4002: no pong)"
+        );
+        let f = CloseFrame {
+            code: CloseCode::from(4002),
+            reason: "".into(),
+        };
+        assert_eq!(
+            describe_close(Some(&f)),
+            "gateway closed the connection (4002)"
+        );
+        assert_eq!(describe_close(None), "connection closed");
     }
 }
