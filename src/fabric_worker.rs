@@ -588,6 +588,7 @@ impl Default for WorkerConfig {
             workload_templates: Vec::new(),
             max_shared_cpus: None,
             max_shared_vram_mb: None,
+            max_inference_jobs: None,
             max_shared_ram_mb: None,
             max_shared_disk_gb: None,
             share_inference: true,
@@ -664,6 +665,12 @@ pub struct WorkerConfig {
     /// VRAM accounting use — so lending less genuinely means peers can place
     /// less here, rather than being asked politely not to.
     pub max_shared_vram_mb: Option<u64>,
+    /// Inference jobs this node takes at once from the pool (protocol
+    /// v3.8, `PROVIDER_MAX_INFERENCE_JOBS`). None = the default of 4 per
+    /// accelerator (what Ollama runs in parallel before it queues), 2 on a
+    /// CPU-only host. A consumer the gateway already bound to this node is
+    /// not held to it; it stops NEW consumers landing on a saturated node.
+    pub max_inference_jobs: Option<u32>,
     /// Ceiling on system RAM advertised in the cpu_share block, from the
     /// sharing settings. None = advertise the machine's total.
     pub max_shared_ram_mb: Option<u64>,
@@ -1169,6 +1176,14 @@ fn models_from_openai(body: &Value) -> Vec<String> {
 /// leaving every deployed desktop install on byte-for-byte the path it used
 /// before this fallback existed.
 pub async fn local_models(client: &reqwest::Client, ollama_base: &str) -> Vec<String> {
+    local_models_kind(client, ollama_base).await.0
+}
+
+/// The models at `ollama_base`, and whether Ollama's own API answered
+/// (`true`) or only the OpenAI-compatible listing did (`false`). Jobs for a
+/// server that is not Ollama (vLLM, llama.cpp server, LM Studio, …) must
+/// never be sent Ollama's `/api/chat` or its `keep_alive` field.
+pub async fn local_models_kind(client: &reqwest::Client, ollama_base: &str) -> (Vec<String>, bool) {
     let native = client.get(format!("{ollama_base}/api/tags")).send().await;
     let native_err = match native {
         // Status is checked explicitly: vLLM answers /api/tags with a JSON
@@ -1182,7 +1197,9 @@ pub async fn local_models(client: &reqwest::Client, ollama_base: &str) -> Vec<St
             // old early-return took that as "an Ollama with no models" and
             // the /v1/models fallback below became unreachable — a node
             // pointed at LM Studio advertised nothing, silently.
-            Ok(body) if body.get("models").is_some() => return models_from_native(&body),
+            Ok(body) if body.get("models").is_some() => {
+                return (models_from_native(&body), true);
+            }
             Ok(_) => "200 without a model list (not an Ollama)".to_string(),
             Err(e) => format!("unreadable body: {e}"),
         },
@@ -1192,13 +1209,13 @@ pub async fn local_models(client: &reqwest::Client, ollama_base: &str) -> Vec<St
 
     match client.get(format!("{ollama_base}/v1/models")).send().await {
         Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
-            Ok(body) => models_from_openai(&body),
+            Ok(body) => (models_from_openai(&body), false),
             Err(e) => {
                 log(format!(
                     "cannot list models at {ollama_base} — /api/tags: {native_err}; \
                      /v1/models: unreadable body: {e}"
                 ));
-                Vec::new()
+                (Vec::new(), false)
             }
         },
         other => {
@@ -1212,7 +1229,7 @@ pub async fn local_models(client: &reqwest::Client, ollama_base: &str) -> Vec<St
                 "cannot list models at {ollama_base} — /api/tags: {native_err}; \
                  /v1/models: {compat_err}"
             ));
-            Vec::new()
+            (Vec::new(), false)
         }
     }
 }
@@ -1272,7 +1289,17 @@ pub async fn discover(
     client: &reqwest::Client,
     cfg: &WorkerConfig,
 ) -> (Vec<String>, std::collections::HashMap<String, String>) {
-    let primary = local_models(client, &cfg.ollama_base).await;
+    let (models, engines, _) = discover_kind(client, cfg).await;
+    (models, engines)
+}
+
+/// `discover` plus whether the primary upstream speaks only the OpenAI
+/// shape (`true` when `/api/tags` did not answer and `/v1/models` did).
+pub async fn discover_kind(
+    client: &reqwest::Client,
+    cfg: &WorkerConfig,
+) -> (Vec<String>, std::collections::HashMap<String, String>, bool) {
+    let (primary, is_ollama) = local_models_kind(client, &cfg.ollama_base).await;
     let colibri = colibri_models(client, &cfg.colibri_base, &cfg.colibri_api_key).await;
     let mut engines = std::collections::HashMap::new();
     let mut all = primary.clone();
@@ -1282,7 +1309,7 @@ pub async fn discover(
             all.push(m);
         }
     }
-    (all, engines)
+    (all, engines, !is_ollama)
 }
 
 /// Total VRAM of GPU 0 in MB via nvidia-smi, or None. The one number the
@@ -1417,11 +1444,32 @@ async fn gpu_info(backend: crate::gpu::Backend, max_shared_vram_mb: Option<u64>)
             // Advertise only what the operator agreed to lend, and never
             // MORE than the card holds whatever the setting says:
             // over-advertising wins the node sessions it cannot then run.
-            let vram = match max_shared_vram_mb {
-                Some(cap) if cap > 0 => g.total_mb.min(cap),
-                _ => g.total_mb,
+            let cap = |mb: u64| match max_shared_vram_mb {
+                Some(cap) if cap > 0 => mb.min(cap),
+                _ => mb,
             };
-            return json!({ "backend": g.backend.as_str(), "name": g.name, "vram_mb": vram });
+            // Every device (v3.8), the operator's ceiling applied per card:
+            // the ceiling is "how much of a card peers may use", and a rig
+            // owner who lends 20 GB of each 24 GB card means it eight times.
+            let gpus: Vec<Value> = g
+                .devices
+                .iter()
+                .map(|d| {
+                    json!({
+                        "index": d.index,
+                        "name": d.name,
+                        "vram_mb": cap(d.total_mb),
+                        "backend": g.backend.as_str(),
+                    })
+                })
+                .collect();
+            return json!({
+                "backend": g.backend.as_str(),
+                "name": g.name,
+                "vram_mb": cap(g.total_mb),
+                "gpus": gpus,
+                "gpu_count": g.devices.len().max(1),
+            });
         }
         // Configured for an accelerator the probe cannot see. Report CPU
         // rather than a card with 0 MB: the scheduler treats vram_mb as
@@ -1440,6 +1488,21 @@ async fn gpu_info(backend: crate::gpu::Backend, max_shared_vram_mb: Option<u64>)
         model
     };
     json!({ "backend": "cpu", "name": name, "vram_mb": 0 })
+}
+
+/// How many inference jobs this node accepts at once from the pool
+/// (protocol v3.8). The operator's number when set; else 4 per accelerator
+/// (Ollama's parallel default before requests queue) and 2 on a CPU-only
+/// host, where a third parallel generation only makes all of them slower.
+pub(crate) fn inference_slots(cfg: &WorkerConfig, gpu_count: usize) -> u32 {
+    if let Some(n) = cfg.max_inference_jobs {
+        return n.max(1);
+    }
+    if cfg.accel() == crate::gpu::Backend::Cpu {
+        2
+    } else {
+        4 * gpu_count.max(1) as u32
+    }
 }
 
 /// Static CPU/RAM facts for the hello frame.
@@ -1942,6 +2005,9 @@ type Sessions = Arc<Mutex<std::collections::HashMap<String, (String, u16)>>>;
 #[derive(Default)]
 struct Telemetry {
     gpu_used_mb: Option<u64>,
+    /// Used MB per accelerator, index order (v3.8). Empty on CPU-only hosts
+    /// and when the vendor tool did not answer.
+    gpus_used_mb: Vec<u64>,
     loaded_models: Vec<Value>,
     /// Model names to advertise. Cached here for the same reason as the rest:
     /// the read loop must never wait on Ollama.
@@ -4042,7 +4108,10 @@ async fn start_workload(
     if let Some(need) = required {
         // Per vendor: --gpus all for CUDA, the kfd/dri devices for ROCm,
         // the render node for Intel. None of them widen the sandbox.
-        args.extend(need.docker_args());
+        // The gateway placed this session on ONE card of a multi-GPU box
+        // (`gpu_index`, v3.8): hand the container that card only.
+        let device = frame["gpu_index"].as_u64().map(|v| v as u32);
+        args.extend(need.docker_args_for(device));
     }
     // The named-volume mounts hoisted above, filtered by the same rule that
     // fed the prefetcher: fabric-namespaced named volumes only.
@@ -5070,6 +5139,9 @@ struct JobUpstreams {
     /// This node's envelope key and the identity it is bound to (protocol
     /// v5), None when the node has no identity key and so offers no envelope.
     envelope: Option<Arc<NodeEnvelope>>,
+    /// The primary is not Ollama (vLLM, llama.cpp server, LM Studio, …):
+    /// no `/api/chat`, no `keep_alive`, no `think`.
+    primary_openai_only: bool,
 }
 
 /// What a job needs to open a sealed request: the X25519 key, and the
@@ -5265,7 +5337,8 @@ async fn run_job(
     // is the only place the flag actually takes effect. Ollama-only: colibri
     // has no native endpoint and no hidden reasoning channel to suppress.
     let think = payload.get("think").and_then(Value::as_bool);
-    let native_think = kind == "chat" && think.is_some() && !is_colibri;
+    let openai_only = is_colibri || upstreams.primary_openai_only;
+    let native_think = kind == "chat" && think.is_some() && !openai_only;
     let path = if kind != "chat" {
         "/v1/embeddings"
     } else if native_think {
@@ -5280,12 +5353,12 @@ async fn run_job(
     };
     // keep_alive/num_ctx are Ollama residency knobs; colibri manages its own
     // expert cache and must not receive fields it never defined.
-    let mut payload = if is_colibri {
+    let mut payload = if openai_only {
         payload
     } else {
         keep_peer_model_warm(payload, path)
     };
-    if is_colibri {
+    if openai_only {
         if let Some(obj) = payload.as_object_mut() {
             obj.remove("think");
         }
@@ -5448,10 +5521,10 @@ async fn session(
     // `serving()` is the switch AND the dashboard's live pause: a paused node
     // stays connected, keeps its hosted sessions and its place in the
     // registry, and advertises nothing.
-    let (models, engines) = if serving(cfg) {
-        discover(client, cfg).await
+    let (models, engines, primary_openai_only) = if serving(cfg) {
+        discover_kind(client, cfg).await
     } else {
-        (Vec::new(), std::collections::HashMap::new())
+        (Vec::new(), std::collections::HashMap::new(), false)
     };
     if models.is_empty() && serving(cfg) {
         log("no local models — connecting anyway; jobs will be refused by scheduler");
@@ -5490,6 +5563,11 @@ async fn session(
         .map_err(|e| e.to_string())?;
     let (write, mut read) = ws.split();
     let sink = Arc::new(Mutex::new(write));
+    // Inference jobs in flight on this connection, by gateway job id, so a
+    // `cancel` frame can abort one (v3.8).
+    let inflight: Arc<
+        std::sync::Mutex<std::collections::HashMap<String, tokio::task::AbortHandle>>,
+    > = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     // Register as THE live connection, so frames from session tasks born on
     // an earlier one still reach the gateway (see current_sink_cell).
     *current_sink_cell().write().await = Some(sink.clone());
@@ -5520,6 +5598,15 @@ async fn session(
         (Some(e), Some(identity)) => e.key.attestation(&identity, crate::identity::now_s()),
         _ => Value::Null,
     };
+    let gpu_facts = gpu_info(cfg.accel(), cfg.max_shared_vram_mb).await;
+    let gpu_count = gpu_facts
+        .get("gpu_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(if cfg.accel() == crate::gpu::Backend::Cpu {
+            0
+        } else {
+            1
+        }) as usize;
     let hello = json!({
         "type": "hello",
         "node_id": creds.node_id,
@@ -5531,7 +5618,12 @@ async fn session(
         // Per-model upstream overrides ({model: "colibri"}, protocol v2.5).
         // Empty for single-upstream nodes; older gateways ignore the key.
         "engines": engines,
-        "gpu": gpu_info(cfg.accel(), cfg.max_shared_vram_mb).await,
+        "gpu": gpu_facts,
+        // Every accelerator and the parallel-job cap (v3.8). Older gateways
+        // ignore the three keys.
+        "gpus": gpu_facts.get("gpus").cloned().unwrap_or(Value::Array(Vec::new())),
+        "gpu_count": gpu_count,
+        "inference_slots": inference_slots(cfg, gpu_count),
         "workloads": workload_capability(
             cfg, docker_live, disk_live, &images_live, inventory_err.as_deref(), &runtimes_live,
         ),
@@ -5742,12 +5834,14 @@ async fn session(
         let accel = cfg.accel();
         tokio::spawn(async move {
             let used = crate::gpu::used_mb(accel).await;
+            let used_all = crate::gpu::used_mb_all(accel).await;
             let resident = loaded_models(&client, &base).await;
             let names = local_models(&client, &base).await;
             let (disk, imgs, err) = sample_inventory().await;
             let mut t = telemetry.lock().await;
             t.inventory_error = err;
             t.gpu_used_mb = used;
+            t.gpus_used_mb = used_all;
             t.loaded_models = resident;
             t.disk_used_mb = disk;
             t.images = imgs;
@@ -5905,6 +5999,9 @@ async fn session(
                             if let Some(used) = t.gpu_used_mb {
                                 p["gpu_used_mb"] = json!(used);
                             }
+                            if !t.gpus_used_mb.is_empty() {
+                                p["gpus_used_mb"] = json!(t.gpus_used_mb);
+                            }
                             // ALWAYS sent, empty included. The empty list is
                             // the news "nothing is resident anymore" — it was
                             // skipped here, so the gateway (which treats an
@@ -5956,6 +6053,7 @@ async fn session(
                             let accel = cfg.accel();
                             tokio::spawn(async move {
                                 let used = crate::gpu::used_mb(accel).await;
+                                let used_all = crate::gpu::used_mb_all(accel).await;
                                 let resident = loaded_models(&client, &base).await;
                                 let names = local_models(&client, &base).await;
                                 let dok = docker_ok().await;
@@ -5986,6 +6084,7 @@ async fn session(
                                     t.inventory_error = err;
                                 }
                                 t.gpu_used_mb = used;
+                                t.gpus_used_mb = used_all;
                                 t.loaded_models = resident;
                                 if !names.is_empty() {
                                     t.models = names;
@@ -6117,12 +6216,34 @@ async fn session(
                             colibri_api_key: cfg.colibri_api_key.clone(),
                             engines: current_engines.clone(),
                             envelope: node_envelope.clone(),
+                            primary_openai_only,
                         };
                         let (sink, client) = (sink.clone(), client.clone());
-                        tokio::spawn(async move {
-                            let _counted = crate::status::JobGuard::start(&model);
-                            run_job(sink, client, upstreams, frame).await;
+                        let job_id = frame["id"].as_str().unwrap_or_default().to_string();
+                        let running = inflight.clone();
+                        let handle = tokio::spawn({
+                            let job_id = job_id.clone();
+                            let running = running.clone();
+                            async move {
+                                let _counted = crate::status::JobGuard::start(&model);
+                                run_job(sink, client, upstreams, frame).await;
+                                running.lock().unwrap().remove(&job_id);
+                            }
                         });
+                        if !job_id.is_empty() {
+                            running.lock().unwrap().insert(job_id, handle.abort_handle());
+                        }
+                    }
+                    Some("cancel") => {
+                        // The consumer is gone (v3.8): the gateway released
+                        // its slot and asks this node to stop generating for
+                        // nobody. Aborting the task drops the upstream HTTP
+                        // stream, and Ollama stops on a closed connection.
+                        let job_id = frame["id"].as_str().unwrap_or_default();
+                        if let Some(h) = inflight.lock().unwrap().remove(job_id) {
+                            h.abort();
+                            log(format!("job {} cancelled: consumer left", &job_id[..job_id.len().min(8)]));
+                        }
                     }
                     Some("workload_start") => {
                         tokio::spawn(start_workload(sink.clone(), sessions.clone(), stopped.clone(), cfg.clone(), frame));
