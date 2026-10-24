@@ -612,6 +612,7 @@ impl Default for WorkerConfig {
             colibri_api_key: String::new(),
             vllm_model: String::new(),
             vllm_max_model_len: crate::vllm_managed::DEFAULT_MAX_MODEL_LEN,
+            vllm_tuning: crate::vllm_managed::Tuning::default(),
             creds_path: PathBuf::new(),
             country: String::new(),
             // Empty = container sessions off. The safe default: running other
@@ -678,6 +679,8 @@ pub struct WorkerConfig {
     /// (vllm_managed.rs). Started by `run` before joining the fabric.
     pub vllm_model: String,
     pub vllm_max_model_len: u32,
+    /// KV cache settings for that vLLM (fp8, GPU share, CPU offload).
+    pub vllm_tuning: crate::vllm_managed::Tuning,
     pub creds_path: PathBuf,
     /// ISO-3166-1 alpha-2 declared on the hello frame, or "" to declare
     /// nothing (the gateway then records "XX"). See PROTOCOL.md — it is

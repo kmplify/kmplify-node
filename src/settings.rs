@@ -81,6 +81,15 @@ pub struct Settings {
     /// That vLLM's context window (`KMPLIFY_VLLM_MAX_MODEL_LEN`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vllm_max_model_len: Option<u32>,
+    /// Its KV cache precision, auto or fp8 (`KMPLIFY_VLLM_KV_DTYPE`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vllm_kv_dtype: Option<String>,
+    /// Share of the GPU it may take, 0.50 to 0.95 (`KMPLIFY_VLLM_GPU_UTIL`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vllm_gpu_util: Option<f32>,
+    /// KV cache it may keep in system RAM, GiB, 0 = off (`KMPLIFY_VLLM_OFFLOAD_GB`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vllm_offload_gb: Option<u32>,
     /// Ceiling on logical CPUs lent to sessions (`PROVIDER_MAX_CPUS`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_cpus: Option<f64>,
@@ -140,6 +149,10 @@ pub const KEYS: &[(&str, &str)] = &[
     // ROCm GPU) and lends it; empty = no node-managed vLLM (vllm_managed.rs).
     ("vllm-model", "KMPLIFY_VLLM_MODEL"),
     ("vllm-max-model-len", "KMPLIFY_VLLM_MAX_MODEL_LEN"),
+    // How that vLLM holds its KV cache on this machine's GPU.
+    ("vllm-kv-dtype", "KMPLIFY_VLLM_KV_DTYPE"),
+    ("vllm-gpu-util", "KMPLIFY_VLLM_GPU_UTIL"),
+    ("vllm-offload-gb", "KMPLIFY_VLLM_OFFLOAD_GB"),
     ("max-cpus", "PROVIDER_MAX_CPUS"),
     ("max-vram-mb", "PROVIDER_MAX_VRAM_MB"),
     ("max-ram-mb", "PROVIDER_MAX_RAM_MB"),
@@ -217,6 +230,15 @@ impl Settings {
         }
         if let Some(v) = self.vllm_max_model_len {
             cfg.vllm_max_model_len = v;
+        }
+        if let Some(v) = &self.vllm_kv_dtype {
+            cfg.vllm_tuning.kv_dtype = v.clone();
+        }
+        if let Some(v) = self.vllm_gpu_util {
+            cfg.vllm_tuning.gpu_util = v;
+        }
+        if let Some(v) = self.vllm_offload_gb {
+            cfg.vllm_tuning.offload_gb = v;
         }
         // A ceiling of zero is how "lend none of this" is spelled on the way
         // in; the worker's contract for that is None (no explicit choice) for
@@ -441,6 +463,27 @@ impl Settings {
                 }
                 self.vllm_max_model_len = Some(n);
             }
+            "vllm-kv-dtype" => {
+                let v = value.to_ascii_lowercase();
+                if !crate::vllm_managed::valid_kv_dtype(&v) {
+                    return Err(format!("{key} must be auto or fp8"));
+                }
+                self.vllm_kv_dtype = Some(v);
+            }
+            "vllm-gpu-util" => {
+                let v = parse_num::<f32>(key, value)?;
+                if !crate::vllm_managed::valid_gpu_util(v) {
+                    return Err(format!("{key} must be between 0.50 and 0.95"));
+                }
+                self.vllm_gpu_util = Some(v);
+            }
+            "vllm-offload-gb" => {
+                let v = parse_num::<u32>(key, value)?;
+                if v > 256 {
+                    return Err(format!("{key} must be between 0 (off) and 256"));
+                }
+                self.vllm_offload_gb = Some(v);
+            }
             "max-cpus" => self.max_cpus = Some(parse_num::<f64>(key, value)?),
             "max-vram-mb" => self.max_vram_mb = Some(parse_capacity(key, value, Unit::Mb)?),
             "max-inference-jobs" => self.max_inference_jobs = Some(parse_num::<u32>(key, value)?),
@@ -485,6 +528,9 @@ impl Settings {
             "colibri-key" => self.colibri_api_key = None,
             "vllm-model" => self.vllm_model = None,
             "vllm-max-model-len" => self.vllm_max_model_len = None,
+            "vllm-kv-dtype" => self.vllm_kv_dtype = None,
+            "vllm-gpu-util" => self.vllm_gpu_util = None,
+            "vllm-offload-gb" => self.vllm_offload_gb = None,
             "max-cpus" => self.max_cpus = None,
             "max-vram-mb" => self.max_vram_mb = None,
             "max-inference-jobs" => self.max_inference_jobs = None,
@@ -535,6 +581,9 @@ impl Settings {
             "vllm-max-model-len",
             self.vllm_max_model_len.map(|v| v.to_string()),
         );
+        push("vllm-kv-dtype", self.vllm_kv_dtype.clone());
+        push("vllm-gpu-util", self.vllm_gpu_util.map(|v| format!("{v:.2}")));
+        push("vllm-offload-gb", self.vllm_offload_gb.map(|v| v.to_string()));
         push("max-cpus", self.max_cpus.map(|v| v.to_string()));
         push("max-vram-mb", self.max_vram_mb.map(|v| v.to_string()));
         push(
@@ -892,6 +941,8 @@ mod tests {
                 "colibri-key" => "k",
                 "vllm-model" => "Qwen/Qwen3-8B",
                 "vllm-max-model-len" => "65536",
+                "vllm-kv-dtype" => "fp8",
+                "vllm-gpu-util" => "0.8",
                 "workloads" => "ollama-cpu",
                 _ => "1",
             };
