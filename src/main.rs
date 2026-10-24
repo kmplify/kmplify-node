@@ -228,6 +228,10 @@ fn resolve_config(errs: &mut Vec<String>) -> WorkerConfig {
         colibri_api_key: env_opt("COLIBRI_API_KEY")
             .or_else(|| env_opt("PROVIDER_COLIBRI_API_KEY"))
             .unwrap_or_default(),
+        vllm_model: env_opt("KMPLIFY_VLLM_MODEL").unwrap_or_default(),
+        vllm_max_model_len: env_opt("KMPLIFY_VLLM_MAX_MODEL_LEN")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(kmplify_node::vllm_managed::DEFAULT_MAX_MODEL_LEN),
         creds_path: fabric_worker::default_creds_path(&dir),
         country,
         workload_templates: env_opt("PROVIDER_WORKLOADS")
@@ -1497,13 +1501,43 @@ impl Node {
 }
 
 /// Join the fabric and serve until told to stop. Returns the exit code.
-async fn serve(cfg: WorkerConfig, dir: PathBuf) -> i32 {
+async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
     if let Err(e) = fabric_worker::check_gateway_url(&cfg.gateway_url) {
         // Before ensure_identity, which is the call that would hand the token
         // over. Exits non-zero so a service manager reports a failed unit
         // rather than restarting into the same misconfiguration forever.
         eprintln!("\nERROR: {e}");
         return EXIT_UNUSABLE;
+    }
+    // `set vllm-model=<hf id>`: the node runs vLLM itself and lends it. A
+    // vLLM that cannot start leaves the configured engine in place, so the
+    // node still lends something; without the setting, a container a
+    // previous run left behind is removed.
+    let managed_vllm = !cfg.vllm_model.trim().is_empty();
+    if managed_vllm {
+        let (backend, _) = kmplify_node::gpu::detect().await;
+        println!(
+            "[kmplify-node] starting vLLM with {} (a first start downloads the engine and the model)…",
+            cfg.vllm_model
+        );
+        match kmplify_node::vllm_managed::start(
+            backend,
+            cfg.vllm_model.trim(),
+            cfg.vllm_max_model_len,
+        )
+        .await
+        {
+            Ok(base) => {
+                println!("[kmplify-node] vLLM is ready at {base}; lending it");
+                cfg.ollama_base = base;
+            }
+            Err(e) => eprintln!(
+                "[kmplify-node] vLLM did not start ({e}); lending {} instead",
+                cfg.ollama_base
+            ),
+        }
+    } else {
+        kmplify_node::vllm_managed::remove().await;
     }
     println!("[kmplify-node] joining {}", cfg.gateway_url);
     let node = start_node(cfg, dir).await;
@@ -1554,6 +1588,9 @@ async fn serve(cfg: WorkerConfig, dir: PathBuf) -> i32 {
             let _ = publisher.await;
             commands.abort();
             status::clear_published(&dir);
+            if managed_vllm {
+                kmplify_node::vllm_managed::remove().await;
+            }
             return code;
         }
         // A dashboard, here or attached, asking this node to stop.
@@ -1570,6 +1607,10 @@ async fn serve(cfg: WorkerConfig, dir: PathBuf) -> i32 {
     }
     .shutdown()
     .await;
+    // Nothing may keep running on the owner's GPU after the node stops.
+    if managed_vllm {
+        kmplify_node::vllm_managed::remove().await;
+    }
     println!("[kmplify-node] stopped cleanly");
     code
 }
