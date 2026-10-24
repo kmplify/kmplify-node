@@ -60,8 +60,37 @@ fn s(v: &[&str]) -> Vec<String> {
     v.iter().map(|x| x.to_string()).collect()
 }
 
+/// How vLLM holds its KV cache on this machine's GPU: the node twin of the
+/// desktop's Settings > KV Cache & Context (`kmplify-node set vllm-...`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tuning {
+    /// `auto` (the model's precision) or `fp8` (half the cache).
+    pub kv_dtype: String,
+    /// Share of the GPU vLLM may take, 0.50 to 0.95.
+    pub gpu_util: f32,
+    /// KV cache vLLM may keep in system RAM, in GiB; 0 = off.
+    pub offload_gb: u32,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self { kv_dtype: "auto".into(), gpu_util: DEFAULT_GPU_UTIL, offload_gb: 0 }
+    }
+}
+
+/// What the node passed before the setting existed.
+pub const DEFAULT_GPU_UTIL: f32 = 0.90;
+
+pub fn valid_kv_dtype(v: &str) -> bool {
+    matches!(v, "auto" | "fp8")
+}
+
+pub fn valid_gpu_util(v: f32) -> bool {
+    (0.5..=0.95).contains(&v)
+}
+
 /// `docker run` arguments (detached; the node stops it on exit).
-pub fn run_args(backend: Backend, model: &str, max_model_len: u32) -> Result<Vec<String>, String> {
+pub fn run_args(backend: Backend, model: &str, max_model_len: u32, tuning: &Tuning) -> Result<Vec<String>, String> {
     let (gpu, image): (Vec<String>, &str) = match backend {
         Backend::Cuda => (s(&["--gpus", "all"]), IMAGE_CUDA),
         Backend::Rocm => (
@@ -109,12 +138,18 @@ pub fn run_args(backend: Backend, model: &str, max_model_len: u32) -> Result<Vec
         "--max-model-len",
     ]));
     a.push(max_model_len.to_string());
-    a.extend(s(&[
-        "--gpu-memory-utilization",
-        "0.90",
-        "--enable-auto-tool-choice",
-        "--tool-call-parser",
-    ]));
+    a.extend(s(&["--gpu-memory-utilization"]));
+    let util = if valid_gpu_util(tuning.gpu_util) { tuning.gpu_util } else { DEFAULT_GPU_UTIL };
+    a.push(format!("{util:.2}"));
+    if tuning.kv_dtype == "fp8" {
+        a.extend(s(&["--kv-cache-dtype", "fp8"]));
+    }
+    if tuning.offload_gb > 0 {
+        a.extend(s(&["--kv-offloading-size"]));
+        a.push(tuning.offload_gb.to_string());
+        a.extend(s(&["--kv-offloading-backend", "native"]));
+    }
+    a.extend(s(&["--enable-auto-tool-choice", "--tool-call-parser"]));
     a.push(tool_call_parser(model).to_string());
     Ok(a)
 }
@@ -132,8 +167,8 @@ pub async fn remove() {
 
 /// Start vLLM for `model` and wait until it answers. Returns the base URL
 /// to lend (the node's `ollama_base` for this run).
-pub async fn start(backend: Backend, model: &str, max_model_len: u32) -> Result<String, String> {
-    let args = run_args(backend, model, max_model_len)?;
+pub async fn start(backend: Backend, model: &str, max_model_len: u32, tuning: &Tuning) -> Result<String, String> {
+    let args = run_args(backend, model, max_model_len, tuning)?;
     // Never two: a container left by a killed node holds the GPU and port.
     remove().await;
     let out = crate::proc::command("docker")
@@ -215,22 +250,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn kv_cache_tuning_reaches_vllm_and_the_default_is_unchanged() {
+        let d = run_args(Backend::Cuda, "Qwen/Qwen3-8B", 65536, &Tuning::default()).unwrap().join(" ");
+        assert!(d.contains("--gpu-memory-utilization 0.90"), "{d}");
+        assert!(!d.contains("--kv-cache-dtype") && !d.contains("--kv-offloading"), "{d}");
+        let t = Tuning { kv_dtype: "fp8".into(), gpu_util: 0.7, offload_gb: 16 };
+        let a = run_args(Backend::Cuda, "Qwen/Qwen3-8B", 65536, &t).unwrap().join(" ");
+        assert!(a.contains("--gpu-memory-utilization 0.70"), "{a}");
+        assert!(a.contains("--kv-cache-dtype fp8"), "{a}");
+        assert!(a.contains("--kv-offloading-size 16 --kv-offloading-backend native"), "{a}");
+    }
+
+    #[test]
     fn cuda_and_rocm_get_their_devices_and_pinned_images() {
-        let a = run_args(Backend::Cuda, "Qwen/Qwen3-8B", 65536).unwrap();
+        let a = run_args(Backend::Cuda, "Qwen/Qwen3-8B", 65536, &Tuning::default()).unwrap();
         assert!(a.windows(2).any(|w| w[0] == "--gpus" && w[1] == "all"));
         assert!(a.contains(&IMAGE_CUDA.to_string()) && IMAGE_CUDA.contains("@sha256:"));
-        let r = run_args(Backend::Rocm, "Qwen/Qwen3-8B", 65536).unwrap();
+        let r = run_args(Backend::Rocm, "Qwen/Qwen3-8B", 65536, &Tuning::default()).unwrap();
         assert!(r
             .windows(2)
             .any(|w| w[0] == "--device" && w[1] == "/dev/kfd"));
         assert!(r.contains(&IMAGE_ROCM.to_string()));
-        assert!(run_args(Backend::Metal, "Qwen/Qwen3-8B", 65536).is_err());
-        assert!(run_args(Backend::Cpu, "Qwen/Qwen3-8B", 65536).is_err());
+        assert!(run_args(Backend::Metal, "Qwen/Qwen3-8B", 65536, &Tuning::default()).is_err());
+        assert!(run_args(Backend::Cpu, "Qwen/Qwen3-8B", 65536, &Tuning::default()).is_err());
     }
 
     #[test]
     fn loopback_only_tool_calls_on_and_weights_outside_the_fabric_namespace() {
-        let a = run_args(Backend::Cuda, "ibm-granite/granite-3.3-2b-instruct", 65536).unwrap();
+        let a = run_args(Backend::Cuda, "ibm-granite/granite-3.3-2b-instruct", 65536, &Tuning::default()).unwrap();
         assert!(a
             .windows(2)
             .any(|w| w[0] == "-p" && w[1] == format!("127.0.0.1:{PORT}:8000")));
@@ -257,7 +304,7 @@ mod tests {
             "a/b/c",
             "a b",
         ] {
-            assert!(run_args(Backend::Cuda, bad, 4096).is_err(), "{bad}");
+            assert!(run_args(Backend::Cuda, bad, 4096, &Tuning::default()).is_err(), "{bad}");
         }
     }
 

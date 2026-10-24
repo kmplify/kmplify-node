@@ -232,6 +232,19 @@ fn resolve_config(errs: &mut Vec<String>) -> WorkerConfig {
         vllm_max_model_len: env_opt("KMPLIFY_VLLM_MAX_MODEL_LEN")
             .and_then(|v| v.parse().ok())
             .unwrap_or(kmplify_node::vllm_managed::DEFAULT_MAX_MODEL_LEN),
+        vllm_tuning: kmplify_node::vllm_managed::Tuning {
+            kv_dtype: env_opt("KMPLIFY_VLLM_KV_DTYPE")
+                .filter(|v| kmplify_node::vllm_managed::valid_kv_dtype(v))
+                .unwrap_or_else(|| "auto".into()),
+            gpu_util: env_opt("KMPLIFY_VLLM_GPU_UTIL")
+                .and_then(|v| v.parse().ok())
+                .filter(|v| kmplify_node::vllm_managed::valid_gpu_util(*v))
+                .unwrap_or(kmplify_node::vllm_managed::DEFAULT_GPU_UTIL),
+            offload_gb: env_opt("KMPLIFY_VLLM_OFFLOAD_GB")
+                .and_then(|v| v.parse().ok())
+                .filter(|v: &u32| *v <= 256)
+                .unwrap_or(0),
+        },
         creds_path: fabric_worker::default_creds_path(&dir),
         country,
         workload_templates: env_opt("PROVIDER_WORKLOADS")
@@ -1524,6 +1537,7 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
             backend,
             cfg.vllm_model.trim(),
             cfg.vllm_max_model_len,
+            &cfg.vllm_tuning,
         )
         .await
         {
