@@ -75,6 +75,12 @@ pub struct Settings {
     /// Bearer for that gateway (`COLIBRI_API_KEY`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub colibri_api_key: Option<String>,
+    /// Model the node runs in its own vLLM (`KMPLIFY_VLLM_MODEL`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vllm_model: Option<String>,
+    /// That vLLM's context window (`KMPLIFY_VLLM_MAX_MODEL_LEN`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vllm_max_model_len: Option<u32>,
     /// Ceiling on logical CPUs lent to sessions (`PROVIDER_MAX_CPUS`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_cpus: Option<f64>,
@@ -130,6 +136,10 @@ pub const KEYS: &[(&str, &str)] = &[
     ("engine", "OLLAMA_BASE"),
     ("colibri", "COLIBRI_BASE"),
     ("colibri-key", "COLIBRI_API_KEY"),
+    // A Hugging Face model id: the node starts vLLM with it (Docker, CUDA or
+    // ROCm GPU) and lends it; empty = no node-managed vLLM (vllm_managed.rs).
+    ("vllm-model", "KMPLIFY_VLLM_MODEL"),
+    ("vllm-max-model-len", "KMPLIFY_VLLM_MAX_MODEL_LEN"),
     ("max-cpus", "PROVIDER_MAX_CPUS"),
     ("max-vram-mb", "PROVIDER_MAX_VRAM_MB"),
     ("max-ram-mb", "PROVIDER_MAX_RAM_MB"),
@@ -201,6 +211,12 @@ impl Settings {
         }
         if let Some(v) = &self.colibri_api_key {
             cfg.colibri_api_key = v.clone();
+        }
+        if let Some(v) = &self.vllm_model {
+            cfg.vllm_model = v.clone();
+        }
+        if let Some(v) = self.vllm_max_model_len {
+            cfg.vllm_max_model_len = v;
         }
         // A ceiling of zero is how "lend none of this" is spelled on the way
         // in; the worker's contract for that is None (no explicit choice) for
@@ -410,6 +426,21 @@ impl Settings {
                 self.colibri_base = Some(value.trim_end_matches('/').to_string());
             }
             "colibri-key" => self.colibri_api_key = Some(value.to_string()),
+            "vllm-model" => {
+                if !value.is_empty() && !crate::vllm_managed::valid_model_id(value) {
+                    return Err(format!(
+                        "{key} must be a Hugging Face model id such as Qwen/Qwen3-8B, or empty"
+                    ));
+                }
+                self.vllm_model = Some(value.to_string());
+            }
+            "vllm-max-model-len" => {
+                let n = parse_num::<u32>(key, value)?;
+                if !(4096..=1_048_576).contains(&n) {
+                    return Err(format!("{key} must be between 4096 and 1048576"));
+                }
+                self.vllm_max_model_len = Some(n);
+            }
             "max-cpus" => self.max_cpus = Some(parse_num::<f64>(key, value)?),
             "max-vram-mb" => self.max_vram_mb = Some(parse_capacity(key, value, Unit::Mb)?),
             "max-inference-jobs" => self.max_inference_jobs = Some(parse_num::<u32>(key, value)?),
@@ -452,6 +483,8 @@ impl Settings {
             "engine" => self.engine = None,
             "colibri" => self.colibri_base = None,
             "colibri-key" => self.colibri_api_key = None,
+            "vllm-model" => self.vllm_model = None,
+            "vllm-max-model-len" => self.vllm_max_model_len = None,
             "max-cpus" => self.max_cpus = None,
             "max-vram-mb" => self.max_vram_mb = None,
             "max-inference-jobs" => self.max_inference_jobs = None,
@@ -496,6 +529,11 @@ impl Settings {
             self.colibri_api_key
                 .as_ref()
                 .map(|k| if k.is_empty() { "(empty)" } else { "(set)" }.to_string()),
+        );
+        push("vllm-model", self.vllm_model.clone());
+        push(
+            "vllm-max-model-len",
+            self.vllm_max_model_len.map(|v| v.to_string()),
         );
         push("max-cpus", self.max_cpus.map(|v| v.to_string()));
         push("max-vram-mb", self.max_vram_mb.map(|v| v.to_string()));
@@ -852,6 +890,8 @@ mod tests {
                 "engine" => "ollama",
                 "colibri" => "http://127.0.0.1:5000",
                 "colibri-key" => "k",
+                "vllm-model" => "Qwen/Qwen3-8B",
+                "vllm-max-model-len" => "65536",
                 "workloads" => "ollama-cpu",
                 _ => "1",
             };

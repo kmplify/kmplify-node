@@ -610,6 +610,8 @@ impl Default for WorkerConfig {
             // did before colibri existed.
             colibri_base: String::new(),
             colibri_api_key: String::new(),
+            vllm_model: String::new(),
+            vllm_max_model_len: crate::vllm_managed::DEFAULT_MAX_MODEL_LEN,
             creds_path: PathBuf::new(),
             country: String::new(),
             // Empty = container sessions off. The safe default: running other
@@ -672,6 +674,10 @@ pub struct WorkerConfig {
     /// Bearer for the colibri gateway, matching its COLI_API_KEY. Empty =
     /// no auth (the localhost default).
     pub colibri_api_key: String,
+    /// Hugging Face model the node runs in its own vLLM; empty = none
+    /// (vllm_managed.rs). Started by `run` before joining the fabric.
+    pub vllm_model: String,
+    pub vllm_max_model_len: u32,
     pub creds_path: PathBuf,
     /// ISO-3166-1 alpha-2 declared on the hello frame, or "" to declare
     /// nothing (the gateway then records "XX"). See PROTOCOL.md — it is
@@ -5751,6 +5757,25 @@ async fn session(
     if models.is_empty() && serving(cfg) {
         log("no local models — connecting anyway; jobs will be refused by scheduler");
     }
+    // The context window each model is SERVED with, where the engine says
+    // (vLLM's max_model_len), so the fabric and its consumers can budget
+    // prompts for it. Older gateways ignore the key.
+    let contexts = if serving(cfg) && primary_openai_only {
+        match client
+            .get(format!("{}/v1/models", cfg.ollama_base))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r
+                .json::<Value>()
+                .await
+                .map(|b| crate::vllm_managed::contexts_from_models(&b))
+                .unwrap_or_default(),
+            _ => std::collections::HashMap::new(),
+        }
+    } else {
+        std::collections::HashMap::new()
+    };
 
     // Probed BEFORE the hello so this node never announces container
     // capability it cannot honour. Safe to block here — nothing is connected
@@ -5840,6 +5865,7 @@ async fn session(
         // Per-model upstream overrides ({model: "colibri"}, protocol v2.5).
         // Empty for single-upstream nodes; older gateways ignore the key.
         "engines": engines,
+        "contexts": contexts,
         "gpu": gpu_facts,
         // Every accelerator and the parallel-job cap (v3.8). Older gateways
         // ignore the three keys.
