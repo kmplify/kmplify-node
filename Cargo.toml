@@ -87,6 +87,16 @@ codegen-units = 16
 lto = "thin"
 strip = true
 
+# Dev builds keep line tables only, and dependencies none at all. Full
+# debuginfo across the dependency tree (wasmtime included) is what grew
+# target/ past 30 GB on Windows. Line tables still give panic backtraces with
+# file:line for our own code.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [features]
 # Both lanes ship in the released binaries. The functions lane was optional
 # for a year and the result was a fabric where the gateway could sign and
