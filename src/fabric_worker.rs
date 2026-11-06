@@ -4645,6 +4645,37 @@ fn should_reregister(error: &str, healed_since_welcome: bool) -> bool {
     error == AUTH_REJECTED && !healed_since_welcome
 }
 
+/// The envelope key beside the node's credentials, created on first use.
+/// Deleting the file rotates the key: the next connection makes a new one and
+/// attests it, and requests sealed to the old one get `envelope_key_changed`.
+async fn load_or_create_envelope_key(creds_path: &Path) -> Option<crate::envelope::EnvelopeKey> {
+    let path = creds_path.parent()?.join("envelope_key.json");
+    if let Ok(text) = tokio::fs::read_to_string(&path).await {
+        if let Some(key) = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v["seed"].as_str().map(str::to_string))
+            .and_then(|seed| crate::envelope::EnvelopeKey::from_seed_hex(&seed))
+        {
+            return Some(key);
+        }
+        log("envelope key file is unreadable; making a new key");
+    }
+    let key = crate::envelope::EnvelopeKey::generate();
+    let body = json!({"seed": key.seed_hex(), "created": crate::identity::now_s()}).to_string();
+    match write_private(&path, body.into_bytes()).await {
+        Ok(()) => Some(key),
+        Err(e) => {
+            // No key on disk means a new one every connection, and every
+            // consumer's cached key going stale each time. Better to offer no
+            // envelope at all than one that cannot stay put.
+            log(format!(
+                "could not store the envelope key ({e}); not offering sealed requests"
+            ));
+            None
+        }
+    }
+}
+
 /// Publisher keys this node's owner trusts for the workload catalog.
 fn trusted_publishers() -> Vec<String> {
     crate::catalog::parse_trusted(&std::env::var("KMPLIFY_TRUSTED_PUBLISHERS").unwrap_or_default())
@@ -4967,6 +4998,118 @@ struct JobUpstreams {
     colibri_base: String,
     colibri_api_key: String,
     engines: std::collections::HashMap<String, String>,
+    /// This node's envelope key and the identity it is bound to (protocol
+    /// v5), None when the node has no identity key and so offers no envelope.
+    envelope: Option<Arc<NodeEnvelope>>,
+}
+
+/// What a job needs to open a sealed request: the X25519 key, and the
+/// identity public key that every HPKE context is bound to.
+pub struct NodeEnvelope {
+    pub key: crate::envelope::EnvelopeKey,
+    pub node_pubkey_hex: String,
+}
+
+/// Why a sealed job was refused. The strings are CODES a client acts on, not
+/// prose, and none of them says why a ciphertext failed to open.
+const SEALED_KEY_CHANGED: &str = "envelope_key_changed";
+const SEALED_REFUSED: &str = "envelope_refused";
+const SEALED_UNSUPPORTED: &str = "envelope_unsupported";
+
+/// Open the `sealed` block of an inference job into the request it carries.
+///
+/// The clear `model` and `stream` beside it are what the GATEWAY routed and
+/// scheduled by. They are authenticated as aad, and the opened request has to
+/// name the same model and the same streaming mode: a relay that tampers with
+/// either gets a refusal, never a job run under terms the consumer did not
+/// write.
+fn open_sealed_job(
+    envelope: Option<&NodeEnvelope>,
+    kind: &str,
+    payload: &Value,
+    now: u64,
+    replay: &mut crate::envelope::ReplayGuard,
+) -> Result<(Value, crate::envelope::ResponseSealer), &'static str> {
+    use crate::envelope as env;
+    let envelope = envelope.ok_or(SEALED_UNSUPPORTED)?;
+    let sealed = &payload["sealed"];
+    if sealed["suite"].as_u64() != Some(env::SUITE) {
+        return Err(SEALED_UNSUPPORTED);
+    }
+    if sealed["key_id"].as_str() != Some(envelope.key.key_id().as_str()) {
+        // The one failure a client can fix: fetch the new key and seal again.
+        return Err(SEALED_KEY_CHANGED);
+    }
+    let model = payload["model"].as_str().unwrap_or_default();
+    let stream = payload["stream"].as_bool().unwrap_or(false);
+    let enc = sealed["enc"]
+        .as_str()
+        .and_then(env::unb64)
+        .ok_or(SEALED_REFUSED)?;
+    let ct = sealed["ct"]
+        .as_str()
+        .and_then(env::unb64)
+        .ok_or(SEALED_REFUSED)?;
+    let ts = sealed["ts"].as_u64().ok_or(SEALED_REFUSED)?;
+    let (plaintext, sealer) = envelope
+        .key
+        .open(
+            &envelope.node_pubkey_hex,
+            env::LANE_INFERENCE,
+            &enc,
+            &ct,
+            &env::inference_aad(kind, model, stream, ts),
+        )
+        .map_err(|_| SEALED_REFUSED)?;
+    // AFTER it authenticated, so only a genuine request can occupy a slot in
+    // the replay memory, and BEFORE anything runs: see ReplayGuard for why a
+    // second run of the same request must never produce a second answer.
+    if !replay.admit(&enc, ts, now) {
+        return Err(SEALED_REFUSED);
+    }
+    let inner: Value = serde_json::from_slice(&plaintext).map_err(|_| SEALED_REFUSED)?;
+    if !inner.is_object()
+        || inner["model"].as_str() != Some(model)
+        || inner["stream"].as_bool().unwrap_or(false) != stream
+    {
+        return Err(SEALED_REFUSED);
+    }
+    Ok((inner, sealer))
+}
+
+/// One replay memory per PROCESS, not per connection: a relay must not be able
+/// to reset it by dropping the socket.
+fn replay_guard() -> &'static std::sync::Mutex<crate::envelope::ReplayGuard> {
+    static GUARD: std::sync::OnceLock<std::sync::Mutex<crate::envelope::ReplayGuard>> =
+        std::sync::OnceLock::new();
+    GUARD.get_or_init(|| {
+        std::sync::Mutex::new(crate::envelope::ReplayGuard::new(crate::identity::now_s()))
+    })
+}
+
+/// Seal what a job is about to send, when the job was sealed.
+///
+/// Chunks and the final result carry content. So can an error: an upstream
+/// engine's message may quote the prompt back. All three are sealed; the
+/// clear `message` of a sealed error is a fixed string.
+fn seal_job_frame(sealer: &mut crate::envelope::ResponseSealer, mut msg: Value) -> Value {
+    match msg["type"].as_str() {
+        Some(kind @ ("chunk" | "done")) => {
+            let data = serde_json::to_vec(&msg["data"]).unwrap_or_default();
+            msg["data"] = json!({ "sealed": sealer.seal(kind, &data) });
+        }
+        Some("error") => {
+            let detail = msg["message"]
+                .as_str()
+                .unwrap_or_default()
+                .as_bytes()
+                .to_vec();
+            msg["sealed"] = sealer.seal("error", &detail);
+            msg["message"] = json!("the provider reported an error (sealed)");
+        }
+        _ => {}
+    }
+    msg
 }
 
 async fn run_job(
@@ -4977,7 +5120,38 @@ async fn run_job(
 ) {
     let job_id = frame["id"].as_str().unwrap_or_default().to_string();
     let kind = frame["kind"].as_str().unwrap_or_default();
-    let payload = frame["payload"].clone();
+    let mut payload = frame["payload"].clone();
+    // Protocol v5: a sealed job. The gateway forwarded a ciphertext it cannot
+    // read; from here on `payload` is the request the CONSUMER wrote, and
+    // everything this job sends back goes through the sealer.
+    let sealer: Arc<std::sync::Mutex<Option<crate::envelope::ResponseSealer>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    if payload.get("sealed").is_some() {
+        let opened = open_sealed_job(
+            upstreams.envelope.as_deref(),
+            kind,
+            &payload,
+            crate::identity::now_s(),
+            &mut replay_guard().lock().expect("replay guard lock"),
+        );
+        match opened {
+            Ok((inner, s)) => {
+                payload = inner;
+                *sealer.lock().expect("sealer lock") = Some(s);
+            }
+            Err(code) => {
+                crate::status::count_job_error();
+                let _ = sink
+                    .lock()
+                    .await
+                    .send(Message::Text(
+                        json!({"type": "error", "id": job_id, "message": code}).to_string(),
+                    ))
+                    .await;
+                return;
+            }
+        }
+    }
     // Per-model routing: models the discovery tagged "colibri" go to the
     // colibri gateway; everything else takes the unchanged primary path.
     let requested_model = payload
@@ -4987,11 +5161,21 @@ async fn run_job(
         .to_string();
     let is_colibri = upstreams.engines.get(&requested_model).map(String::as_str) == Some("colibri");
 
-    let send = |sink: Arc<Mutex<WsSink>>, msg: Value| async move {
-        if msg["type"] == "error" {
-            crate::status::count_job_error();
+    let send = move |sink: Arc<Mutex<WsSink>>, msg: Value| {
+        let sealer = sealer.clone();
+        async move {
+            if msg["type"] == "error" {
+                crate::status::count_job_error();
+            }
+            // The one place every frame of this job leaves through, so the
+            // one place a sealed job's output is sealed. Nothing below can
+            // forget to.
+            let msg = match sealer.lock().expect("sealer lock").as_mut() {
+                Some(s) => seal_job_frame(s, msg),
+                None => msg,
+            };
+            let _ = sink.lock().await.send(Message::Text(msg.to_string())).await;
         }
-        let _ = sink.lock().await.send(Message::Text(msg.to_string())).await;
     };
 
     if is_colibri && kind != "chat" {
@@ -5249,6 +5433,24 @@ async fn session(
         .key()
         .map(|k| k.hello_fields(&creds.node_id, crate::identity::now_s()))
         .unwrap_or(Value::Null);
+    // Protocol v5: this node's encryption key, attested by its identity key.
+    // Only a node WITH an identity key offers the envelope: an encryption key
+    // nobody vouches for is one a relay could substitute.
+    let node_envelope: Option<Arc<NodeEnvelope>> = match creds.key() {
+        Some(identity) => load_or_create_envelope_key(&cfg.creds_path)
+            .await
+            .map(|key| {
+                Arc::new(NodeEnvelope {
+                    key,
+                    node_pubkey_hex: identity.public_hex(),
+                })
+            }),
+        None => None,
+    };
+    let envelope_attestation = match (&node_envelope, creds.key()) {
+        (Some(e), Some(identity)) => e.key.attestation(&identity, crate::identity::now_s()),
+        _ => Value::Null,
+    };
     let hello = json!({
         "type": "hello",
         "node_id": creds.node_id,
@@ -5285,6 +5487,9 @@ async fn session(
         // response instead of buffering it, and announces kept sessions. A
         // gateway only sends `credit` frames to a node that says so.
         "protocol": 4,
+        // v5: the key consumers may seal requests to, signed by the identity
+        // key above. Null when this node has no identity key.
+        "envelope": envelope_attestation,
         // Highest signed catalog this node holds, 0 when it trusts no
         // publisher (src/catalog.rs). Lets an operator see which nodes have
         // picked up a new catalog without asking them.
@@ -5842,6 +6047,7 @@ async fn session(
                             colibri_base: cfg.colibri_base.clone(),
                             colibri_api_key: cfg.colibri_api_key.clone(),
                             engines: current_engines.clone(),
+                            envelope: node_envelope.clone(),
                         };
                         let (sink, client) = (sink.clone(), client.clone());
                         tokio::spawn(async move {
@@ -8001,5 +8207,194 @@ mod container_hardening_tests {
         assert_eq!(digest.len(), 64);
         assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
         assert!(GUARD_IMAGE.starts_with("alpine/socat:"));
+    }
+}
+
+#[cfg(test)]
+mod sealed_job_tests {
+    use super::*;
+    use base64::Engine;
+
+    const NODE_PUBKEY: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+    /// The timestamp the Python client authenticated in the pinned request.
+    const SEALED_AT: u64 = 1_800_000_000;
+
+    fn guard() -> crate::envelope::ReplayGuard {
+        crate::envelope::ReplayGuard::new(SEALED_AT - 10)
+    }
+
+    /// `open_sealed_job` at the moment the pinned request was fresh.
+    fn open_now(
+        e: Option<&NodeEnvelope>,
+        kind: &str,
+        payload: &Value,
+    ) -> Result<(Value, crate::envelope::ResponseSealer), &'static str> {
+        open_sealed_job(e, kind, payload, SEALED_AT + 1, &mut guard())
+    }
+
+    fn envelope() -> NodeEnvelope {
+        NodeEnvelope {
+            key: crate::envelope::EnvelopeKey::from_seed_hex(
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+            )
+            .unwrap(),
+            node_pubkey_hex: NODE_PUBKEY.into(),
+        }
+    }
+
+    /// The job payload exactly as the gateway forwards it, sealed by the
+    /// Python reference client (the literal src/envelope.rs also pins).
+    fn sealed_payload() -> Value {
+        let b64 = |hex: &str| {
+            base64::engine::general_purpose::STANDARD
+                .encode(crate::functions::hex_decode(hex).unwrap())
+        };
+        json!({
+            "model": "llama3.1:8b", "stream": true,
+            "sealed": {"suite": 1, "key_id": "01520b9fd72dc69a", "ts": SEALED_AT, "enc": b64("37fda3567bdbd628e88668c3c8d7e97d1d1253b6d4ea6d44c150f741f1bf4431"), "ct": b64("00e4c3a6a39797dfae9350fa0c89888de245e831a4d9e5f127702ae711af08b0588522efb7ba03cdae8e7c530056cc536e308460447fae3349eaa50dc27493b1d2b339036afa5169a35b401e29f43840d592f9b183e0ae978eec0d33616dbf68bebceb74c1563f0811")},
+        })
+    }
+
+    #[test]
+    fn a_sealed_job_becomes_the_request_the_consumer_wrote() {
+        let (inner, _) = open_now(Some(&envelope()), "chat", &sealed_payload()).unwrap();
+        assert_eq!(inner["messages"][0]["content"], "hello node");
+        assert_eq!(inner["model"], "llama3.1:8b");
+    }
+
+    /// The gateway forwards `model` and `stream` in the clear and schedules by
+    /// them. Changing either must not run the job under terms the consumer
+    /// did not write.
+    #[test]
+    fn a_relay_that_changes_the_routing_metadata_gets_a_refusal() {
+        let e = envelope();
+        let mut swapped = sealed_payload();
+        swapped["model"] = json!("gpt-oss:120b");
+        assert_eq!(
+            open_now(Some(&e), "chat", &swapped).err(),
+            Some(SEALED_REFUSED)
+        );
+        let mut unstreamed = sealed_payload();
+        unstreamed["stream"] = json!(false);
+        assert_eq!(
+            open_now(Some(&e), "chat", &unstreamed).err(),
+            Some(SEALED_REFUSED)
+        );
+        assert_eq!(
+            open_now(Some(&e), "embeddings", &sealed_payload()).err(),
+            Some(SEALED_REFUSED)
+        );
+    }
+
+    /// A rotated key is the one failure a client can fix, so it is the one
+    /// that says what it is. Everything else is the same refusal.
+    #[test]
+    fn refusals_are_codes_and_only_a_key_change_is_distinguishable() {
+        let e = envelope();
+        let mut rotated = sealed_payload();
+        rotated["sealed"]["key_id"] = json!("ffffffffffffffff");
+        assert_eq!(
+            open_now(Some(&e), "chat", &rotated).err(),
+            Some(SEALED_KEY_CHANGED)
+        );
+        let mut suite = sealed_payload();
+        suite["sealed"]["suite"] = json!(2);
+        assert_eq!(
+            open_now(Some(&e), "chat", &suite).err(),
+            Some(SEALED_UNSUPPORTED)
+        );
+        assert_eq!(
+            open_now(None, "chat", &sealed_payload()).err(),
+            Some(SEALED_UNSUPPORTED)
+        );
+        let mut junk = sealed_payload();
+        junk["sealed"]["ct"] = json!("not base64 !!");
+        assert_eq!(
+            open_now(Some(&e), "chat", &junk).err(),
+            Some(SEALED_REFUSED)
+        );
+    }
+
+    /// The relay replays a captured request. It must be refused BEFORE a job
+    /// runs: a second answer under the same key and nonces breaks AES-GCM.
+    #[test]
+    fn a_replayed_sealed_job_is_refused_before_anything_runs() {
+        let e = envelope();
+        let mut g = guard();
+        assert!(
+            open_sealed_job(Some(&e), "chat", &sealed_payload(), SEALED_AT + 1, &mut g).is_ok()
+        );
+        assert_eq!(
+            open_sealed_job(Some(&e), "chat", &sealed_payload(), SEALED_AT + 2, &mut g).err(),
+            Some(SEALED_REFUSED)
+        );
+        // Stale, or from before this process started: refused as well.
+        assert_eq!(
+            open_sealed_job(
+                Some(&e),
+                "chat",
+                &sealed_payload(),
+                SEALED_AT + 10_000,
+                &mut guard()
+            )
+            .err(),
+            Some(SEALED_REFUSED)
+        );
+        let mut restarted = crate::envelope::ReplayGuard::new(SEALED_AT + 5);
+        assert_eq!(
+            open_sealed_job(
+                Some(&e),
+                "chat",
+                &sealed_payload(),
+                SEALED_AT + 6,
+                &mut restarted
+            )
+            .err(),
+            Some(SEALED_REFUSED)
+        );
+        // The timestamp is authenticated: a relay cannot freshen it.
+        let mut freshened = sealed_payload();
+        freshened["sealed"]["ts"] = json!(SEALED_AT + 9_000);
+        assert_eq!(
+            open_sealed_job(
+                Some(&e),
+                "chat",
+                &freshened,
+                SEALED_AT + 9_001,
+                &mut guard()
+            )
+            .err(),
+            Some(SEALED_REFUSED)
+        );
+    }
+
+    /// Every frame that can carry content is sealed, in order, and nothing
+    /// readable is left beside the ciphertext.
+    #[test]
+    fn everything_a_sealed_job_sends_back_is_sealed() {
+        let (_, mut sealer) = open_now(Some(&envelope()), "chat", &sealed_payload()).unwrap();
+        let chunk = seal_job_frame(
+            &mut sealer,
+            json!({"type": "chunk", "id": "j", "data": {"choices": [{"delta": {"content": "secret answer"}}]}}),
+        );
+        assert_eq!(chunk["id"], "j");
+        assert_eq!(chunk["data"]["sealed"]["n"], 0);
+        assert_eq!(chunk["data"]["sealed"]["k"], "chunk");
+        assert!(!chunk.to_string().contains("secret answer"));
+        let err = seal_job_frame(
+            &mut sealer,
+            json!({"type": "error", "id": "j", "message": "upstream said: your prompt 'secret' was too long"}),
+        );
+        assert!(!err.to_string().contains("secret"));
+        assert_eq!(err["sealed"]["n"], 1);
+        assert_eq!(err["sealed"]["k"], "error");
+        let done = seal_job_frame(
+            &mut sealer,
+            json!({"type": "done", "id": "j", "data": null}),
+        );
+        assert_eq!(done["data"]["sealed"]["n"], 2);
+        // Frames with no content pass through untouched.
+        let other = json!({"type": "pong"});
+        assert_eq!(seal_job_frame(&mut sealer, other.clone()), other);
     }
 }
