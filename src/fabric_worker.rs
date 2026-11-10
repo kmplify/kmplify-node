@@ -1594,12 +1594,9 @@ fn cpu_info() -> Value {
 /// exactly the error a consumer saw: "failed to connect to the docker API at
 /// npipe:////./pipe/dockerDesktopLinux".
 async fn docker_ok() -> bool {
-    let probe = crate::proc::command("docker")
-        .args(["version", "--format", "{{.Server.Version}}"])
-        .output();
     matches!(
-        tokio::time::timeout(DOCKER_PROBE_TIMEOUT, probe).await,
-        Ok(Ok(o)) if o.status.success()
+        bounded_output("docker", &["version", "--format", "{{.Server.Version}}"], DOCKER_PROBE_TIMEOUT).await,
+        Ok(o) if o.status.success()
     )
 }
 
@@ -2934,7 +2931,69 @@ async fn docker_rm(name: &str) -> Result<(), String> {
 }
 
 /// Sample both inventories, keeping the first failure's reason.
+/// Longest the two inventory commands may take, each. `docker system df`
+/// scans every volume and can take a while on a full disk, so this is far
+/// more generous than the liveness probe; it exists so that a daemon that
+/// never answers cannot hold the worker.
+const DOCKER_INVENTORY_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// A docker command's output, or why there is none, within `limit`.
+///
+/// The inventory runs BEFORE the worker dials the gateway and again on the
+/// slow telemetry path. Without a limit, a Docker Desktop that accepts the
+/// connection and then never answers held the worker at "connecting" for
+/// good: no hello, no error, nothing in any log (owner report 2026-11-10: a
+/// Windows machine with sharing on that the gateway had not seen for three
+/// days and that never once tried to connect). The child is killed when the
+/// limit passes, so a hung CLI does not pile up either.
+async fn docker_bounded(args: &[&str], limit: Duration) -> Result<std::process::Output, String> {
+    bounded_output("docker", args, limit).await
+}
+
+async fn bounded_output(program: &str, args: &[&str], limit: Duration) -> Result<std::process::Output, String> {
+    let mut cmd = crate::proc::command(program);
+    cmd.args(args).kill_on_drop(true);
+    match tokio::time::timeout(limit, cmd.output()).await {
+        Ok(Ok(out)) => Ok(out),
+        Ok(Err(e)) => Err(format!("{program} unavailable: {e}")),
+        Err(_) => Err(format!(
+            "{program} did not answer `{program} {}` within {} s",
+            args.join(" "),
+            limit.as_secs_f32().ceil() as u64
+        )),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod bounded_tests {
+    use super::*;
+
+    /// A command that never answers must not hold the worker: the call
+    /// returns at the limit with a sentence, and the child is gone.
+    #[tokio::test]
+    async fn a_command_that_hangs_is_given_up_at_the_limit() {
+        let started = std::time::Instant::now();
+        let err = bounded_output("sleep", &["30"], Duration::from_millis(300)).await.unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5), "returned only after {:?}", started.elapsed());
+        assert!(err.contains("did not answer `sleep 30`"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_command_that_answers_in_time_is_passed_through() {
+        let out = bounded_output("echo", &["ok"], Duration::from_secs(5)).await.unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+        let err = bounded_output("kmplify-no-such-program", &[], Duration::from_secs(5)).await.unwrap_err();
+        assert!(err.contains("unavailable"), "{err}");
+    }
+}
+
 async fn sample_inventory() -> (Option<u64>, Vec<String>, Option<String>) {
+    // A daemon that does not answer the 5-second liveness probe is not asked
+    // two slower questions: say so and move on.
+    if !docker_ok().await {
+        return (None, Vec::new(), Some("docker is not running or does not answer".to_string()));
+    }
     let (disk, disk_err) = match measure_fabric_disk().await {
         Ok(mb) => (Some(mb), None),
         Err(e) => (None, Some(e)),
@@ -2954,11 +3013,7 @@ async fn sample_inventory() -> (Option<u64>, Vec<String>, Option<String>) {
 /// the provider the bandwidth and the disk. `docker images` is a metadata
 /// read — no container spawn, no filesystem walk.
 async fn cached_images() -> Result<Vec<String>, String> {
-    let out = crate::proc::command("docker")
-        .args(["images", "--format", "{{.Repository}}:{{.Tag}}"])
-        .output()
-        .await
-        .map_err(|e| format!("docker unavailable: {e}"))?;
+    let out = docker_bounded(&["images", "--format", "{{.Repository}}:{{.Tag}}"], DOCKER_INVENTORY_TIMEOUT).await?;
     if !out.status.success() {
         return Err(format!(
             "docker images failed: {}",
@@ -3110,11 +3165,7 @@ async fn measure_fabric_disk() -> Result<u64, String> {
 
 /// The cheap path: Docker's own per-volume sizes, no filesystem walk of ours.
 async fn measure_fabric_disk_via_df() -> Result<u64, String> {
-    let out = crate::proc::command("docker")
-        .args(["system", "df", "-v", "--format", "{{json .Volumes}}"])
-        .output()
-        .await
-        .map_err(|e| format!("docker unavailable: {e}"))?;
+    let out = docker_bounded(&["system", "df", "-v", "--format", "{{json .Volumes}}"], DOCKER_INVENTORY_TIMEOUT).await?;
     if !out.status.success() {
         return Err(format!(
             "docker system df failed: {}",
