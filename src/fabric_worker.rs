@@ -1999,6 +1999,9 @@ fn workload_capability(
         "accelerator": accel.as_str(),
         "templates": if usable { cfg.workload_templates.clone() } else { Vec::new() },
     });
+    // Protocol v5.2: this node removes a consumer's state volumes when the
+    // gateway relays their erasure request (drop_volumes below).
+    caps["volume_drop"] = json!(true);
     // The disk the owner agreed to lend, and what is already spent of it.
     // Absent when they have not agreed to any — the gateway then treats this
     // node as unbounded, which is the pre-existing behaviour, rather than as
@@ -2971,6 +2974,97 @@ async fn cached_images() -> Result<Vec<String>, String> {
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty() && l != "<none>:<none>")
         .collect())
+}
+
+/// May this node remove the volume on a gateway's say-so?
+///
+/// Only a consumer's own state volume: fabric-namespaced, and ending in the
+/// 16-hex consumer digest the gateway derives (protocol v3.6). A shared
+/// store (an install, a model cache: `kmplify-fabric-comfyui-models`) has no
+/// such ending and is never removed this way, whatever the frame says: it is
+/// not one person's data, and losing it costs the provider hours of
+/// downloads.
+fn is_consumer_state_volume(name: &str) -> bool {
+    if name.len() > 96 || !is_fabric_volume(name, "/x") {
+        return false;
+    }
+    match name.rsplit_once('-') {
+        Some((head, tag)) => {
+            head.len() > "kmplify-fabric".len()
+                && tag.len() == 16
+                && tag.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        }
+        None => false,
+    }
+}
+
+/// What became of one volume the gateway asked to have removed.
+#[derive(Debug, PartialEq)]
+enum VolumeDrop {
+    Removed,
+    Absent,
+    InUse,
+    Failed(String),
+}
+
+async fn drop_one_volume(name: &str) -> VolumeDrop {
+    if !is_consumer_state_volume(name) {
+        return VolumeDrop::Failed("refused: not a consumer state volume".into());
+    }
+    let exists = crate::proc::command("docker").args(["volume", "inspect", name]).output().await;
+    match exists {
+        Err(e) => return VolumeDrop::Failed(format!("docker unavailable: {e}")),
+        Ok(o) if !o.status.success() => return VolumeDrop::Absent,
+        Ok(_) => {}
+    }
+    // Any container, running or not, that mounts it: docker would refuse the
+    // removal anyway, and "in use" is the answer the gateway can act on.
+    let users = crate::proc::command("docker")
+        .args(["ps", "-a", "-q", "--filter", &format!("volume={name}")])
+        .output()
+        .await;
+    if let Ok(o) = &users {
+        if o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty() {
+            return VolumeDrop::InUse;
+        }
+    }
+    match crate::proc::command("docker").args(["volume", "rm", name]).output().await {
+        Ok(o) if o.status.success() => VolumeDrop::Removed,
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr).trim().chars().take(160).collect::<String>();
+            if err.contains("in use") { VolumeDrop::InUse } else { VolumeDrop::Failed(err) }
+        }
+        Err(e) => VolumeDrop::Failed(format!("docker unavailable: {e}")),
+    }
+}
+
+/// Protocol v5.2 `volume_drop`: a person asked for their data to be erased,
+/// and part of it is state their sessions left on this machine. Remove the
+/// named volumes and say what happened to each.
+async fn drop_volumes(sink: Arc<Mutex<WsSink>>, frame: Value) {
+    let request = frame["request"].as_str().unwrap_or_default().to_string();
+    let names: Vec<String> = frame["volumes"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).take(64).collect())
+        .unwrap_or_default();
+    let (mut removed, mut absent, mut in_use, mut failed) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for name in names {
+        match drop_one_volume(&name).await {
+            VolumeDrop::Removed => {
+                eprintln!("[fabric-worker] erased state volume {name} on the consumer's request");
+                removed.push(name)
+            }
+            VolumeDrop::Absent => absent.push(name),
+            VolumeDrop::InUse => in_use.push(name),
+            VolumeDrop::Failed(message) => failed.push(json!({"volume": name, "message": message})),
+        }
+    }
+    send_frame(
+        &sink,
+        json!({"type": "volume_drop_result", "request": request,
+               "removed": removed, "absent": absent, "in_use": in_use, "failed": failed}),
+    )
+    .await;
 }
 
 /// How much disk the fabric's own volumes are using, in MB.
@@ -6618,6 +6712,9 @@ async fn session(
                             sink.clone(), client.clone(), cfg.clone(), frame,
                         ));
                     }
+                    Some("volume_drop") => {
+                        tokio::spawn(drop_volumes(sink.clone(), frame));
+                    }
                     Some("workload_stop") => {
                         let session_id = frame["session"].as_str().unwrap_or_default().to_string();
                         tokio::spawn(stop_workload(
@@ -7316,12 +7413,28 @@ mod container_death_tests {
 
 #[cfg(test)]
 mod volume_rule_tests {
-    use super::is_fabric_volume;
+    use super::{is_consumer_state_volume, is_fabric_volume};
 
     /// The gateway decides WHAT runs here; it does not get to decide which of
     /// the provider's directories a consumer's container can see.
     #[test]
     fn only_fabric_named_volumes_onto_absolute_paths() {
+        // v5.2: only a consumer's own state volume may be removed on request.
+        assert!(is_consumer_state_volume("kmplify-fabric-floci-3cc54e4a581e2664"));
+        assert!(is_consumer_state_volume("kmplify-fabric-floci-azure-0123456789abcdef"));
+        for shared in [
+            "kmplify-fabric-comfyui-models",
+            "kmplify-fabric-comfyui-cu126",
+            "kmplify-fabric-hf-cache",
+            "kmplify-fabric-0123456789abcdef",
+            "kmplify-fabric-floci-3CC54E4A581E2664",
+            "kmplify-fabric-floci-3cc54e4a581e266",
+            "rag-postgres-0123456789abcdef",
+            "kmplify-fabric-floci-0123456789abcdef; rm -rf /",
+            "../kmplify-fabric-floci-0123456789abcdef",
+        ] {
+            assert!(!is_consumer_state_volume(shared), "{shared}");
+        }
         assert!(is_fabric_volume("kmplify-fabric-comfyui-cu126", "/root"));
         assert!(is_fabric_volume(
             "kmplify-fabric-comfyui-models",
