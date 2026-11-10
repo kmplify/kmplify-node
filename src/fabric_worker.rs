@@ -2729,6 +2729,107 @@ async fn container_exit(name: &str) -> Option<i64> {
     parse_container_state(out.status.success(), &String::from_utf8_lossy(&out.stdout))
 }
 
+/// How often a running session's container is sampled for `workload_usage`.
+const USAGE_SAMPLE_EVERY: Duration = Duration::from_secs(15);
+
+/// What the given containers use right now: name -> (CPU in percent of one
+/// core, memory in MB). One `docker stats` call for all of them; a container
+/// that is gone is simply absent from the answer.
+async fn containers_usage(names: &[String]) -> std::collections::HashMap<String, (f64, f64)> {
+    let mut out = std::collections::HashMap::new();
+    if names.is_empty() {
+        return out;
+    }
+    let run = crate::proc::command("docker")
+        .args(["stats", "--no-stream", "--format", "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"])
+        .args(names)
+        .output();
+    // `docker stats` waits for one sample per container; a wedged daemon
+    // must not hold the sampler forever.
+    let Ok(Ok(res)) = tokio::time::timeout(Duration::from_secs(12), run).await else {
+        return out;
+    };
+    for line in String::from_utf8_lossy(&res.stdout).lines() {
+        if let Some((name, cpu, mem)) = parse_stats_line(line) {
+            out.insert(name, (cpu, mem));
+        }
+    }
+    out
+}
+
+/// One line of `docker stats --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"`,
+/// e.g. `kmplify-s-ab12\t42.50%\t310.2MiB / 7.654GiB`.
+fn parse_stats_line(line: &str) -> Option<(String, f64, f64)> {
+    let mut parts = line.split('\t');
+    let name = parts.next()?.trim();
+    let cpu = parts.next()?.trim().trim_end_matches('%').parse::<f64>().ok()?;
+    let used = parts.next()?.split('/').next()?.trim();
+    let mem = parse_mem_mb(used)?;
+    if name.is_empty() || !cpu.is_finite() || cpu < 0.0 {
+        return None;
+    }
+    Some((name.to_string(), cpu, mem))
+}
+
+/// Docker's memory figure in MB: `310.2MiB`, `1.5GiB`, `512kB`, `0B`.
+fn parse_mem_mb(raw: &str) -> Option<f64> {
+    let split = raw.find(|c: char| c.is_ascii_alphabetic())?;
+    let value = raw[..split].trim().parse::<f64>().ok()?;
+    let mb = match raw[split..].trim() {
+        "B" => value / 1_048_576.0,
+        "kB" | "KB" => value / 1_000.0 / 1.048_576,
+        "KiB" => value / 1_024.0,
+        "MB" => value / 1.048_576,
+        "MiB" => value,
+        "GB" => value * 1_000.0 / 1.048_576,
+        "GiB" => value * 1_024.0,
+        "TB" => value * 1_000_000.0 / 1.048_576,
+        "TiB" => value * 1_048_576.0,
+        _ => return None,
+    };
+    (mb.is_finite() && mb >= 0.0).then_some(mb)
+}
+
+/// Ends a spawned task when its owner goes out of scope, on every way out.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// While this connection lives: every `USAGE_SAMPLE_EVERY`, tell the gateway
+/// what each running session's container uses (protocol v5.1). The person who
+/// started the session sizes it from that instead of guessing. Counts only.
+async fn usage_sampler(sink: Arc<Mutex<WsSink>>, sessions: Sessions) {
+    loop {
+        tokio::time::sleep(USAGE_SAMPLE_EVERY).await;
+        let running: Vec<(String, String)> = sessions
+            .lock()
+            .await
+            .iter()
+            .map(|(session, (name, _))| (session.clone(), name.clone()))
+            .collect();
+        if running.is_empty() {
+            continue;
+        }
+        let names: Vec<String> = running.iter().map(|(_, n)| n.clone()).collect();
+        let usage = containers_usage(&names).await;
+        for (session, name) in running {
+            if let Some((cpu, mem)) = usage.get(&name) {
+                send_frame(
+                    &sink,
+                    json!({"type": "workload_usage", "session": session,
+                           "cpu_percent": (cpu * 10.0).round() / 10.0,
+                           "memory_mb": (mem * 10.0).round() / 10.0}),
+                )
+                .await;
+            }
+        }
+    }
+}
+
 /// Pure half of `container_exit`, split out for tests.
 fn parse_container_state(inspect_ok: bool, stdout: &str) -> Option<i64> {
     if !inspect_ok {
@@ -6112,6 +6213,10 @@ async fn session(
     // loop — see GATEWAY_SILENCE_TIMEOUT for why read.next() alone can hang
     // forever on a proxied socket.
     let mut last_rx = tokio::time::Instant::now();
+    // Dies with this connection: a sampler that outlived it would report a
+    // second time through the next connection (send_frame falls back to the
+    // current sink).
+    let _usage_task = AbortOnDrop(tokio::spawn(usage_sampler(sink.clone(), sessions.clone())));
     let result = loop {
         tokio::select! {
             ctl = control_rx.recv() => {
@@ -9119,5 +9224,39 @@ mod close_frame_tests {
             "gateway closed the connection (4002)"
         );
         assert_eq!(describe_close(None), "connection closed");
+    }
+}
+
+#[cfg(test)]
+mod usage_sample_tests {
+    use super::*;
+
+    #[test]
+    fn a_stats_line_becomes_cpu_percent_and_megabytes() {
+        let (name, cpu, mem) = parse_stats_line("kmplify-s-ab12\t42.50%\t310.2MiB / 7.654GiB").unwrap();
+        assert_eq!(name, "kmplify-s-ab12");
+        assert_eq!(cpu, 42.5);
+        assert!((mem - 310.2).abs() < 1e-9);
+        let (_, cpu, mem) = parse_stats_line("x\t180.04%\t1.5GiB / 16GiB").unwrap();
+        assert_eq!(cpu, 180.04);
+        assert_eq!(mem, 1536.0);
+    }
+
+    #[test]
+    fn memory_units_convert_to_megabytes() {
+        assert_eq!(parse_mem_mb("0B"), Some(0.0));
+        assert_eq!(parse_mem_mb("512KiB"), Some(0.5));
+        assert_eq!(parse_mem_mb("2GiB"), Some(2048.0));
+        assert!((parse_mem_mb("1GB").unwrap() - 953.674).abs() < 0.001);
+        assert!((parse_mem_mb("500kB").unwrap() - 0.4768).abs() < 0.001);
+        assert_eq!(parse_mem_mb("12 parsecs"), None);
+        assert_eq!(parse_mem_mb(""), None);
+    }
+
+    #[test]
+    fn broken_lines_are_dropped() {
+        for line in ["", "name only", "x\t--\t-- / --", "x\tfast%\t1MiB / 2MiB", "\t1%\t1MiB / 2MiB", "x\t-3%\t1MiB / 2MiB"] {
+            assert!(parse_stats_line(line).is_none(), "{line:?}");
+        }
     }
 }
