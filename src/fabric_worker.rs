@@ -483,15 +483,11 @@ pub async fn reserved_cpus() -> f64 {
 pub fn gpu_addressable_mb() -> u64 {
     #[cfg(target_os = "macos")]
     {
-        if let Ok(out) = std::process::Command::new("sysctl")
-            .args(["-n", "iogpu.wired_limit_mb"])
-            .output()
-        {
-            if let Ok(mb) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>() {
-                if mb > 0 {
-                    return mb;
-                }
-            }
+        // Asked of the kernel directly, never by starting `sysctl`: by bare
+        // name that was one dead process per PATH directory in front of
+        // /usr/sbin, every time this was asked. See proc.rs, NOWHERE.
+        if let Some(mb) = crate::proc::sysctl_u64(c"iogpu.wired_limit_mb").filter(|mb| *mb > 0) {
+            return mb;
         }
     }
     host_ram_mb() * 3 / 4

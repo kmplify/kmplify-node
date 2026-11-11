@@ -102,6 +102,11 @@ tui = ["dep:ratatui"]
 # only whether an operator who opts in has an engine to do it with.
 wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
 
+# proc.rs: kernel settings by system call (sysctlbyname), never by starting
+# `sysctl`. Already in the tree through tokio; no new crate is downloaded.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 wat = "1.243.0"
 # Paused clock for the session-grace reaper test; never in the shipped binary.
