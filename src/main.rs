@@ -132,7 +132,7 @@ fn node_dir() -> PathBuf {
 /// exactly the command someone runs on a broken host. `kill_on_drop` so the
 /// abandoned probe does not outlive us as an orphan.
 async fn probe(timeout: Duration, cmd: &str, args: &[&str]) -> Option<String> {
-    let child = tokio::process::Command::new(cmd)
+    let child = kmplify_node::proc::command(cmd)
         .args(args)
         .kill_on_drop(true)
         .output();
