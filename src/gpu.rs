@@ -460,11 +460,12 @@ async fn probe_metal() -> Option<Gpu> {
     if !(cfg!(target_os = "macos") && cfg!(target_arch = "aarch64")) {
         return None;
     }
-    let name = run("sysctl", &["-n", "machdep.cpu.brand_string"])
-        .await
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "Apple Silicon".to_string());
+    // Read from the kernel, not by starting `sysctl`.
+    #[cfg(target_os = "macos")]
+    let chip = crate::proc::sysctl_string(c"machdep.cpu.brand_string");
+    #[cfg(not(target_os = "macos"))]
+    let chip: Option<String> = None;
+    let name = chip.unwrap_or_else(|| "Apple Silicon".to_string());
     // What the GPU can actually address, not total RAM: unified memory is
     // shared and the GPU is capped well below the machine's total.
     Some(Gpu::single(
@@ -547,12 +548,7 @@ pub fn detect_installed() -> Backend {
     // that.
     #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
     {
-        let rosetta = std::process::Command::new("sysctl")
-            .args(["-n", "hw.optional.arm64"])
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
-            .unwrap_or(false);
+        let rosetta = crate::proc::sysctl_u64(c"hw.optional.arm64") == Some(1);
         return if rosetta {
             Backend::Metal
         } else {
