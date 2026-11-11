@@ -1482,6 +1482,7 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "hpke",
+ "libc",
  "rand_core 0.6.4",
  "ratatui",
  "reqwest",
