@@ -54,6 +54,11 @@ pub struct Settings {
     /// Lend spare CPU threads and system RAM (`PROVIDER_SHARE_CPU`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub share_cpu: Option<bool>,
+    /// List this node in the KMPLIFY marketplace's Compute category
+    /// (`PROVIDER_MARKETPLACE`). Off unless switched on: lending is not a
+    /// request to be shown in a public catalogue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marketplace: Option<bool>,
     /// Container session templates this node accepts (`PROVIDER_WORKLOADS`).
     /// An empty list is a real choice: sessions off.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -139,6 +144,7 @@ pub struct Settings {
 pub const KEYS: &[(&str, &str)] = &[
     ("share-inference", "PROVIDER_SHARE_INFERENCE"),
     ("share-cpu", "PROVIDER_SHARE_CPU"),
+    ("marketplace", "PROVIDER_MARKETPLACE"),
     ("workloads", "PROVIDER_WORKLOADS"),
     ("approval-mode", "PROVIDER_APPROVAL_MODE"),
     ("country", "PROVIDER_COUNTRY"),
@@ -206,6 +212,9 @@ impl Settings {
         }
         if let Some(v) = self.share_cpu {
             cfg.share_cpu = v;
+        }
+        if let Some(v) = self.marketplace {
+            cfg.marketplace = v;
         }
         if let Some(v) = &self.workloads {
             cfg.workload_templates = v.clone();
@@ -313,6 +322,13 @@ impl Settings {
                 v.to_string(),
             );
         }
+        if let Some(v) = self.marketplace {
+            note(
+                "PROVIDER_MARKETPLACE",
+                from_env.marketplace.to_string(),
+                v.to_string(),
+            );
+        }
         if let Some(v) = &self.workloads {
             note(
                 "PROVIDER_WORKLOADS",
@@ -397,6 +413,7 @@ impl Settings {
         match key {
             "share-inference" => self.share_inference = Some(parse_bool(key, value)?),
             "share-cpu" => self.share_cpu = Some(parse_bool(key, value)?),
+            "marketplace" => self.marketplace = Some(parse_bool(key, value)?),
             "workloads" => {
                 self.workloads = Some(
                     value
@@ -520,6 +537,7 @@ impl Settings {
         match key {
             "share-inference" => self.share_inference = None,
             "share-cpu" => self.share_cpu = None,
+            "marketplace" => self.marketplace = None,
             "workloads" => self.workloads = None,
             "approval-mode" => self.approval_mode = None,
             "country" => self.country = None,
@@ -565,6 +583,7 @@ impl Settings {
             self.share_inference.map(|v| v.to_string()),
         );
         push("share-cpu", self.share_cpu.map(|v| v.to_string()));
+        push("marketplace", self.marketplace.map(|v| v.to_string()));
         push("workloads", self.workloads.as_ref().map(|v| v.join(",")));
         push("approval-mode", self.approval_mode.clone());
         push("country", self.country.clone());
@@ -743,6 +762,30 @@ mod tests {
                 (cfg.share_inference, cfg.share_cpu, cfg.max_shared_cpus)
             )
         );
+    }
+
+    /// Being listed in the marketplace is the operator's own switch: off
+    /// unless it is set, on for "true", and it leaves sharing alone.
+    #[test]
+    fn marketplace_listing_is_off_until_it_is_switched_on() {
+        let mut s = Settings::default();
+        let mut cfg = env_cfg();
+        s.apply(&mut cfg);
+        assert!(!cfg.marketplace, "a node is listed without having asked");
+
+        s.set("share-cpu", "true").unwrap();
+        s.apply(&mut cfg);
+        assert!(!cfg.marketplace, "lending listed the node by itself");
+
+        s.set("marketplace", "true").unwrap();
+        s.apply(&mut cfg);
+        assert!(cfg.marketplace);
+        assert!(s.set("marketplace", "sometimes").is_err());
+
+        s.clear("marketplace").unwrap();
+        let mut fresh = env_cfg();
+        s.apply(&mut fresh);
+        assert!(!fresh.marketplace, "clearing it did not return to the default");
     }
 
     #[test]
