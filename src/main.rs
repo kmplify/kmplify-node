@@ -31,6 +31,7 @@
 //!   PROVIDER_COUNTRY       ISO alpha-2 for EU-only consumers, "" = undeclared
 //!   PROVIDER_SHARE_INFERENCE  serve chat/embedding jobs (default true)
 //!   PROVIDER_SHARE_CPU     lend spare CPU threads and RAM (default false)
+//!   PROVIDER_MARKETPLACE   list this node in the marketplace (default false)
 //!   PROVIDER_APPROVAL_MODE auto | manual consumer admission
 //!   OLLAMA_BASE            host Ollama for model serving (default localhost)
 //!   COLIBRI_BASE           optional colibri gateway for frontier models
@@ -269,6 +270,8 @@ fn resolve_config(errs: &mut Vec<String>) -> WorkerConfig {
         } else {
             env_bool("KMPLIFY_SHARE_CPU", false, errs)
         },
+        // Listed in the marketplace only when the operator says so.
+        marketplace: env_bool("PROVIDER_MARKETPLACE", false, errs),
         approval_mode,
         // Filled in by the caller once the accelerator has been probed; doing
         // it here would make every command that merely reads configuration
@@ -1793,6 +1796,7 @@ mod tests {
             "PROVIDER_SHARE_INFERENCE",
             "PROVIDER_SHARE_CPU",
             "KMPLIFY_SHARE_CPU",
+            "PROVIDER_MARKETPLACE",
             "PROVIDER_APPROVAL_MODE",
             "PROVIDER_WORKLOADS",
             "OLLAMA_BASE",
