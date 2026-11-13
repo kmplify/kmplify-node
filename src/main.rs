@@ -1471,7 +1471,7 @@ pub(crate) async fn start_node(cfg: WorkerConfig, dir: PathBuf) -> Node {
             );
             status::push_log(format!(
                 "node identity {}…",
-                &c.node_id[..8.min(c.node_id.len())]
+                &c.node_id[..16.min(c.node_id.len())]
             ));
         }
         Err(e) => {
@@ -1559,7 +1559,7 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
     if !snap.node_id.is_empty() {
         println!(
             "[kmplify-node] node identity {}…",
-            &snap.node_id[..8.min(snap.node_id.len())]
+            &snap.node_id[..16.min(snap.node_id.len())]
         );
     }
     let mut control_rx = fabric_worker::subscribe_control();
