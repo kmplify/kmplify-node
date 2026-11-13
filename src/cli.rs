@@ -189,6 +189,11 @@ const BOOL_FLAGS: &[(&str, &str, &str)] = &[
         "lend spare CPU threads and RAM",
     ),
     (
+        "--marketplace",
+        "PROVIDER_MARKETPLACE",
+        "list this node in the KMPLIFY marketplace",
+    ),
+    (
         "--functions",
         "PROVIDER_FUNCTIONS",
         "host signed Wasm functions",

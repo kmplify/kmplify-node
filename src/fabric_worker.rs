@@ -621,6 +621,7 @@ impl Default for WorkerConfig {
             max_shared_disk_gb: None,
             share_inference: true,
             share_cpu: false,
+            marketplace: false,
             // None = report this crate's version, which is correct for
             // everything except an embedder with its own release cycle.
             client_version: None,
@@ -722,6 +723,10 @@ pub struct WorkerConfig {
     /// Apple Silicon). Advertised as the hello's `cpu_share` block so the
     /// grid can show general CPU/RAM capacity next to the GPU.
     pub share_cpu: bool,
+    /// The operator switched on being listed in the KMPLIFY marketplace's
+    /// Compute category. Sent in the hello; the gateway lists a node only on
+    /// a literal true. Off by default.
+    pub marketplace: bool,
     /// Peer-consumer admission: "auto" (anyone connects) or "manual" (the
     /// gateway parks unknown consumers until this provider approves them).
     /// Declared on the hello frame; invitations always bypass the gate.
@@ -6178,6 +6183,9 @@ async fn session(
         // total RAM. Independent of cpu_share, which says only what was
         // volunteered — a GPU peer still has a CPU worth naming.
         "cpu": cpu_info(),
+        // Listed in the marketplace's Compute category only when the
+        // operator said so (v5.1); older gateways ignore the field.
+        "marketplace": cfg.marketplace,
         // General CPU/RAM lending (v2.3): threads bounded by the operator's
         // ceiling, RAM the machine's total. Absent entirely when the
         // operator has not opted in — pre-v2.3 gateways ignore the field.
