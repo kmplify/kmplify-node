@@ -960,7 +960,7 @@ pub async fn ensure_identity(gateway_url: &str, creds_path: &Path) -> Result<Cre
     }
     log(format!(
         "registered as anonymous node {}…",
-        &creds.node_id[..8.min(creds.node_id.len())]
+        &creds.node_id[..16.min(creds.node_id.len())]
     ));
     Ok(creds)
 }
@@ -1028,7 +1028,7 @@ pub async fn register_identity(
         .is_some_and(|c| c.node_id == creds.node_id);
     log(format!(
         "re-registered as anonymous node {}… ({})",
-        &creds.node_id[..8.min(creds.node_id.len())],
+        &creds.node_id[..16.min(creds.node_id.len())],
         if kept {
             "gateway re-adopted the previous identity — existing invitations stay valid"
         } else {
