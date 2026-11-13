@@ -3849,6 +3849,58 @@ fn pct(done: u64, total: u64) -> f64 {
     (done as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
 }
 
+/// The ComfyUI models volume both ComfyUI templates mount.
+const COMFYUI_MODELS_VOLUME: &str = "kmplify-fabric-comfyui-models";
+
+/// The model files a template needs when the gateway's frame names none.
+///
+/// The gateway in production predates manifests and sends no `models`, so a
+/// cold peer greeted every consumer with a default canvas whose nodes were
+/// red. ComfyUI's default canvas in the image we run (yanwk/comfyui-boot
+/// cu126-slim) is the Z-Image Turbo text-to-image workflow; these are exactly
+/// the three files it loads, from Comfy-Org's own Hugging Face repository
+/// (Apache-2.0), with the sha256 of each file's LFS object. About 21 GB, once
+/// per provider: a file already in the volume costs nothing. A frame that
+/// DOES carry a manifest always wins over this list.
+fn builtin_models(template: &str) -> Value {
+    match template {
+        "comfyui" | "comfyui-api" => json!([
+            {
+                "volume": COMFYUI_MODELS_VOLUME,
+                "path": "diffusion_models/z_image_turbo_bf16.safetensors",
+                "url": "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/diffusion_models/z_image_turbo_bf16.safetensors",
+                "sha256": "2407613050b809ffdff18a4ac99af83ea6b95443ecebdf80e064a79c825574a6",
+                "bytes": 12309866400u64,
+            },
+            {
+                "volume": COMFYUI_MODELS_VOLUME,
+                "path": "text_encoders/qwen_3_4b.safetensors",
+                "url": "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors",
+                "sha256": "6c671498573ac2f7a5501502ccce8d2b08ea6ca2f661c458e708f36b36edfc5a",
+                "bytes": 8044982048u64,
+            },
+            {
+                "volume": COMFYUI_MODELS_VOLUME,
+                "path": "vae/ae.safetensors",
+                "url": "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/vae/ae.safetensors",
+                "sha256": "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38",
+                "bytes": 335304388u64,
+            },
+        ]),
+        _ => Value::Null,
+    }
+}
+
+/// The manifest to fetch for this session: the frame's own, else the
+/// built-in one for the template.
+fn session_manifest(frame: &Value, template: &str) -> Value {
+    if frame["models"].is_null() {
+        builtin_models(template)
+    } else {
+        frame["models"].clone()
+    }
+}
+
 fn container_name(session: &str) -> String {
     format!("kmplify-fabric-{}", &session[..12.min(session.len())])
 }
@@ -4374,7 +4426,9 @@ async fn start_workload(
     // workflow that runs instead of a missing-models dialog. Everything in
     // the frame is re-validated here; a refused manifest fails the session
     // loudly rather than starting an app the catalog says is incomplete.
-    match parse_models(&frame["models"], &mounted_fabric) {
+    // A gateway that sends no manifest (production predates v3.4 on the
+    // live host) gets the built-in list for the template.
+    match parse_models(&session_manifest(&frame, &template), &mounted_fabric) {
         Err(why) => {
             hosted_remove(&session).await;
             workload_status(
@@ -9418,5 +9472,24 @@ mod usage_sample_tests {
         for line in ["", "name only", "x\t--\t-- / --", "x\tfast%\t1MiB / 2MiB", "\t1%\t1MiB / 2MiB", "x\t-3%\t1MiB / 2MiB"] {
             assert!(parse_stats_line(line).is_none(), "{line:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod builtin_model_tests {
+    use super::*;
+
+    #[test]
+    fn comfyui_without_a_gateway_manifest_gets_its_default_workflow_models() {
+        let mounts: std::collections::HashSet<String> = ["kmplify-fabric-comfyui-cu126", COMFYUI_MODELS_VOLUME]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let specs = parse_models(&session_manifest(&json!({}), "comfyui"), &mounts).unwrap();
+        assert_eq!(specs.len(), 3);
+        assert!(specs.iter().any(|s| s.path == "diffusion_models/z_image_turbo_bf16.safetensors"));
+        // The frame's own manifest wins, and other templates get nothing.
+        assert!(parse_models(&session_manifest(&json!({"models": []}), "comfyui"), &mounts).unwrap().is_empty());
+        assert!(session_manifest(&json!({}), "ollama").is_null());
     }
 }
