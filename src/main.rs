@@ -33,6 +33,11 @@
 //!   PROVIDER_SHARE_CPU     lend spare CPU threads and RAM (default false)
 //!   PROVIDER_MARKETPLACE   list this node in the marketplace (default false)
 //!   PROVIDER_APPROVAL_MODE auto | manual consumer admission
+//!   PROVIDER_DOCUMENT_TERMS the Peer Compute provider terms version the
+//!                          operator accepted (e.g. 2026-11); only the current
+//!                          one enables document jobs (page vision), unset =
+//!                          none. Recorded with its first time in
+//!                          <node dir>/provider-document-terms.json
 //!   OLLAMA_BASE            host Ollama for model serving (default localhost)
 //!   COLIBRI_BASE           optional colibri gateway for frontier models
 //!   KMPLIFY_NODE_DIR       identity/credentials dir
@@ -1714,6 +1719,22 @@ async fn main() {
         }
         eprintln!("\nnothing was started. Fix the configuration and try again.");
         std::process::exit(EXIT_USAGE);
+    }
+    // Provider terms for document content: the version the operator states
+    // in the environment is recorded with its first time; without the
+    // variable (or with an old version) the record is dropped and the node
+    // takes no document jobs.
+    match env_opt("PROVIDER_DOCUMENT_TERMS") {
+        Some(v) => match kmplify_node::provider_terms::accept(&dir, &v) {
+            Ok(a) => eprintln!("kmplify-node: provider document terms {} accepted at {}", a.version, a.accepted_at),
+            Err(e) => {
+                let _ = kmplify_node::provider_terms::withdraw(&dir);
+                eprintln!("kmplify-node: PROVIDER_DOCUMENT_TERMS not used: {e}. No document jobs.");
+            }
+        },
+        None => {
+            let _ = kmplify_node::provider_terms::withdraw(&dir);
+        }
     }
     // What the operator chose in the dashboard or with `set` wins over the
     // environment; see the settings module for why round that way.

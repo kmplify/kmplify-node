@@ -797,6 +797,8 @@ impl Credentials {
 
 fn log(msg: impl std::fmt::Display) {
     let msg = msg.to_string();
+    #[cfg(test)]
+    log_capture::push(msg.clone());
     // Every line also lands in the status ring, which is what the dashboard's
     // log pane and an attached `kmplify-node tui` read. Kept here rather than
     // at the call sites so a line can never exist in one surface and not the
@@ -807,6 +809,34 @@ fn log(msg: impl std::fmt::Display) {
     if !crate::status::quiet() {
         println!("[fabric-worker] {msg}");
     }
+}
+
+/// Every worker log line, kept in tests only, so a test can prove that no
+/// request or reply content reaches the log (provider terms, "what a
+/// provider machine keeps").
+#[cfg(test)]
+pub(crate) mod log_capture {
+    static LINES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    pub fn push(line: String) {
+        LINES.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+    }
+    pub fn all() -> Vec<String> {
+        LINES.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// The error frame for a document job this node may not run, or None
+/// (protocol v5.3): a job marked `content: "document"` needs a current
+/// acceptance of the provider terms and an engine that does not log prompts.
+/// The refusal names a code only, never anything from the request.
+fn document_job_refusal(frame: &Value, terms_dir: Option<&Path>) -> Option<Value> {
+    if !crate::provider_terms::is_document_job(frame) {
+        return None;
+    }
+    let code = crate::provider_terms::refusal_for(terms_dir)?;
+    let job_id = frame["id"].as_str().unwrap_or_default();
+    log(format!("job {} refused: document content needs {code}", &job_id[..job_id.len().min(8)]));
+    Some(json!({"type": "error", "id": job_id, "code": code, "message": code}))
 }
 
 /// Write a file only its owner may read.
@@ -6240,6 +6270,9 @@ async fn session(
         // Listed in the marketplace's Compute category only when the
         // operator said so (v5.1); older gateways ignore the field.
         "marketplace": cfg.marketplace,
+        // Provider terms for document content (protocol v5.3): version and
+        // time accepted, or null. Older gateways ignore the key.
+        "document_terms": crate::provider_terms::hello_block(cfg.creds_path.parent()),
         // General CPU/RAM lending (v2.3): threads bounded by the operator's
         // ceiling, RAM the machine's total. Absent entirely when the
         // operator has not opted in — pre-v2.3 gateways ignore the field.
@@ -6768,6 +6801,14 @@ async fn session(
                                 crate::status::JobGuard::lane(crate::status::Lane::Vector);
                             run_vector_job(sink, store, frame).await;
                         });
+                    }
+                    Some("job")
+                        if crate::provider_terms::is_document_job(&frame)
+                            && crate::provider_terms::refusal_for(cfg.creds_path.parent()).is_some() =>
+                    {
+                        if let Some(refusal) = document_job_refusal(&frame, cfg.creds_path.parent()) {
+                            send_frame(&sink, refusal).await;
+                        }
                     }
                     Some("job") => {
                         // Counted around the spawn, not inside run_job: the
@@ -9499,5 +9540,142 @@ mod builtin_model_tests {
         // The frame's own manifest wins, and other templates get nothing.
         assert!(parse_models(&session_manifest(&json!({"models": []}), "comfyui"), &mounts).unwrap().is_empty());
         assert!(session_manifest(&json!({}), "ollama").is_null());
+    }
+}
+
+/// DSGVO (provider terms, "what a provider machine keeps"): document jobs
+/// need the terms, and no job's text, image or reply reaches a log line.
+#[cfg(test)]
+mod document_terms_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const MARK: &str = "DSGVO-CANARY-7f3a91";
+
+    async fn fake_engine(status: &'static str, content_type: &'static str, body: String) -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = l.accept().await {
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    let mut got = Vec::new();
+                    loop {
+                        let n = sock.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        got.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&got);
+                        if let Some(h) = text.find("\r\n\r\n") {
+                            let len = text[..h]
+                                .lines()
+                                .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                                .unwrap_or(0);
+                            if got.len() >= h + 4 + len {
+                                break;
+                            }
+                        }
+                    }
+                    let head = format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    async fn run(base: &str, frame: Value) -> Vec<Value> {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let far = tokio::spawn(async move {
+            let (sock, _) = l.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(sock).await.unwrap();
+            let mut frames = Vec::new();
+            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                let end = matches!(v["type"].as_str(), Some("done") | Some("error"));
+                frames.push(v);
+                if end {
+                    break;
+                }
+            }
+            frames
+        });
+        let (ws, _) = connect_async(format!("ws://{addr}")).await.unwrap();
+        let (sink, _read) = ws.split();
+        let upstreams = JobUpstreams {
+            ollama_base: base.to_string(),
+            colibri_base: String::new(),
+            colibri_api_key: String::new(),
+            engines: Default::default(),
+            envelope: None,
+            primary_openai_only: false,
+        };
+        run_job(Arc::new(Mutex::new(sink)), reqwest::Client::new(), upstreams, frame).await;
+        far.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn no_payload_reaches_a_log_line() {
+        let image = format!("data:image/png;base64,{}", b64_encode(MARK.as_bytes()));
+        let messages = json!([{"role": "user", "content": [
+            {"type": "text", "text": format!("Seite 1 von {MARK}")},
+            {"type": "image_url", "image_url": {"url": image}},
+        ]}]);
+        let ok = json!({"id": "c", "object": "chat.completion", "model": "vl",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": format!("Antwort {MARK}")}, "finish_reason": "stop"}]}).to_string();
+        let sse = format!("data: {}\n\ndata: [DONE]\n\n", json!({"choices": [{"index": 0, "delta": {"content": MARK}}]}));
+        let cases = vec![
+            (fake_engine("200 OK", "application/json", ok).await, false),
+            (fake_engine("200 OK", "text/event-stream", sse).await, true),
+            (fake_engine("400 Bad Request", "text/plain", format!("bad prompt: {MARK}")).await, false),
+            (fake_engine("500 Internal Server Error", "text/plain", format!("crash near {MARK}")).await, true),
+            ("http://127.0.0.1:9".to_string(), false),
+        ];
+        for (i, (base, stream)) in cases.into_iter().enumerate() {
+            let frame = json!({"type": "job", "id": format!("nostore{i}"), "kind": "chat", "content": "document",
+                "payload": {"model": "vl", "messages": messages, "stream": stream}});
+            assert!(!run(&base, frame).await.is_empty(), "the consumer always gets an answer");
+        }
+        let refused = document_job_refusal(
+            &json!({"type": "job", "id": "gate", "content": "document", "payload": {"messages": messages}}),
+            None,
+        )
+        .expect("no terms without a folder");
+        assert!(!refused.to_string().contains(MARK));
+        let lines = super::log_capture::all();
+        assert!(lines.iter().any(|l| l.contains("refused")), "the capture sees worker lines");
+        for l in &lines {
+            assert!(!l.contains(MARK), "a log line holds request or reply content: {l}");
+        }
+        for l in crate::status::logs() {
+            assert!(!l.contains(MARK), "the status ring holds request or reply content: {l}");
+        }
+    }
+
+    #[test]
+    fn document_jobs_need_the_current_terms() {
+        let dir = std::env::temp_dir().join(format!("kmplify-node-docgate-{}-{}", std::process::id(), now_s_test()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = json!({"type": "job", "id": "d1", "kind": "chat", "content": "document", "payload": {"model": "m"}});
+        let chat = json!({"type": "job", "id": "c1", "kind": "chat", "payload": {"model": "m"}});
+        assert_eq!(document_job_refusal(&chat, None), None, "ordinary jobs are not affected");
+        let r = document_job_refusal(&doc, Some(&dir)).expect("no acceptance on file");
+        assert_eq!(r["code"], "peer_document_terms_missing");
+        std::fs::write(crate::provider_terms::path(&dir), r#"{"version":"2025-01","accepted_at":1}"#).unwrap();
+        assert!(document_job_refusal(&doc, Some(&dir)).is_some(), "an older version is not enough");
+        crate::provider_terms::accept(&dir, crate::provider_terms::CURRENT_VERSION).unwrap();
+        if crate::provider_terms::engine_logs_prompts() {
+            assert_eq!(document_job_refusal(&doc, Some(&dir)).unwrap()["code"], "peer_document_engine_logging");
+        } else {
+            assert_eq!(document_job_refusal(&doc, Some(&dir)), None);
+        }
+    }
+
+    fn now_s_test() -> u128 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     }
 }
