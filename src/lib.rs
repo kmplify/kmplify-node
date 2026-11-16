@@ -26,6 +26,7 @@ pub mod hostcpu;
 pub mod identity;
 pub mod peers;
 pub mod proc;
+pub mod provider_terms;
 pub mod rewards;
 pub mod settings;
 pub mod status;
