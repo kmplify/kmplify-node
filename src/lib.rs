@@ -16,6 +16,7 @@
 
 pub mod catalog;
 pub mod control;
+pub mod credits;
 pub mod engines;
 pub mod envelope;
 pub mod fabric_worker;
