@@ -3043,8 +3043,23 @@ async fn sample_inventory() -> (Option<u64>, Vec<String>, Option<String>) {
 /// seconds, while a cold one makes the consumer wait out the pull and costs
 /// the provider the bandwidth and the disk. `docker images` is a metadata
 /// read — no container spawn, no filesystem walk.
+///
+/// Each image is advertised by tag (`repo:tag`) AND by digest
+/// (`repo@sha256:…`). The gateway matches a template's image string exactly,
+/// and a template pinned by digest (`ollama/ollama@sha256:…`) never equals a
+/// tag, so a node that advertised tags only looked cold for every pinned
+/// template it had already pulled. One `docker images` call yields both, the
+/// same on Linux, macOS and Windows (it is the docker CLI either way).
 async fn cached_images() -> Result<Vec<String>, String> {
-    let out = docker_bounded(&["images", "--format", "{{.Repository}}:{{.Tag}}"], DOCKER_INVENTORY_TIMEOUT).await?;
+    let out = docker_bounded(
+        &[
+            "images",
+            "--format",
+            "{{.Repository}}\t{{.Tag}}\t{{.Digest}}",
+        ],
+        DOCKER_INVENTORY_TIMEOUT,
+    )
+    .await?;
     if !out.status.success() {
         return Err(format!(
             "docker images failed: {}",
@@ -3055,11 +3070,44 @@ async fn cached_images() -> Result<Vec<String>, String> {
                 .collect::<String>()
         ));
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty() && l != "<none>:<none>")
-        .collect())
+    Ok(parse_image_inventory(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Turn `docker images --format '{{.Repository}}\t{{.Tag}}\t{{.Digest}}'`
+/// output into the advertised list: `repo:tag` for every tagged image, then
+/// `repo@digest` for every image that has a digest, in first-seen order and
+/// without duplicates (one image tagged twice shares one digest). `<none>`
+/// in any column means "not there" and contributes nothing: `repo:<none>` or
+/// `repo@<none>` can never equal a template image, so advertising it would
+/// only be noise. A locally built image has no digest and is advertised by
+/// tag alone, exactly as before.
+///
+/// Order is stable for a given docker output, which matters: the worker
+/// re-advertises whenever this list differs from the last one it sent.
+fn parse_image_inventory(stdout: &str) -> Vec<String> {
+    let none = |v: &str| v.is_empty() || v == "<none>";
+    let mut tags: Vec<String> = Vec::new();
+    let mut digests: Vec<String> = Vec::new();
+    for line in stdout.lines() {
+        let mut cols = line.trim().split('\t').map(str::trim);
+        let repo = cols.next().unwrap_or("");
+        let tag = cols.next().unwrap_or("");
+        let digest = cols.next().unwrap_or("");
+        if none(repo) {
+            continue;
+        }
+        if !none(tag) {
+            tags.push(format!("{repo}:{tag}"));
+        }
+        if !none(digest) {
+            digests.push(format!("{repo}@{digest}"));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    tags.into_iter()
+        .chain(digests)
+        .filter(|i| seen.insert(i.clone()))
+        .collect()
 }
 
 /// May this node remove the volume on a gateway's say-so?
@@ -7372,6 +7420,86 @@ async fn run_vector_job(
 
 pub fn default_creds_path(data_dir: &Path) -> PathBuf {
     data_dir.join("fabric_node.json")
+}
+
+#[cfg(test)]
+mod image_inventory_tests {
+    use super::parse_image_inventory;
+
+    const D1: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const D2: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+    #[test]
+    fn tags_and_digests_are_both_advertised() {
+        let out = format!("ollama/ollama\t0.5.7\t{D1}\nvllm/vllm-openai\tv0.6.4\t{D2}\n");
+        assert_eq!(
+            parse_image_inventory(&out),
+            vec![
+                "ollama/ollama:0.5.7".to_string(),
+                "vllm/vllm-openai:v0.6.4".to_string(),
+                format!("ollama/ollama@{D1}"),
+                format!("vllm/vllm-openai@{D2}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_digest_pinned_template_image_is_in_the_list() {
+        // Pulled by digest only: docker shows the tag as <none>.
+        let out = format!("ollama/ollama\t<none>\t{D1}\n");
+        let imgs = parse_image_inventory(&out);
+        assert_eq!(imgs, vec![format!("ollama/ollama@{D1}")]);
+        assert!(imgs.contains(&format!("ollama/ollama@{D1}")));
+    }
+
+    #[test]
+    fn none_columns_contribute_nothing() {
+        let out = "<none>\t<none>\t<none>\n\
+                   local/build\tdev\t<none>\n\
+                   dangling/repo\t<none>\t<none>\n\
+                   <none>\t<none>\tsha256:abc\n\n   \n";
+        assert_eq!(
+            parse_image_inventory(out),
+            vec!["local/build:dev".to_string()]
+        );
+    }
+
+    #[test]
+    fn duplicates_are_removed_in_first_seen_order() {
+        // One image under two tags shares a digest; docker may also repeat
+        // a row. Each string appears once.
+        let out = format!(
+            "ollama/ollama\tlatest\t{D1}\nollama/ollama\t0.5.7\t{D1}\nollama/ollama\tlatest\t{D1}\n"
+        );
+        assert_eq!(
+            parse_image_inventory(&out),
+            vec![
+                "ollama/ollama:latest".to_string(),
+                "ollama/ollama:0.5.7".to_string(),
+                format!("ollama/ollama@{D1}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_line_endings_and_old_two_column_output_still_parse() {
+        // CRLF from docker on Windows, and a docker too old to print a
+        // digest column: tags still come through.
+        let out = format!("ollama/ollama\tlatest\t{D1}\r\nregistry:5000/x\t1\r\n");
+        assert_eq!(
+            parse_image_inventory(&out),
+            vec![
+                "ollama/ollama:latest".to_string(),
+                "registry:5000/x:1".to_string(),
+                format!("ollama/ollama@{D1}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_output_is_an_empty_list() {
+        assert!(parse_image_inventory("").is_empty());
+    }
 }
 
 #[cfg(test)]
