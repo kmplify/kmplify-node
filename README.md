@@ -1,22 +1,112 @@
-# kmplify-node
+<div align="center">
 
-The provider agent for the KMPLIFY Compute Fabric. It lends a machine's GPU, CPU
-and locally-served models to a fabric, over a single outbound connection.
+<a href="https://kmplify.io/platform/kmplify-node">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/kmplify-logo-dark.svg">
+    <img src=".github/assets/kmplify-logo-light.svg" alt="KMPLIFY" width="360">
+  </picture>
+</a>
+
+<h1>kmplify-node</h1>
+
+**Lend your GPU to the KMPLIFY Compute Fabric, on your terms.**<br>
+The open-source provider agent: it serves inference, container sessions and signed
+Wasm functions from your machine over a single outbound connection, and enforces
+every limit you set on your side of the wire.
+
+[![CI](https://github.com/kmplify/kmplify-node/actions/workflows/ci.yml/badge.svg)](https://github.com/kmplify/kmplify-node/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/kmplify/kmplify-node?color=10b981&label=release)](https://github.com/kmplify/kmplify-node/releases)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+![Rust](https://img.shields.io/badge/built%20with-Rust%201.95-dea584?logo=rust&logoColor=white)
+[![Protocol](https://img.shields.io/badge/protocol-PROTOCOL.md-334155)](PROTOCOL.md)
+<br>
+![Linux](https://img.shields.io/badge/Linux-x86__64%20%C2%B7%20aarch64-111827?logo=linux&logoColor=white)
+![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon-111827?logo=apple&logoColor=white)
+![Windows](https://img.shields.io/badge/Windows-CUDA-111827?logo=windows&logoColor=white)
+![GPUs](https://img.shields.io/badge/GPUs-NVIDIA%20%C2%B7%20AMD%20%C2%B7%20Intel%20%C2%B7%20Apple-76b900)
+![No open ports](https://img.shields.io/badge/inbound%20ports-none-0f766e)
+
+<h3>
+  <a href="#install">Install</a>
+  ·
+  <a href="https://kmplify.io/platform/kmplify-node">What kmplify-node is</a>
+  ·
+  <a href="https://kmplify.io/platform/compute-fabric">Compute Fabric</a>
+  ·
+  <a href="https://github.com/kmplify/kmplify-node/releases">Releases</a>
+  ·
+  <a href="docs/ONBOARDING.md">Onboarding walkthrough</a>
+</h3>
+
+<sub>
+  <a href="#what-it-does">What it does</a> ·
+  <a href="#hardware-support">Hardware</a> ·
+  <a href="#run">Run</a> ·
+  <a href="#the-cli">CLI</a> ·
+  <a href="#the-terminal-dashboard">Dashboard</a> ·
+  <a href="#configuration">Configuration</a> ·
+  <a href="#trust-model">Trust model</a> ·
+  <a href="#running-your-own-fabric">Your own fabric</a> ·
+  <a href="#learn-more">Learn more</a>
+</sub>
+
+</div>
+
+---
 
 This is the half of the fabric that runs on **your** machine, and it is open
 source for exactly that reason. Deciding to lend a stranger your GPU is not a
 decision anyone should make about a binary they cannot read.
 
+```mermaid
+flowchart LR
+    subgraph yours["Your machine · open source"]
+        direction TB
+        N["kmplify-node<br/>(this repository)"]
+        M["Local model server<br/>Ollama · vLLM · llama.cpp · LM Studio …"]
+        C["Optional container sessions<br/>vLLM · ComfyUI · speech"]
+        W["Optional signed Wasm functions<br/>WASI sandbox"]
+        N --> M & C & W
+    end
+
+    subgraph fabric["KMPLIFY Compute Fabric · hosted"]
+        direction TB
+        G["Gateway<br/>scheduler · registry"]
+        B["Billing · catalog<br/>marketplace"]
+        G --- B
+    end
+
+    U(["Consumers<br/>apps · API · Desktop"])
+
+    N == "one outbound WebSocket<br/>no inbound ports" ==> G
+    U --> G
 ```
-        your machine                        someone else's
-  ┌───────────────────────┐            ┌──────────────────────┐
-  │  kmplify-node         │  outbound  │  gateway             │
-  │  (this repository)    │═══════════▶│  scheduler, registry │
-  │                       │  WebSocket │  billing, catalog    │
-  │  local model server   │            │                      │
-  │  optional containers  │            │  (not open source)   │
-  └───────────────────────┘            └──────────────────────┘
-```
+
+<table>
+<tr>
+<td width="33%" valign="top">
+
+**🔒 Nothing listens**<br>
+One outbound WebSocket carries everything, including the relay to hosted
+sessions. No port forwarding, no firewall rule, no domain.
+
+</td>
+<td width="33%" valign="top">
+
+**🎛️ Your limits, enforced here**<br>
+CPU, VRAM, RAM and disk ceilings are clamped on this side, not requested
+politely from the gateway.
+
+</td>
+<td width="33%" valign="top">
+
+**🧾 Honest capacity**<br>
+Real GPU model and VRAM, physical cores, cgroup limits. The fabric only
+advertises what this machine can actually serve.
+
+</td>
+</tr>
+</table>
 
 ## What it does
 
@@ -100,6 +190,12 @@ forward a port, open a firewall or own a domain.
 It has no account. A node registers anonymously and gets an opaque id and
 token; there is no email, no PII, and nothing tying the machine to a person
 unless you separately link it for payouts.
+
+It holds no balance. Where the fabric has KMPLIFY Credits switched on, a node
+that hosts rented GPU sessions earns credits for the account it is linked to,
+and shows what the gateway reports about them. Credits are a prepaid balance
+for KMPLIFY services, not a currency, and there is no cash payout. See
+[docs/CREDITS.md](https://github.com/kmplify/kmplify-node/blob/operational/docs/CREDITS.md).
 
 It holds no wallet. No key material, no address, no chain client, no token —
 being paid is an optional companion program that reads what this node
@@ -332,6 +428,20 @@ alert` is a monitor. `--json` adds every field the dashboard draws — link
 state, per-core load, VRAM, ceilings, hosted sessions, the log tail — which is
 the machine-readable half of the monitoring story below.
 
+Where the fabric has KMPLIFY Credits switched on, three more lines follow:
+what this node earned this month and in total, the rate of its GPU class with
+the platform fee, and whether the node is linked to a KMPLIFY account. With
+the credit system off they are absent and the output is as above.
+
+```
+  credits  : 1240 earned this month · 5678 in total
+  rate     : class M (24 GB) · … credits per minute · platform fee … % · about … per minute to this node
+  account  : linked
+```
+
+The rate and the fee are the gateway's, read at that moment. On a node that is
+not linked the last line reads `NOT LINKED`, and earnings wait until it is.
+
 ### `set` — change what you lend, without a restart
 
 The dashboard's sharing screen for a shell:
@@ -414,6 +524,34 @@ Invitations are meant to be scripted:
 ```bash
 INVITE=$(kmplify-node peers invite "Anna's phone")
 ```
+
+### Earning KMPLIFY Credits
+
+A node that hosts **rented GPU sessions** (GPU apps and container sessions)
+earns KMPLIFY Credits for the seconds the renter paid for.
+
+- **What they are.** A prepaid balance for KMPLIFY services. Credits are not a
+  currency, cannot be traded or transferred, and there is **no cash payout**:
+  earned credits are spent on KMPLIFY services, for example on renting a
+  bigger GPU than your own. They are valid for 24 months.
+- **The rate.** A session is priced per minute by the GPU class of the host
+  (S, M, L or XL, by the VRAM the node lends) and metered per second.
+- **The fee.** KMPLIFY keeps a platform fee, a percentage of what the renter
+  is charged. The rest is credited to you.
+- **Where the numbers are.** Rate and fee are set on the server and can
+  change, so none is written here. `kmplify-node status` and `kmplify-node
+  rewards` show the current ones.
+- **Linking.** Earnings are booked to the KMPLIFY account the node is linked
+  to. Until it is linked they wait, and they are moved when you link it: run
+  `kmplify-node id`, copy the `kmpn1…` address, and in the KMPLIFY app choose
+  Settings, "Your KMPLIFY identity", "My nodes", "Claim node".
+- **What does not earn.** Chat and embedding jobs, functions and vector
+  collections cost their users no credits and earn none.
+
+`kmplify-node rewards` shows the figures, the latest earnings and, on an
+unlinked node, the linking steps with the address already printed. The whole
+feature is switched on at the gateway; with it off, the node shows nothing
+about credits. Details: [docs/CREDITS.md](https://github.com/kmplify/kmplify-node/blob/operational/docs/CREDITS.md).
 
 ### `rewards` — what it delivered, and (optionally) what that earns
 
@@ -602,7 +740,7 @@ falling back to a default the operator did not choose.
 |---|---|---|
 | `PROVIDER_GATEWAY_URL` | the public fabric | Gateway to join. Point it at your own. |
 | `OLLAMA_BASE` | `http://127.0.0.1:11434` | Any OpenAI-compatible endpoint, despite the name. |
-| `PROVIDER_WORKLOADS` | *empty* | Container template ids to host (`vllm-openai`, `vllm-openai-lmcache`, `comfyui`, `comfyui-api`, `ollama`, `ollama-cpu`, `speaches`, `speaches-cpu`). Empty means sessions are off. |
+| `PROVIDER_WORKLOADS` | *empty* | Container template ids to host (`vllm-openai`, `vllm-openai-lmcache`, `comfyui`, `comfyui-api`, `ollama`, `ollama-cpu`, `speaches`, `speaches-cpu`, `floci`, and on managed nodes `n8n`, `jupyter`). Empty means sessions are off. |
 | `PROVIDER_COUNTRY` | *empty* | ISO alpha-2, so consumers can prefer EU capacity. Self-declared, see below. |
 | `PROVIDER_SHARE_INFERENCE` | `true` | Serve model jobs at all. |
 | `PROVIDER_SHARE_CPU` | `false` | Offer CPU and RAM as lendable capacity. |
@@ -631,6 +769,27 @@ for the consumer, not for you.
 
 ## Trust model
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant G as Gateway
+    participant N as kmplify-node
+    participant D as Docker / model server
+
+    N->>G: outbound WebSocket (register, advertise capacity)
+    G->>N: workload_start (template, image, limits)
+    N->>N: template opted in?<br/>image matches the local pin?<br/>no host mounts?<br/>clamp memory, CPU, timeout
+    alt any rule fails
+        N-->>G: refused, nothing pulled
+    else all rules pass
+        N->>D: start boxed container<br/>cap-drop ALL · no-new-privileges · 127.0.0.1 only
+        G->>N: relayed requests over the same socket
+        N->>D: loopback only
+        D-->>N: response
+        N-->>G: response
+    end
+```
+
 The gateway schedules. The node decides what its own hardware does. Every rule
 below is enforced here, in code you can read, and none of them depend on the
 gateway behaving:
@@ -650,6 +809,12 @@ gateway behaving:
 - **Containers are boxed**: `--cap-drop ALL`, `--security-opt no-new-privileges`,
   memory and PID caps, and a 127.0.0.1-only port binding. GPU passthrough is
   the only privilege granted.
+- **No-egress sessions are reachable and still sealed**: a template the
+  catalog marks `network: none` runs on a private internal network of its
+  own with a tiny socat guard on the bridge publishing its port (Docker
+  publishes nothing for `--network none` or internal networks by itself).
+  The guard forwards one port inward and nothing else; the workload has no
+  route out and cannot see another session on the same machine.
 - **Ceilings are clamped here.** A session's memory cap, CPU share and readiness
   timeout all arrive as requests and are clamped locally, so a gateway cannot
   pin a container on your machine indefinitely or hand it the whole box.
@@ -690,6 +855,14 @@ entitled to audit, and that is worth more to us as source than as a secret.
 The same worker powers the KMPLIFY desktop app's provider mode. This repository
 is the headless build of it.
 
+## Learn more
+
+- 🖥️ **Product:** [kmplify-node on kmplify.io](https://kmplify.io/platform/kmplify-node) ([Deutsch](https://kmplify.io/de/plattform/kmplify-node))
+- 🧩 **Platform:** [KMPLIFY Compute Fabric](https://kmplify.io/platform/compute-fabric)
+- 💡 **Use case:** [Your own compute capacity](https://kmplify.io/services/own-compute-capacity)
+- ⚡ **Build for the fabric:** [Serverless apps](https://kmplify.io/platform/serverless-apps) and the [KMPLIFY Dev SDK](https://github.com/kmplify/kmplify-dev-sdk)
+- 📚 **Docs:** [kmplify.io/docs](https://kmplify.io/docs) · in this repo: [ONBOARDING](docs/ONBOARDING.md), [HEADLESS-NODE](docs/HEADLESS-NODE.md), [CREDITS](https://github.com/kmplify/kmplify-node/blob/operational/docs/CREDITS.md), [REWARDS](docs/REWARDS.md), [PROTOCOL](PROTOCOL.md)
+
 ## Contributing
 
 Yes, please, especially hardware coverage and the trust rules. See
@@ -704,3 +877,8 @@ The licence covers the code, not the name: KMPLIFY and kmplify-node are
 trademarks, and modified versions need their own name. What that means in
 practice, including everything you may do without asking, is spelled out in
 [TRADEMARKS.md](TRADEMARKS.md).
+
+<div align="center">
+<br>
+<sub>Made by <a href="https://kmplify.io">KMPLIFY</a> · Hosted in Germany · <a href="SECURITY.md">Report a vulnerability</a></sub>
+</div>
