@@ -101,6 +101,12 @@ It has no account. A node registers anonymously and gets an opaque id and
 token; there is no email, no PII, and nothing tying the machine to a person
 unless you separately link it for payouts.
 
+It holds no balance. Where the fabric has KMPLIFY Credits switched on, a node
+that hosts rented GPU sessions earns credits for the account it is linked to,
+and shows what the gateway reports about them. Credits are a prepaid balance
+for KMPLIFY services, not a currency, and there is no cash payout. See
+[docs/CREDITS.md](docs/CREDITS.md).
+
 It holds no wallet. No key material, no address, no chain client, no token —
 being paid is an optional companion program that reads what this node
 publishes and settles against the fabric's own signed receipts. See
@@ -332,6 +338,20 @@ alert` is a monitor. `--json` adds every field the dashboard draws — link
 state, per-core load, VRAM, ceilings, hosted sessions, the log tail — which is
 the machine-readable half of the monitoring story below.
 
+Where the fabric has KMPLIFY Credits switched on, three more lines follow:
+what this node earned this month and in total, the rate of its GPU class with
+the platform fee, and whether the node is linked to a KMPLIFY account. With
+the credit system off they are absent and the output is as above.
+
+```
+  credits  : 1240 earned this month · 5678 in total
+  rate     : class M (24 GB) · … credits per minute · platform fee … % · about … per minute to this node
+  account  : linked
+```
+
+The rate and the fee are the gateway's, read at that moment. On a node that is
+not linked the last line reads `NOT LINKED`, and earnings wait until it is.
+
 ### `set` — change what you lend, without a restart
 
 The dashboard's sharing screen for a shell:
@@ -414,6 +434,34 @@ Invitations are meant to be scripted:
 ```bash
 INVITE=$(kmplify-node peers invite "Anna's phone")
 ```
+
+### Earning KMPLIFY Credits
+
+A node that hosts **rented GPU sessions** (GPU apps and container sessions)
+earns KMPLIFY Credits for the seconds the renter paid for.
+
+- **What they are.** A prepaid balance for KMPLIFY services. Credits are not a
+  currency, cannot be traded or transferred, and there is **no cash payout**:
+  earned credits are spent on KMPLIFY services, for example on renting a
+  bigger GPU than your own. They are valid for 24 months.
+- **The rate.** A session is priced per minute by the GPU class of the host
+  (S, M, L or XL, by the VRAM the node lends) and metered per second.
+- **The fee.** KMPLIFY keeps a platform fee, a percentage of what the renter
+  is charged. The rest is credited to you.
+- **Where the numbers are.** Rate and fee are set on the server and can
+  change, so none is written here. `kmplify-node status` and `kmplify-node
+  rewards` show the current ones.
+- **Linking.** Earnings are booked to the KMPLIFY account the node is linked
+  to. Until it is linked they wait, and they are moved when you link it: run
+  `kmplify-node id`, copy the `kmpn1…` address, and in the KMPLIFY app choose
+  Settings, "Your KMPLIFY identity", "My nodes", "Claim node".
+- **What does not earn.** Chat and embedding jobs, functions and vector
+  collections cost their users no credits and earn none.
+
+`kmplify-node rewards` shows the figures, the latest earnings and, on an
+unlinked node, the linking steps with the address already printed. The whole
+feature is switched on at the gateway; with it off, the node shows nothing
+about credits. Details: [docs/CREDITS.md](docs/CREDITS.md).
 
 ### `rewards` — what it delivered, and (optionally) what that earns
 

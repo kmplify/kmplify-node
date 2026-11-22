@@ -839,3 +839,46 @@ consumer authenticates, and cannot read the rest.
 The node decrypts. This is not zero knowledge and not confidential computing. The only
 sentence it supports is "the relay cannot read it", and only for traffic that is
 actually sealed.
+
+## Credits: what a node earned (read-only)
+
+Optional, and outside the node link: one HTTP read with the node token. A
+gateway without the credit system answers 404 or `{"enabled": false}` and the
+node shows nothing (`src/credits.rs`, `docs/CREDITS.md`).
+
+```
+GET /fabric/credits/node
+Authorization: Bearer <node token>
+```
+
+```
+200 {"enabled": true,
+     "linked": true,
+     "gpu_class": "s"|"m"|"l"|"xl"|null,
+     "vram_gb": 24,
+     "credits_per_minute": <int>,
+     "platform_fee_percent": <number>,
+     "earned_this_month": <int>,
+     "earned_total": <int>,
+     "held": <int>,
+     "history": [{"at": "<RFC 3339>", "kind": "earning", "credits": <int>,
+                  "session_id": "...", "gpu_class": "m", "seconds": <int>,
+                  "fee_credits": <int>}]}
+```
+
+- `linked`: the node is claimed by a KMPLIFY account (the signed
+  node-ownership statement of v3.7). `held`: credits waiting for an unlinked
+  node; they move to the account when it is claimed.
+- `gpu_class` and `vram_gb`: how the gateway classed the `gpu.vram_mb` of the
+  node's hello. `credits_per_minute` is what a renter is charged on that
+  class; `platform_fee_percent` is the share the platform keeps. Both come
+  from the gateway's configuration and the node repeats them, nothing more.
+- `earned_*` and `history[].credits` are whole credits after the fee, for
+  THIS node only. `history` is newest first and may be short or absent.
+- The answer never carries an account id, a name, an e-mail address or the
+  account's balance.
+- Every field but `enabled` is optional; unknown fields are ignored. `401` is
+  a rejected token, as on every other call with it.
+
+Credits are a prepaid balance for KMPLIFY services. The node cannot spend,
+move or pay them out, and nothing in scheduling or admission reads them.
