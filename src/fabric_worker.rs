@@ -5474,6 +5474,10 @@ static RELAYS_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 struct RelaySlot;
 
 impl RelaySlot {
+    // `fetch_update` is deprecated (renamed `try_update`) on current stable,
+    // and CI builds with -D warnings; `try_update` is newer than this crate's
+    // rust-version, so the old name stays until that floor moves.
+    #[allow(deprecated)]
     fn take() -> Option<RelaySlot> {
         use std::sync::atomic::Ordering;
         RELAYS_IN_FLIGHT
