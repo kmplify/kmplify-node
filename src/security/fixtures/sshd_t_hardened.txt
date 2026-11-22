@@ -1,0 +1,10 @@
+port 22
+addressfamily any
+listenaddress [::]:22
+listenaddress 0.0.0.0:22
+usepam yes
+permitrootlogin without-password
+passwordauthentication no
+kbdinteractiveauthentication no
+pubkeyauthentication yes
+x11forwarding yes

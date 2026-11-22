@@ -840,6 +840,57 @@ The node decrypts. This is not zero knowledge and not confidential computing. Th
 sentence it supports is "the relay cannot read it", and only for traffic that is
 actually sealed.
 
+## Protocol v5.5: trusted node baseline and operator session
+
+### `security`: the node's own baseline check
+
+The node checks its own security settings at start and every 3 hours
+(`src/security/`) and sends the result in the hello and in every pong:
+
+```json
+"security": {
+  "os": "linux", "disk_encrypted": true, "patch_age_days": 12,
+  "firewall_on": true, "screen_lock": null, "ssh_password_auth": false,
+  "ssh_root_login": false, "checked_at": 1763856000, "checker_version": "1",
+  "hints": [], "sig": "<hex>"
+}
+```
+
+- `sig`: KIP-1, purpose **`node-security`**, by the node's identity key, over the
+  canonical JSON (sorted keys, no whitespace) of the nine facts plus `node_id` and
+  `pubkey`:
+  `{"checked_at","checker_version","disk_encrypted","firewall_on","node_id","os","patch_age_days","pubkey","screen_lock","ssh_password_auth","ssh_root_login"}`.
+  Null when the node has no identity key; the gateway reads that as unsigned.
+- `hints`: plain-language reasons a value is null (for example "needs administrator
+  rights"). Advisory, NOT signed, never used for a decision.
+- A value the node could not read is `null`, never a guess. `screen_lock` is null on
+  a headless machine, the two `ssh_*` facts are null when no sshd runs. The gateway's
+  rule fails closed on a required null.
+- A hello sent before the first check has finished leaves the key out (it does not
+  send `null`, which would withdraw the block the gateway kept); the next pong carries
+  it. A pong without the key keeps the last block.
+- The node never sends a trust level. The gateway computes it.
+
+### `operator_session`: who is signed in on this node
+
+Present only when an embedder (the desktop app) has a signed-in KMPLIFY session and
+reported it with `operator_session::set`, and the node has an identity key:
+
+```json
+"operator_session": {"session_id": "<public id>", "expires_at": 1763900000,
+                     "ts": 1763856000, "sig": "<hex>"}
+```
+
+- `sig`: KIP-1, purpose **`node-operator-session`**, over
+  `{"expires_at","node_id","pubkey","session_id","ts"}`. `ts` is fresh on every pong,
+  so the signature also says the node is live with that session now.
+- `session_id` is the session's PUBLIC id (8 to 64 characters of `A-Za-z0-9_-`),
+  never its token; the node refuses anything token-shaped. No account id, name or
+  e-mail address is ever sent. Logout clears it; an expired session is not sent.
+- What the session means (whose it is, its role, whether it is still valid) is for
+  the service that issued it to decide. The headless binary has no login and never
+  sends one.
+
 ## Credits: what a node earned (read-only)
 
 Optional, and outside the node link: one HTTP read with the node token. A

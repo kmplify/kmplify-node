@@ -1,0 +1,12 @@
+{
+   "blockdevices": [
+      {"name":"sda", "type":"disk", "mountpoint":null, "fstype":null,
+         "children": [
+            {"name":"sda1", "type":"part", "mountpoint":"/boot/efi", "fstype":"vfat"},
+            {"name":"sda2", "type":"part", "mountpoint":"/", "fstype":"ext4"},
+            {"name":"sda3", "type":"part", "mountpoint":"[SWAP]", "fstype":"swap"}
+         ]
+      },
+      {"name":"sr0", "type":"rom", "mountpoint":"/media/cdrom", "fstype":"iso9660"}
+   ]
+}

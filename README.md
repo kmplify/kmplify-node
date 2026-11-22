@@ -767,6 +767,42 @@ so consumers can *prefer* EU/EEA capacity, which is a data-residency preference
 and not an attestation. Declaring a country you are not in defeats the point
 for the consumer, not for you.
 
+## Trusted node baseline
+
+Personal or confidential work only runs on Trusted nodes. Trusted needs two things:
+the provider's KMPLIFY account passed the identity check, and the machine meets a
+security baseline that the node checks itself. See what yours says:
+
+```sh
+kmplify-node security check          # the checklist, with how to fix each item
+kmplify-node security check --json   # the same as data; exit code 0 when it passes
+```
+
+| Item | Passes when | Windows | macOS | Linux |
+|---|---|---|---|---|
+| Disk encryption | the system and data volumes are encrypted | BitLocker on every fixed drive | FileVault on | every mounted filesystem but /boot and EFI on LUKS (dm-crypt), swap included |
+| Security updates | the last one is at most 30 days old | Windows Update history, "Security Updates" classification, and hotfixes | install history: macOS updates and security responses (XProtect does not count) | apt history and unattended-upgrades stamp, dnf history, pacman log |
+| Firewall | it is on | Defender Firewall on for domain, private and public | Application Firewall on | ufw or firewalld on, or an nftables input chain that drops |
+| Screen lock | desktops lock within 15 minutes | lock policy or a password screen saver | password on screen saver or display sleep | GNOME or KDE lock settings; not checked without a desktop session |
+| SSH password logins | off, or no SSH server | sshd_config of OpenSSH Server | sshd_config when Remote Login is on | `sshd -T` when allowed, sshd_config otherwise |
+| SSH root login | `PermitRootLogin` is not `yes` | does not apply | sshd_config | as above |
+
+How the node checks:
+
+- At start and every 3 hours. The result goes to the fabric in the hello and every
+  pong, signed with the node's identity key (PROTOCOL.md, v5.5). The fabric decides
+  the trust level, and a check older than 6 hours no longer counts.
+- What it cannot read is reported as unknown, never guessed, and unknown counts as
+  failing. Screen lock and SSH are the exception: without a desktop session or an
+  SSH server there is nothing to check.
+- It never asks for more rights than it has: no `sudo`, no elevation prompt. When a
+  check needs administrator rights (BitLocker on some Windows drives, the nftables
+  rules on Linux), the value is unknown and the checklist says so.
+- Only the facts above are sent: no drive names, mount points, file paths or user
+  names. The checklist shows those details on your screen only.
+- The separate network segment for a Trusted node is your declaration when you accept
+  the provider terms; it is not checked here.
+
 ## Trust model
 
 ```mermaid

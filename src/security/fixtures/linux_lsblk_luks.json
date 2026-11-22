@@ -1,0 +1,23 @@
+{
+   "blockdevices": [
+      {"name":"nvme0n1", "type":"disk", "mountpoint":null, "fstype":null,
+         "children": [
+            {"name":"nvme0n1p1", "type":"part", "mountpoint":"/boot/efi", "fstype":"vfat"},
+            {"name":"nvme0n1p2", "type":"part", "mountpoint":"/boot", "fstype":"ext4"},
+            {"name":"nvme0n1p3", "type":"part", "mountpoint":null, "fstype":"crypto_LUKS",
+               "children": [
+                  {"name":"dm_crypt-0", "type":"crypt", "mountpoint":null, "fstype":"LVM2_member",
+                     "children": [
+                        {"name":"ubuntu--vg-root", "type":"lvm", "mountpoint":"/", "fstype":"ext4"},
+                        {"name":"ubuntu--vg-home", "type":"lvm", "mountpoint":"/home", "fstype":"ext4"},
+                        {"name":"ubuntu--vg-swap", "type":"lvm", "mountpoint":"[SWAP]", "fstype":"swap"}
+                     ]
+                  }
+               ]
+            }
+         ]
+      },
+      {"name":"loop0", "type":"loop", "mountpoint":"/snap/core22/1663", "fstype":"squashfs"},
+      {"name":"zram0", "type":"disk", "mountpoint":"[SWAP]", "fstype":null}
+   ]
+}
