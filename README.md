@@ -781,7 +781,7 @@ kmplify-node security check --json   # the same as data; exit code 0 when it pas
 | Item | Passes when | Windows | macOS | Linux |
 |---|---|---|---|---|
 | Disk encryption | the system and data volumes are encrypted | BitLocker on every fixed drive | FileVault on | every mounted filesystem but /boot and EFI on LUKS (dm-crypt), swap included |
-| Security updates | the last one is at most 30 days old | Windows Update history, "Security Updates" classification, and hotfixes | install history: macOS updates and security responses (XProtect does not count) | apt history and unattended-upgrades stamp, dnf history, pacman log |
+| Security updates | none is waiting, or the last one is at most 30 days old | Windows Update history and search, "Security Updates" classification, and hotfixes | install history (macOS updates and security responses; XProtect does not count) and `softwareupdate -l` | apt history, unattended-upgrades stamp and `apt-get -s dist-upgrade` (security pocket); dnf history and `dnf updateinfo --security`; pacman log (waiting updates unknown) |
 | Firewall | it is on | Defender Firewall on for domain, private and public | Application Firewall on | ufw or firewalld on, or an nftables input chain that drops |
 | Screen lock | desktops lock within 15 minutes | lock policy or a password screen saver | password on screen saver or display sleep | GNOME or KDE lock settings; not checked without a desktop session |
 | SSH password logins | off, or no SSH server | sshd_config of OpenSSH Server | sshd_config when Remote Login is on | `sshd -T` when allowed, sshd_config otherwise |

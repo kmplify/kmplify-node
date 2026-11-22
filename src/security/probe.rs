@@ -26,6 +26,13 @@ pub(super) struct Out {
 /// not finish within the timeout.
 #[allow(dead_code)]
 pub(super) async fn run(program: &str, args: &[&str]) -> Option<Out> {
+    run_for(PROBE_TIMEOUT, program, args).await
+}
+
+/// `run` with its own timeout, for a probe that may have to ask a vendor's
+/// update server.
+#[allow(dead_code)]
+pub(super) async fn run_for(timeout: Duration, program: &str, args: &[&str]) -> Option<Out> {
     let mut cmd = crate::proc::command(program);
     cmd.args(args)
         .stdin(Stdio::null())
@@ -35,7 +42,7 @@ pub(super) async fn run(program: &str, args: &[&str]) -> Option<Out> {
     // Parsers read English, fixed-format output.
     #[cfg(unix)]
     cmd.env("LC_ALL", "C").env("LANG", "C");
-    let out = tokio::time::timeout(PROBE_TIMEOUT, cmd.output())
+    let out = tokio::time::timeout(timeout, cmd.output())
         .await
         .ok()?
         .ok()?;
@@ -110,6 +117,7 @@ fn read_sshd_config(path: &std::path::Path, etc_ssh: &std::path::Path) -> Option
 struct Found {
     disk_encrypted: Option<bool>,
     last_update: Option<i64>,
+    pending: Option<u64>,
     firewall_on: Option<bool>,
     screen_lock: Option<bool>,
     ssh: Option<(bool, bool)>,
@@ -129,6 +137,7 @@ pub(super) async fn collect(now: u64) -> Report {
         patch_age_days: f
             .last_update
             .map(|t| parse::age_days(t, i64::try_from(now).unwrap_or(i64::MAX))),
+        pending_security_updates: f.pending,
         firewall_on: f.firewall_on,
         screen_lock: f.screen_lock,
         ssh_password_auth: f.ssh.map(|s| s.0),
@@ -172,6 +181,16 @@ async fn collect_os() -> Found {
     if f.last_update.is_none() {
         f.hints
             .push("No macOS update was found in the install history.".into());
+    }
+    // Asks Apple's update server; only an answer within the timeout counts.
+    f.pending = run("/usr/sbin/softwareupdate", &["-l"])
+        .await
+        .and_then(|o| parse::softwareupdate_pending(&format!("{}{}", o.stdout, o.stderr)));
+    if f.pending.is_none() {
+        f.hints.push(
+            "Waiting updates could not be listed (softwareupdate -l needs the update server)."
+                .into(),
+        );
     }
 
     f.firewall_on = match run(
@@ -277,6 +296,21 @@ $o.is_system = $id.IsSystem
 $o | ConvertTo-Json -Depth 5 -Compress
 "#;
 
+/// Security updates offered, not installed and not hidden. Reads only.
+#[cfg(windows)]
+const WINDOWS_PENDING_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+try {
+  $se = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher()
+  $r = $se.Search("IsInstalled=0 and IsHidden=0 and Type='Software'")
+  $n = 0
+  foreach ($u in $r.Updates) {
+    foreach ($c in $u.Categories) { if ($c.CategoryID -eq '0fa1201d-4330-4fa8-8ae9-b877473b6441') { $n++; break } }
+  }
+  @{ count = $n } | ConvertTo-Json -Compress
+} catch { '{"count":null}' }
+"#;
+
 #[cfg(windows)]
 async fn collect_os() -> Found {
     let mut f = Found::default();
@@ -315,6 +349,27 @@ async fn collect_os() -> Found {
     if f.last_update.is_none() {
         f.hints
             .push("No installed security update was found in the Windows Update history.".into());
+    }
+    // Its own run and timeout: the search may ask Windows Update online and
+    // must not cost the other checks their answer.
+    f.pending = run_for(
+        Duration::from_secs(120),
+        "powershell.exe",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_PENDING_SCRIPT,
+        ],
+    )
+    .await
+    .and_then(|o| parse::windows_pending_security(&o.stdout));
+    if f.pending.is_none() {
+        f.hints.push(
+            "Waiting security updates could not be listed (the Windows Update search failed or \
+             took longer than two minutes)."
+                .into(),
+        );
     }
 
     let (fw, off) = w.firewall_on();
@@ -357,6 +412,37 @@ async fn collect_os() -> Found {
 // ---------------------------------------------------------------------------
 // Linux
 // ---------------------------------------------------------------------------
+
+/// Package metadata older than this cannot vouch for "nothing waiting".
+#[cfg(target_os = "linux")]
+const LISTS_MAX_AGE_S: i64 = 7 * 86_400;
+
+/// Newest modification time of the entries in these directories, one level
+/// deep (apt's list files, dnf's per-repository cache directories).
+#[cfg(target_os = "linux")]
+fn newest_mtime(dirs: &[&str]) -> Option<i64> {
+    let mut newest = None;
+    for dir in dirs {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let mut paths = vec![entry.path()];
+            if entry.path().is_dir() {
+                paths.extend(
+                    std::fs::read_dir(entry.path())
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .map(|e| e.path()),
+                );
+            }
+            for p in paths {
+                if let Some(t) = p.to_str().and_then(mtime_s) {
+                    newest = Some(newest.map_or(t, |n: i64| n.max(t)));
+                }
+            }
+        }
+    }
+    newest
+}
 
 #[cfg(target_os = "linux")]
 fn mtime_s(path: &str) -> Option<i64> {
@@ -424,6 +510,55 @@ async fn collect_os() -> Found {
         stamps.extend(parse::pacman_last_upgrade(&text));
     }
     f.last_update = stamps.into_iter().max();
+
+    // Waiting security updates, from the package lists already on disk (no
+    // refresh: that needs root). Lists older than a week cannot say "none
+    // waiting", so the answer is then unknown.
+    let fresh = |t: Option<i64>| {
+        let now = i64::try_from(crate::identity::now_s()).unwrap_or(i64::MAX);
+        t.is_some_and(|t| now - t <= LISTS_MAX_AGE_S)
+    };
+    if crate::proc::find("apt-get").is_some() {
+        if fresh(newest_mtime(&["/var/lib/apt/lists"])) {
+            f.pending = run(
+                "apt-get",
+                &["-s", "-o", "Debug::NoLocking=1", "dist-upgrade"],
+            )
+            .await
+            .and_then(|o| parse::apt_pending_security(&o.stdout));
+        } else {
+            f.hints.push(
+                "The apt package lists are older than a week, so waiting updates are unknown; \
+                 run sudo apt update or turn on unattended-upgrades."
+                    .into(),
+            );
+        }
+    } else if crate::proc::find("dnf").is_some() {
+        if fresh(newest_mtime(&["/var/cache/dnf", "/var/cache/libdnf5"])) {
+            f.pending = run(
+                "dnf",
+                &[
+                    "-C",
+                    "-q",
+                    "updateinfo",
+                    "list",
+                    "--security",
+                    "--available",
+                ],
+            )
+            .await
+            .filter(|o| o.ok)
+            .map(|o| parse::dnf_pending_security(&o.stdout));
+        } else {
+            f.hints.push(
+                "The dnf metadata cache is older than a week, so waiting updates are unknown; \
+                 run sudo dnf makecache or turn on dnf-automatic."
+                    .into(),
+            );
+        }
+    }
+    // pacman (checkupdates) cannot tell security updates apart: unknown.
+
     if f.last_update.is_none() {
         f.hints.push(
             "The last security update could not be found (apt, dnf and pacman logs are read)."

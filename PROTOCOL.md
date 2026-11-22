@@ -850,16 +850,25 @@ The node checks its own security settings at start and every 3 hours
 ```json
 "security": {
   "os": "linux", "disk_encrypted": true, "patch_age_days": 12,
-  "firewall_on": true, "screen_lock": null, "ssh_password_auth": false,
-  "ssh_root_login": false, "checked_at": 1763856000, "checker_version": "1",
+  "pending_security_updates": 0, "firewall_on": true, "screen_lock": null, "ssh_password_auth": false,
+  "ssh_root_login": false, "checked_at": 1763856000, "checker_version": "2",
   "hints": [], "sig": "<hex>"
 }
 ```
 
 - `sig`: KIP-1, purpose **`node-security`**, by the node's identity key, over the
-  canonical JSON (sorted keys, no whitespace) of the nine facts plus `node_id` and
+  canonical JSON (sorted keys, no whitespace) of the ten facts plus `node_id` and
   `pubkey`:
-  `{"checked_at","checker_version","disk_encrypted","firewall_on","node_id","os","patch_age_days","pubkey","screen_lock","ssh_password_auth","ssh_root_login"}`.
+  `{"checked_at","checker_version","disk_encrypted","firewall_on","node_id","os","patch_age_days","pending_security_updates","pubkey","screen_lock","ssh_password_auth","ssh_root_login"}`.
+- `pending_security_updates` (checker version 2): security updates offered for this
+  machine and not installed; `0` is fully up to date, `null` unknown. The update check
+  passes with `0`, or with `patch_age_days` at most 30. Read without elevation from
+  what is already on the machine or one vendor query: Windows Update search
+  (`IsInstalled=0 and IsHidden=0`, "Security Updates" classification), `softwareupdate -l`
+  (recommended macOS and security entries, 30 s), `apt-get -s dist-upgrade` lines from a
+  `-security` pocket and `dnf -C updateinfo list --security --available`, each only when
+  the package metadata is at most 7 days old. pacman cannot tell security updates apart:
+  `null`.
   Null when the node has no identity key; the gateway reads that as unsigned.
 - `hints`: plain-language reasons a value is null (for example "needs administrator
   rights"). Advisory, NOT signed, never used for a decision.

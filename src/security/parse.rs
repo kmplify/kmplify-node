@@ -191,6 +191,32 @@ pub fn macos_last_security_update(json: &str) -> Option<i64> {
         .max()
 }
 
+/// `softwareupdate -l` (stdout and stderr together): how many recommended
+/// macOS or security updates are offered and not installed. Counted: entries
+/// whose title is a macOS release or names "Security", and that Apple marks
+/// `Recommended: YES`; Command Line Tools, Safari and other apps are not
+/// counted. "No new software available." is 0. Anything else (no network,
+/// an error) is `None`.
+pub fn softwareupdate_pending(text: &str) -> Option<u64> {
+    if text.contains("No new software available") {
+        return Some(0);
+    }
+    if !text.contains("Software Update found the following") {
+        return None;
+    }
+    let count = text
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| l.strip_prefix("Title:"))
+        .filter(|t| {
+            let lower = t.to_ascii_lowercase();
+            (lower.trim_start().starts_with("macos") || lower.contains("security"))
+                && lower.contains("recommended: yes")
+        })
+        .count();
+    Some(count as u64)
+}
+
 /// What `sysadminctl -screenLock status` says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LockDelay {
@@ -324,6 +350,17 @@ pub struct WinScreensaver {
     pub policy_active: Option<String>,
     pub policy_secure: Option<String>,
     pub policy_timeout: Option<String>,
+}
+
+/// What the separate pending-update search printed: `{"count": n}` for
+/// updates offered, not installed and not hidden in the "Security Updates"
+/// classification, or `{"count": null}` when the search failed (no network,
+/// the update service disabled).
+pub fn windows_pending_security(json: &str) -> Option<u64> {
+    let start = json.find('{')?;
+    let end = json.rfind('}')?;
+    let v: serde_json::Value = serde_json::from_str(json.get(start..=end)?).ok()?;
+    v.get("count")?.as_u64()
 }
 
 /// The Windows Update classification "Security Updates". Monthly cumulative
@@ -633,6 +670,52 @@ pub fn pacman_last_upgrade(log: &str) -> Option<i64> {
         .filter(|l| l.contains("[ALPM] upgraded "))
         .filter_map(|l| parse_datetime(l.strip_prefix('[')?.split(']').next()?))
         .max()
+}
+
+/// `apt-get -s dist-upgrade`: the `Inst` lines whose candidate comes from a
+/// security pocket (`noble-security`, `bookworm-security`,
+/// `Debian-Security:12/stable-security`). `None` when the output is not an
+/// apt simulation at all. dist-upgrade rather than upgrade so a security fix
+/// that needs a new package (a kernel) is not held back and missed.
+pub fn apt_pending_security(sim: &str) -> Option<u64> {
+    let simulated = sim.lines().any(|l| {
+        l.starts_with("Inst ")
+            || l.starts_with("Conf ")
+            || l.contains("upgraded,")
+            || l.contains("Reading package lists")
+    });
+    if !simulated {
+        return None;
+    }
+    let n = sim
+        .lines()
+        .filter(|l| l.starts_with("Inst "))
+        .filter(|l| {
+            let src = l
+                .split_once('(')
+                .map_or("", |(_, r)| r)
+                .to_ascii_lowercase();
+            src.contains("-security") || src.contains("/security")
+        })
+        .count();
+    Some(n as u64)
+}
+
+/// `dnf -C -q updateinfo list --security --available`: one line per
+/// (advisory, package) still to install. dnf 4 prints
+/// `FEDORA-2026-1a2b3c Important/Sec. openssl-…`; dnf 5 prints a header and
+/// rows with the type `security`. Counted are lines naming a security
+/// advisory; headers and blank lines are not.
+pub fn dnf_pending_security(text: &str) -> u64 {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter(|l| {
+            let words: Vec<&str> = l.split_whitespace().collect();
+            words.len() >= 3
+                && (words.iter().any(|w| w.ends_with("/Sec.")) || words.contains(&"security"))
+        })
+        .count() as u64
 }
 
 /// `/etc/ufw/ufw.conf`: `ENABLED=yes`.
@@ -1161,6 +1244,46 @@ mod tests {
             None
         );
         assert_eq!(apt_last_upgrade(""), None);
+    }
+
+    #[test]
+    fn pending_security_updates_per_os() {
+        // macOS: macOS and a security response count, Command Line Tools not.
+        let su = include_str!("fixtures/macos_softwareupdate_pending.txt");
+        assert_eq!(softwareupdate_pending(su), Some(2));
+        assert_eq!(
+            softwareupdate_pending(
+                "Software Update Tool\n\nFinding available software\nNo new software available.\n"
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            softwareupdate_pending("Cannot connect to the update server"),
+            None
+        );
+        // Debian/Ubuntu: only the security pocket counts.
+        let apt = include_str!("fixtures/linux_apt_sim_dist_upgrade.txt");
+        assert_eq!(apt_pending_security(apt), Some(2));
+        assert_eq!(
+            apt_pending_security("Reading package lists...\n0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"),
+            Some(0)
+        );
+        assert_eq!(apt_pending_security("E: Could not open lock file"), None);
+        // dnf 4 and dnf 5.
+        assert_eq!(
+            dnf_pending_security(include_str!("fixtures/linux_dnf4_updateinfo.txt")),
+            3
+        );
+        assert_eq!(
+            dnf_pending_security(include_str!("fixtures/linux_dnf5_updateinfo.txt")),
+            2
+        );
+        assert_eq!(dnf_pending_security(""), 0);
+        // Windows: the separate search.
+        assert_eq!(windows_pending_security(r#"{"count":4}"#), Some(4));
+        assert_eq!(windows_pending_security(r#"{"count":0}"#), Some(0));
+        assert_eq!(windows_pending_security(r#"{"count":null}"#), None);
+        assert_eq!(windows_pending_security(""), None);
     }
 
     #[test]

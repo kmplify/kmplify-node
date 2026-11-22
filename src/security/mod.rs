@@ -8,7 +8,7 @@
 //! | fact | what passes |
 //! |---|---|
 //! | `disk_encrypted` | BitLocker / FileVault / LUKS on the system and data volumes |
-//! | `patch_age_days` | the last security update is at most 30 days old |
+//! | `patch_age_days`, `pending_security_updates` | no security update is waiting (`0`), or the last one is at most 30 days old |
 //! | `firewall_on` | Defender Firewall / Application Firewall / ufw, firewalld or an nftables input filter |
 //! | `screen_lock` | not `false`: desktops lock within 15 minutes; `null` on a headless server |
 //! | `ssh_password_auth` | not `true`: no password logins over SSH; `null` without sshd |
@@ -35,7 +35,7 @@ use serde_json::{json, Value};
 
 /// Bumped whenever a rule here changes what passes, so the gateway can tell
 /// two verdicts made by different rules apart.
-pub const CHECKER_VERSION: &str = "1";
+pub const CHECKER_VERSION: &str = "2";
 /// KIP-1 purpose of the signature over the baseline facts.
 pub const PURPOSE_NODE_SECURITY: &str = "node-security";
 /// How old the last security update may be.
@@ -51,6 +51,11 @@ pub struct Report {
     pub os: String,
     pub disk_encrypted: Option<bool>,
     pub patch_age_days: Option<u64>,
+    /// Security updates offered for this machine and not installed: 0 means
+    /// fully up to date, null unknown. With 0 the update check passes even
+    /// when the last update is older than 30 days (the vendor shipped
+    /// nothing since). Checker version 2.
+    pub pending_security_updates: Option<u64>,
     pub firewall_on: Option<bool>,
     pub screen_lock: Option<bool>,
     pub ssh_password_auth: Option<bool>,
@@ -138,10 +143,14 @@ impl Report {
         };
         match item {
             Item::DiskEncrypted => required(self.disk_encrypted),
-            Item::PatchAge => match self.patch_age_days {
-                Some(d) if d <= MAX_PATCH_AGE_DAYS => Verdict::Pass,
-                Some(_) => Verdict::Fail,
-                None => Verdict::Unknown,
+            // Owner rule 2026-11-23: no pending security update, OR the last
+            // one at most 30 days old. A value that is known and fails either
+            // half while the other is unknown still fails.
+            Item::PatchAge => match (self.pending_security_updates, self.patch_age_days) {
+                (Some(0), _) => Verdict::Pass,
+                (_, Some(d)) if d <= MAX_PATCH_AGE_DAYS => Verdict::Pass,
+                (None, None) => Verdict::Unknown,
+                _ => Verdict::Fail,
             },
             Item::Firewall => required(self.firewall_on),
             Item::ScreenLock => match self.screen_lock {
@@ -177,8 +186,8 @@ impl Report {
         let b = |v: Option<bool>| v.map_or("null".to_string(), |v| v.to_string());
         format!(
             "{{\"checked_at\":{},\"checker_version\":{},\"disk_encrypted\":{},\"firewall_on\":{},\
-             \"node_id\":{},\"os\":{},\"patch_age_days\":{},\"pubkey\":{},\"screen_lock\":{},\
-             \"ssh_password_auth\":{},\"ssh_root_login\":{}}}",
+             \"node_id\":{},\"os\":{},\"patch_age_days\":{},\"pending_security_updates\":{},\
+             \"pubkey\":{},\"screen_lock\":{},\"ssh_password_auth\":{},\"ssh_root_login\":{}}}",
             self.checked_at,
             json!(self.checker_version),
             b(self.disk_encrypted),
@@ -186,6 +195,8 @@ impl Report {
             json!(node_id),
             json!(self.os),
             self.patch_age_days
+                .map_or("null".to_string(), |d| d.to_string()),
+            self.pending_security_updates
                 .map_or("null".to_string(), |d| d.to_string()),
             json!(pubkey_hex),
             b(self.screen_lock),
@@ -352,13 +363,28 @@ pub fn render(r: &Report, now: u64, color: bool) -> String {
             Verdict::NotApplicable => paint("2", "[ -- ]"),
         };
         let state = match (item, v) {
-            (Item::PatchAge, _) => match r.patch_age_days {
-                Some(d) => format!(
-                    "last security update {d} day{} ago (at most {MAX_PATCH_AGE_DAYS})",
-                    if d == 1 { "" } else { "s" }
-                ),
-                None => "unknown: counts as failing".into(),
-            },
+            (Item::PatchAge, _) => {
+                let age = match r.patch_age_days {
+                    Some(d) => format!(
+                        "last security update {d} day{} ago",
+                        if d == 1 { "" } else { "s" }
+                    ),
+                    None => "last security update unknown".into(),
+                };
+                let pending = match r.pending_security_updates {
+                    Some(0) => "none waiting".to_string(),
+                    Some(1) => "1 waiting".to_string(),
+                    Some(n) => format!("{n} waiting"),
+                    None => "waiting updates unknown".to_string(),
+                };
+                match v {
+                    Verdict::Unknown => format!("{age}, {pending}: counts as failing"),
+                    Verdict::Fail => format!(
+                        "{age}, {pending} (passes with none waiting or at most {MAX_PATCH_AGE_DAYS} days)"
+                    ),
+                    _ => format!("{age}, {pending}"),
+                }
+            }
             (_, Verdict::Pass) => match item {
                 Item::SshPasswordAuth => "off".into(),
                 Item::SshRootLogin => "off".into(),
@@ -412,6 +438,7 @@ mod tests {
             os: "linux".into(),
             disk_encrypted: Some(true),
             patch_age_days: Some(12),
+            pending_security_updates: Some(0),
             firewall_on: Some(true),
             screen_lock: None,
             ssh_password_auth: Some(false),
@@ -432,8 +459,14 @@ mod tests {
         let cases: [(&str, Break); 7] = [
             ("disk unknown", |r| r.disk_encrypted = None),
             ("disk off", |r| r.disk_encrypted = Some(false)),
-            ("patch unknown", |r| r.patch_age_days = None),
-            ("patch old", |r| r.patch_age_days = Some(31)),
+            ("patch unknown", |r| {
+                r.patch_age_days = None;
+                r.pending_security_updates = None
+            }),
+            ("patch old, updates waiting", |r| {
+                r.patch_age_days = Some(31);
+                r.pending_security_updates = Some(2)
+            }),
             ("firewall unknown", |r| r.firewall_on = None),
             ("screen lock off", |r| r.screen_lock = Some(false)),
             ("ssh password", |r| r.ssh_password_auth = Some(true)),
@@ -446,8 +479,25 @@ mod tests {
         let mut r = good(now);
         r.ssh_root_login = Some(true);
         assert!(!r.baseline_ok(now));
+        // Owner rule: none waiting passes whatever the age; a recent update
+        // passes whatever is waiting; known-bad plus unknown fails.
+        for (age, pending, ok) in [
+            (Some(400), Some(0), true),
+            (None, Some(0), true),
+            (Some(5), Some(3), true),
+            (Some(5), None, true),
+            (Some(31), None, false),
+            (None, Some(1), false),
+            (Some(31), Some(1), false),
+        ] {
+            let mut r = good(now);
+            r.patch_age_days = age;
+            r.pending_security_updates = pending;
+            assert_eq!(r.baseline_ok(now), ok, "{age:?} {pending:?}");
+        }
         let mut r = good(now);
         r.patch_age_days = Some(30);
+        r.pending_security_updates = None;
         r.ssh_password_auth = None;
         r.ssh_root_login = None;
         assert!(r.baseline_ok(now), "30 days, no sshd, headless");
@@ -469,9 +519,9 @@ mod tests {
         // The canonical bytes are what the gateway's canonical_json makes of
         // the same object: sorted keys, no whitespace, null for unknown.
         let expected = format!(
-            "{{\"checked_at\":1800000000,\"checker_version\":\"1\",\"disk_encrypted\":true,\
+            "{{\"checked_at\":1800000000,\"checker_version\":\"2\",\"disk_encrypted\":true,\
              \"firewall_on\":true,\"node_id\":\"node-1\",\"os\":\"linux\",\"patch_age_days\":12,\
-             \"pubkey\":\"{}\",\"screen_lock\":null,\"ssh_password_auth\":false,\
+             \"pending_security_updates\":0,\"pubkey\":\"{}\",\"screen_lock\":null,\"ssh_password_auth\":false,\
              \"ssh_root_login\":false}}",
             key.public_hex()
         );
@@ -512,8 +562,9 @@ mod tests {
             crate::identity::signing_input(PURPOSE_NODE_SECURITY, &r.canonical("node-1", &pubkey));
         let expected = format!(
             "KMPLIFY-ID-v1/node-security\n\
-             {{\"checked_at\":1763856000,\"checker_version\":\"1\",\"disk_encrypted\":true,\"firewall_on\":true,\
-             \"node_id\":\"node-1\",\"os\":\"linux\",\"patch_age_days\":12,\"pubkey\":\"{pubkey}\",\
+             {{\"checked_at\":1763856000,\"checker_version\":\"2\",\"disk_encrypted\":true,\"firewall_on\":true,\
+             \"node_id\":\"node-1\",\"os\":\"linux\",\"patch_age_days\":12,\"pending_security_updates\":0,\
+             \"pubkey\":\"{pubkey}\",\
              \"screen_lock\":null,\"ssh_password_auth\":false,\"ssh_root_login\":false}}"
         );
         assert_eq!(String::from_utf8(input).unwrap(), expected);
@@ -537,6 +588,7 @@ mod tests {
                 "hints",
                 "os",
                 "patch_age_days",
+                "pending_security_updates",
                 "screen_lock",
                 "sig",
                 "ssh_password_auth",

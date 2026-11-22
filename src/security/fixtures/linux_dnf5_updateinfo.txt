@@ -1,0 +1,3 @@
+Name                   Type        Severity               Package                                Issued
+FEDORA-2026-1a2b3c4d5e security    Important              openssl-libs-1:3.2.4-1.fc42.x86_64     2026-11-15 01:02:03
+FEDORA-2026-9f8e7d6c5b security    Moderate               curl-8.11.1-3.fc42.x86_64              2026-11-17 04:05:06
