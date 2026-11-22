@@ -1090,6 +1090,19 @@ fn draw_work(f: &mut Frame, app: &App, area: Rect) {
             )),
         ]));
     }
+    if let Some(credits) = s.credits.as_ref().filter(|c| c.enabled) {
+        lines.push(Line::from(vec![
+            field("credits"),
+            Span::styled(
+                kmplify_node::credits::summary_short(credits),
+                Style::new().fg(if credits.linked {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                }),
+            ),
+        ]));
+    }
     if let Some(rewards) = &app.rewards {
         lines.push(Line::from(vec![
             field("rewards"),

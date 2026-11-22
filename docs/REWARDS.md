@@ -14,6 +14,13 @@ as it always has. Nothing about serving depends on it.
 > asked. No node earns anything today, and nothing here should be read as an
 > income promise: rewards depend on delivered, verified, demanded compute.
 
+> **KMPLIFY Credits are a different thing.** Where a fabric has them switched
+> on, a node that hosts rented GPU sessions earns platform credits, reported by
+> the gateway and shown by `status` and `rewards` with no companion and no
+> setting. They are a prepaid balance for KMPLIFY services, not a currency,
+> and have no payout path. See [CREDITS.md](CREDITS.md). Everything below is
+> about the optional payout companion only.
+
 ## The boundary
 
 1. **kmplify-node stays token-free.** No wallet, no payment key material, no

@@ -924,6 +924,10 @@ fn run_status(dir: &std::path::Path, json: bool) -> i32 {
             human_duration(Duration::from_secs(d.session_seconds))
         );
     }
+    // KMPLIFY Credits, when the gateway reports them. No lines otherwise.
+    for line in kmplify_node::credits::status_lines(snap.credits.as_ref()) {
+        println!("{line}");
+    }
     EXIT_OK
 }
 
@@ -1083,6 +1087,21 @@ async fn run_rewards(dir: &std::path::Path, cfg: &WorkerConfig, stored: &Setting
             human_duration(Duration::from_secs(d.session_seconds))
         );
         println!("  (the node's own count — the fabric's signed receipts are what settle)");
+    }
+
+    // KMPLIFY Credits: what the gateway says this node earned. Asked live,
+    // with the node's own token, and only of a node that has registered.
+    // A gateway with the credit system off, or without it, adds nothing here.
+    if let kmplify_node::credits::Outcome::Report(report) =
+        kmplify_node::credits::fetch_for(&cfg.gateway_url, &cfg.creds_path).await
+    {
+        let address = kmplify_node::peers::credential(&cfg.creds_path)
+            .and_then(|c| c.key())
+            .map(|k| k.address());
+        println!();
+        for line in kmplify_node::credits::detail_lines(&report, address.as_deref()) {
+            println!("{line}");
+        }
     }
 
     let enabled = stored.rewards_enabled();
@@ -1492,11 +1511,19 @@ pub(crate) async fn start_node(cfg: WorkerConfig, dir: PathBuf) -> Node {
         }
     }
     let accel = cfg.accel();
+    let (gateway_url, creds_path) = (cfg.gateway_url.clone(), cfg.creds_path.clone());
     let (stop, stop_rx) = tokio::sync::watch::channel(false);
     let worker = tokio::spawn(fabric_worker::run(cfg, stop_rx.clone()));
     // Publish for `status` and for a dashboard attaching from another
     // process, and accept the commands such a dashboard sends back.
     let publisher = tokio::spawn(status::publish_loop(dir.clone(), accel, stop_rx.clone()));
+    // Earned credits for `status` and the dashboard, for as long as the
+    // node runs. Ends with the stop signal; nothing waits on it.
+    tokio::spawn(kmplify_node::credits::poll_loop(
+        gateway_url,
+        creds_path,
+        stop_rx.clone(),
+    ));
     let commands = tokio::spawn(control::watch(dir.clone(), stop_rx));
     Node {
         stop,
