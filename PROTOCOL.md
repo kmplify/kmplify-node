@@ -247,6 +247,14 @@ The worker's `hello` may add:
 `"workloads": { "enabled": true, "cuda": true, "templates": ["vllm-openai", ...] }`
 Absent = inference-only node (v1 behavior, unchanged).
 
+The block may also carry `images`: the images already pulled on the node,
+each as `repo:tag` and, when the image has a registry digest, also as
+`repo@sha256:<digest>` (de-duplicated, `<none>` entries left out). The
+gateway counts a node as warm for a template when the template's image
+string is in this list exactly, so a digest-pinned template
+(`ollama/ollama@sha256:...`) matches the digest entry. Absent = unknown or
+nothing pulled; the field is re-sent in a `workloads` frame when it changes.
+
 ### Session lifecycle
 
 - Consumer: `POST /v1/workloads {"template": "comfyui"}` →
