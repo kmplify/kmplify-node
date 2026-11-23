@@ -100,6 +100,48 @@ async function act(path, body) {
   refresh();
 }
 
+// -------------------------------------------------------------- readiness
+
+const ITEM_MARK = { pass: "✓", not_applicable: "✓", fail: "✕", unknown: "?", checked: "✓", checking: "…" };
+const ITEM_WORD = { pass: "passes", not_applicable: "not needed here", fail: "fails", unknown: "unknown, counts as failing", checked: "read", checking: "checking" };
+const STEP_WORD = { done: "done", missing: "to do", open: "not confirmed", checking: "checking" };
+
+// The ring: the share of the 6 items that pass (or, while the first check
+// runs, that were read), coloured by band, with the count in the middle.
+// The verdict next to it says the same in words.
+function ring(rd) {
+  const n = rd.band === "none" ? rd.checked : rd.passed;
+  const r = el("div", { class: "ring band-" + rd.band + (rd.checking ? " busy" : ""), "aria-hidden": "true" },
+    el("span", { class: "ring-num", text: n + "/" + rd.total }),
+    el("span", { class: "ring-sub", text: rd.band === "none" ? "read" : "checks" }));
+  r.style.setProperty("--p", String(Math.round(100 * n / rd.total)));
+  return r;
+}
+
+function readiness(rd, compact) {
+  const head = el("div", { class: "ready-head" }, ring(rd),
+    el("div", { class: "grow" },
+      el("div", { class: "ready-title" }, "Trust readiness ",
+        el("span", { class: "chip " + ({ green: "ok", amber: "warn", red: "bad" }[rd.band] || ""),
+          text: { green: "ready", amber: "almost", red: "not ready", none: "checking" }[rd.band] })),
+      el("p", { class: "verdict", role: "status", "aria-live": "polite", text: rd.verdict }),
+      rd.checking ? el("div", { class: "meter busy", role: "progressbar", "aria-label": "Security check progress",
+        "aria-valuemin": "0", "aria-valuemax": String(rd.total), "aria-valuenow": String(rd.checked),
+        "aria-valuetext": rd.checked + " of " + rd.total + " checks read" }, (() => { const b = el("span"); b.style.width = (100 * rd.checked / rd.total) + "%"; return b; })()) : null));
+  const items = el("ul", { class: "ready-items", "aria-label": "Baseline checks" },
+    rd.items.map((i) => el("li", { class: "ri " + i.state },
+      el("span", { class: "ri-mark", "aria-hidden": "true", text: ITEM_MARK[i.state] || "?" }),
+      el("span", { text: i.label }),
+      el("span", { class: "sr", text: ": " + (ITEM_WORD[i.state] || i.state) }))));
+  const steps = el("ol", { class: "steps", "aria-label": "Conditions for Trusted" },
+    rd.steps.map((st, n) => el("li", { class: "step " + st.state },
+      el("span", { class: "step-n", "aria-hidden": "true", text: st.state === "done" ? "✓" : String(n + 1) }),
+      el("div", { class: "grow" },
+        el("div", {}, el("strong", { text: st.label }), " ", el("span", { class: "chip " + ({ done: "ok", missing: "bad", open: "warn" }[st.state] || ""), text: STEP_WORD[st.state] || st.state })),
+        compact ? null : el("div", { class: "small muted", text: st.text })))));
+  return el("div", { class: "ready" }, head, items, steps);
+}
+
 // ----------------------------------------------------------------- header
 
 function header(s) {
@@ -113,7 +155,9 @@ function header(s) {
   const st = s.trust.standing;
   const trust = document.getElementById("pill-trust");
   trust.className = "pill " + (st.level === "trusted" || st.level === "cloud" ? "ok" : st.level === "community" ? "warn" : "");
-  trust.textContent = LEVEL_TEXT[st.level] || st.level;
+  const rd = s.trust.readiness, fab = s.trust.fabric;
+  trust.textContent = (st.level === "unknown" && fab && fab.state === "unreachable" ? "Fabric not reachable" : LEVEL_TEXT[st.level] || st.level)
+    + (rd && rd.band !== "none" && st.level !== "cloud" ? " | " + rd.passed + "/" + rd.total + " checks" : rd && rd.checking ? " | checking" : "");
   const badge = document.getElementById("badge-trust");
   const bad = s.trust.checklist.filter((i) => i.state === "fail" || i.state === "unknown").length;
   badge.hidden = bad === 0;
@@ -172,6 +216,7 @@ function overview(s) {
   const missing = st.missing.slice(0, 4);
   const trust = card("Trusted node",
     el("p", { class: "lead" }, el("span", { class: "pill " + (st.level === "trusted" || st.level === "cloud" ? "ok" : st.level === "community" ? "warn" : ""), text: LEVEL_TEXT[st.level] || st.level }), " ", st.headline),
+    s.trust.readiness ? readiness(s.trust.readiness, true) : null,
     missing.length ? el("ul", {}, missing.map((m) => el("li", { text: m }))) : el("p", { class: "muted", text: "Nothing is missing." }),
     st.missing.length > missing.length ? el("p", { class: "muted small", text: "and " + (st.missing.length - missing.length) + " more" }) : null,
     el("div", { class: "actions" }, el("button", { class: "btn", onclick: () => show("trust") }, "Open the checklist")));
@@ -195,6 +240,7 @@ function trustTab(s) {
     ]),
     el("div", { class: "actions" },
       el("button", { class: "btn", disabled: t.rechecking, onclick: () => act("/api/recheck") }, t.rechecking ? "Checking..." : "Re-check now")),
+    t.readiness ? readiness(t.readiness, false) : null,
     el("p", { class: "muted small", text: "Re-check runs the self-check again and sends the signed result to the fabric with the next heartbeat. The node checks itself every 3 hours anyway; a result older than 6 hours no longer counts." }));
 
   const missing = card("Missing for a Trusted node",
@@ -375,5 +421,10 @@ for (const b of document.querySelectorAll(".tabs button")) {
   b.addEventListener("click", () => show(b.dataset.tab));
 }
 if (location.hash && TABS[location.hash.slice(1)]) show(location.hash.slice(1));
-refresh();
-setInterval(refresh, 3000);
+// Every 3 s; every second while a security check runs, so the meter moves.
+async function loop() {
+  await refresh();
+  const busy = state && state.trust && state.trust.readiness && state.trust.readiness.checking;
+  setTimeout(loop, busy ? 1000 : 3000);
+}
+loop();

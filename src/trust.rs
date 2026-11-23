@@ -6,7 +6,7 @@
 //!   ([`crate::security`]), with the exact reason per item and how to fix it;
 //! * **the fabric's**: the trust level, site and baseline as the gateway
 //!   evaluated them, read from the gateway's PUBLIC `/fabric/nodes` list,
-//!   which names each node by the first 8 characters of its id.
+//!   which names each node by a prefix of its id (8, 16 or 24 characters).
 //!
 //! The node never decides its own trust level (PROTOCOL.md v5.5); this
 //! module only reads what the gateway publishes and explains it. When the
@@ -24,6 +24,8 @@ use crate::security::{Item, Report, Verdict};
 /// How often the gateway's public list is read while the node runs. The list
 /// is public and cheap, but it is a list of every node, so not every ping.
 pub const FABRIC_POLL_INTERVAL: Duration = Duration::from_secs(120);
+/// How soon to read it again while this node is not found in it.
+pub const FABRIC_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How the node was (or was not) found in `/fabric/nodes`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,30 +68,66 @@ pub struct FabricView {
     pub detail: String,
 }
 
+/// The shortest public id the gateway has ever published (8 hex characters
+/// before 2026-11-13, 16 until 2026-11-15, 24 since). Anything shorter
+/// cannot name a node.
+pub const MIN_PUBLIC_ID: usize = 8;
+
+/// A node id as the gateway compares it: lower case, without dashes.
+fn norm_id(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c != '-')
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// The entries of a `/fabric/nodes` answer: a bare list (today), or a list
+/// under `nodes` (the shape other fabric listings use).
+fn node_list(body: &Value) -> Option<&Vec<Value>> {
+    body.as_array()
+        .or_else(|| body.get("nodes").and_then(Value::as_array))
+}
+
 /// Find `node_id` in a `/fabric/nodes` answer. Pure, so every branch is
 /// tested without a gateway.
+///
+/// The gateway publishes a PREFIX of the node id in `node`, never the full
+/// id, and has grown that prefix over time (8, then 16, now 24 hex
+/// characters). So an entry is this node when its `node` is a prefix of the
+/// full id, whatever its length; the longest such prefix wins, and two
+/// entries that match equally well are ambiguous.
 pub fn match_entry(body: &Value, node_id: &str, now_ms: u64) -> FabricView {
     let mut view = FabricView {
         read_at_ms: now_ms,
         ..FabricView::default()
     };
-    if node_id.len() < 8 {
+    let me = norm_id(node_id);
+    if me.len() < MIN_PUBLIC_ID {
         view.state = Match::NoIdentity;
         return view;
     }
-    let Some(list) = body.as_array() else {
+    let Some(list) = node_list(body) else {
         view.state = Match::Unreachable;
-        view.detail = "the gateway's node list is not a list".into();
+        view.detail = "the gateway answered, but not with a node list".into();
         return view;
     };
-    let prefix = &node_id[..8];
-    let hits: Vec<&Value> = list
+    let hits: Vec<(usize, &Value)> = list
         .iter()
-        .filter(|e| e["node"].as_str() == Some(prefix))
+        .filter_map(|e| {
+            let public = norm_id(e["node"].as_str()?);
+            (public.len() >= MIN_PUBLIC_ID && me.starts_with(&public)).then_some((public.len(), e))
+        })
         .collect();
-    let entry = match hits.as_slice() {
+    let best = hits.iter().map(|(n, _)| *n).max().unwrap_or(0);
+    let top: Vec<&Value> = hits
+        .iter()
+        .filter(|(n, _)| *n == best)
+        .map(|(_, e)| *e)
+        .collect();
+    let entry = match top.as_slice() {
         [] => {
             view.state = Match::NotListed;
+            view.detail = format!("{} nodes listed", list.len());
             return view;
         }
         [one] => *one,
@@ -151,14 +189,17 @@ pub fn refresh_now() {
 /// Read `/fabric/nodes` once and find this node in it.
 pub async fn read_once(client: &reqwest::Client, gateway: &str, node_id: &str) -> FabricView {
     let now = crate::status::now_ms();
-    if node_id.len() < 8 {
+    if norm_id(node_id).len() < MIN_PUBLIC_ID {
         return match_entry(&Value::Null, node_id, now);
     }
     let url = format!("{}/fabric/nodes", gateway.trim_end_matches('/'));
     let answer = match client.get(&url).send().await {
-        Ok(r) if r.status().is_success() => r.json::<Value>().await.map_err(|e| e.to_string()),
-        Ok(r) => Err(format!("http {}", r.status().as_u16())),
-        Err(e) => Err(e.to_string()),
+        Ok(r) if r.status().is_success() => r
+            .json::<Value>()
+            .await
+            .map_err(|e| format!("the answer is not JSON: {e}")),
+        Ok(r) => Err(format!("{url} answered HTTP {}", r.status().as_u16())),
+        Err(e) => Err(error_chain(&e)),
     };
     match answer {
         Ok(body) => match_entry(&body, node_id, now),
@@ -168,6 +209,32 @@ pub async fn read_once(client: &reqwest::Client, gateway: &str, node_id: &str) -
             detail: e,
             ..FabricView::default()
         },
+    }
+}
+
+/// An error with its causes ("error sending request: ... : certificate
+/// ..."), so a TLS or DNS problem on the operator's machine is named.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        let t = s.to_string();
+        if !out.contains(&t) {
+            out.push_str(": ");
+            out.push_str(&t);
+        }
+        src = s.source();
+    }
+    out
+}
+
+/// How long to wait before reading the list again: soon while this node is
+/// not found there yet (it is listed from its first hello on, and the read
+/// may have raced the connect), the normal interval once it is.
+pub fn next_poll(view: &FabricView) -> Duration {
+    match view.state {
+        Match::Matched | Match::NoTrustFields => FABRIC_POLL_INTERVAL,
+        _ => FABRIC_RETRY_INTERVAL,
     }
 }
 
@@ -193,9 +260,9 @@ pub async fn poll_loop(gateway: String, mut stop: tokio::sync::watch::Receiver<b
                 }
             }
         }
-        delay = FABRIC_POLL_INTERVAL;
         let node_id = crate::status::snapshot().node_id;
         let view = read_once(&client, &gateway, &node_id).await;
+        delay = next_poll(&view);
         if view.state == Match::Matched {
             let now = (view.trust_level.clone(), view.failing.clone());
             if last.as_ref() != Some(&now) {
@@ -247,14 +314,15 @@ pub fn fabric_line(v: &FabricView) -> String {
             }
         }
         Match::Pending => "not read yet".into(),
-        Match::NotListed => "this node is not in the gateway's public list right now \
-                             (it is listed while connected)"
+        Match::NotListed => "the fabric answered, but this node is not in its public list \
+                             yet (a node is listed while it is connected; read again within \
+                             30 s)"
             .into(),
         Match::Ambiguous => "cannot be matched: more than one node in the gateway's list \
                              starts with this node's id"
             .into(),
         Match::NoTrustFields => "the gateway does not publish trust levels (older gateway)".into(),
-        Match::Unreachable => format!("the gateway's node list could not be read ({})", v.detail),
+        Match::Unreachable => format!("the fabric could not be reached ({})", v.detail),
         Match::NoIdentity => "this node has no identity yet".into(),
     }
 }
@@ -425,6 +493,209 @@ pub fn standing(r: Option<&Report>, f: Option<&FabricView>, now_s: u64) -> Stand
     }
 }
 
+/// One baseline item on the readiness meter.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReadyItem {
+    pub key: &'static str,
+    pub label: &'static str,
+    /// `pass`, `fail`, `unknown`, `not_applicable` from the last finished
+    /// check; `checking` or `checked` (read, verdict not out yet) while the
+    /// first one runs.
+    pub state: &'static str,
+}
+
+/// One of the three conditions for Trusted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReadyStep {
+    pub key: &'static str,
+    pub label: &'static str,
+    /// `done`, `missing`, `checking`, or `open`: an account-side step this
+    /// node cannot see, so it is shown as not confirmed rather than guessed.
+    pub state: &'static str,
+    pub text: String,
+}
+
+/// How close this machine is to Trusted, as a meter: N of 6 baseline items,
+/// the two account-side conditions as separate steps, and one sentence.
+/// Shared by the dashboard, the startup summary, `status` and the TUI, so
+/// they say the same words.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Readiness {
+    /// Baseline items that pass (not applicable counts as passing, like at
+    /// the gateway).
+    pub passed: usize,
+    pub total: usize,
+    /// `green` (all pass), `amber` (4 or 5), `red` (3 or fewer), `none`
+    /// (no finished check yet). Never the only signal: `verdict` says it.
+    pub band: &'static str,
+    /// A check is running now (the first one, or a re-check).
+    pub checking: bool,
+    /// Items read so far by the running check.
+    pub checked: usize,
+    pub items: Vec<ReadyItem>,
+    pub steps: Vec<ReadyStep>,
+    /// Labels of the failing or unreadable items, lower case.
+    pub missing: Vec<String>,
+    pub verdict: String,
+}
+
+fn lower_first(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_lowercase().chain(c).collect(),
+        None => String::new(),
+    }
+}
+
+/// The readiness meter. `progress` is where a running check is.
+pub fn readiness(
+    r: Option<&Report>,
+    f: Option<&FabricView>,
+    progress: &crate::security::Progress,
+    now_s: u64,
+) -> Readiness {
+    let total = Item::ALL.len();
+    let level = f
+        .filter(|f| f.state == Match::Matched)
+        .and_then(|f| f.trust_level.as_deref())
+        .unwrap_or("unknown");
+    let granted = matches!(level, "trusted" | "cloud");
+    let checking = progress.running;
+    let items: Vec<ReadyItem> = Item::ALL
+        .iter()
+        .map(|&i| ReadyItem {
+            key: i.key(),
+            label: i.label(),
+            state: match r {
+                Some(r) => verdict_word(r.verdict(i)),
+                None if progress.has(i) => "checked",
+                None => "checking",
+            },
+        })
+        .collect();
+    let checked = Item::ALL.iter().filter(|i| progress.has(**i)).count();
+    let passed = items
+        .iter()
+        .filter(|i| matches!(i.state, "pass" | "not_applicable"))
+        .count();
+    let missing: Vec<String> = items
+        .iter()
+        .filter(|i| matches!(i.state, "fail" | "unknown"))
+        .map(|i| lower_first(i.label))
+        .collect();
+    let stale =
+        r.is_some_and(|r| now_s.saturating_sub(r.checked_at) > crate::security::MAX_CHECK_AGE_S);
+    let band = match r {
+        None => "none",
+        Some(_) if passed == total && !stale => "green",
+        Some(_) if passed + 2 >= total => "amber",
+        Some(_) => "red",
+    };
+    let baseline = ReadyStep {
+        key: "baseline",
+        label: "Security baseline (this machine)",
+        state: match r {
+            None => "checking",
+            Some(_) if passed == total && !stale => "done",
+            Some(_) => "missing",
+        },
+        text: match r {
+            None => format!("checking: {checked} of {total} read"),
+            Some(_) if stale => {
+                format!("{passed} of {total} passed, but the check is older than 6 hours")
+            }
+            Some(_) => format!("{passed} of {total} passed"),
+        },
+    };
+    let (account, grant) = if granted {
+        (
+            (
+                "done",
+                "confirmed: the fabric lists this node as Trusted".to_string(),
+            ),
+            ("done", "granted".to_string()),
+        )
+    } else {
+        (
+            (
+                "open",
+                "your KMPLIFY provider account passes the identity check (trader verified, \
+                 2FA on); this node cannot see it"
+                    .to_string(),
+            ),
+            (
+                "open",
+                "KMPLIFY grants Trusted for this node once the account check passes".to_string(),
+            ),
+        )
+    };
+    let steps = vec![
+        baseline,
+        ReadyStep {
+            key: "identity",
+            label: "Identity check (provider account)",
+            state: account.0,
+            text: account.1,
+        },
+        ReadyStep {
+            key: "grant",
+            label: "Trust grant (KMPLIFY)",
+            state: grant.0,
+            text: grant.1,
+        },
+    ];
+    let mut verdict = match (r, level) {
+        (_, "cloud") => "Cloud node: run by KMPLIFY in its data centre.".to_string(),
+        (Some(_), "trusted") => format!("Trusted: {passed} of {total} checks passed."),
+        (None, _) => format!("Checking: {checked} of {total} checks read..."),
+        (Some(_), _) if missing.is_empty() => format!(
+            "Ready for Trusted: {passed} of {total} checks passed; still needed: identity \
+             check and trust grant."
+        ),
+        (Some(_), _) => format!(
+            "Ready for Trusted: {passed} of {total} checks passed; missing: {}.",
+            missing.join(", ")
+        ),
+    };
+    if stale && r.is_some() && level != "cloud" {
+        verdict.push_str(" The last check is older than 6 hours.");
+    }
+    if checking && r.is_some() {
+        verdict.push_str(&format!(" Re-checking now: {checked} of {total} read."));
+    }
+    Readiness {
+        passed,
+        total,
+        band,
+        checking,
+        checked,
+        items,
+        steps,
+        missing,
+        verdict,
+    }
+}
+
+/// The meter as text for a terminal: `[####--] 4/6`, one cell per item, so
+/// it reads without colour.
+pub fn readiness_bar(r: &Readiness) -> String {
+    let cells: String = r
+        .items
+        .iter()
+        .map(|i| match i.state {
+            "pass" | "not_applicable" => '#',
+            "checked" => '+',
+            "checking" => '.',
+            _ => '-',
+        })
+        .collect();
+    if r.band == "none" {
+        format!("[{cells}] {}/{} read", r.checked, r.total)
+    } else {
+        format!("[{cells}] {}/{}", r.passed, r.total)
+    }
+}
+
 /// Mask what could be a secret in a log line before it leaves the process
 /// for a screen: bearer tokens, `key=`/`token=`/`secret=`/`password=`
 /// values, and long unbroken runs of hex or base64 (keys, signatures).
@@ -520,6 +791,179 @@ mod tests {
             Match::Unreachable
         );
         assert_eq!(match_entry(&json!([]), "", 1).state, Match::NoIdentity);
+    }
+
+    /// The live gateway's answer shape (2026-11): a bare list, `node` = the
+    /// first 24 hex characters of the id. Field names as served, values fake.
+    const LIVE_SHAPE: &str = include_str!("security/fixtures/fabric_nodes_2026_11.json");
+    /// The full id whose 24-character prefix is the fixture's first entry.
+    const LIVE_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn the_node_is_found_by_the_24_character_public_id_of_todays_gateway() {
+        let body: Value = serde_json::from_str(LIVE_SHAPE).unwrap();
+        let v = match_entry(&body, LIVE_ID, 7);
+        assert_eq!(v.state, Match::Matched, "{v:?}");
+        assert_eq!(v.trust_level.as_deref(), Some("community"));
+        assert_eq!(v.site.as_deref(), Some("home"));
+        assert_eq!(v.baseline_ok, Some(false));
+        assert_eq!(v.failing, ["disk_encrypted", "screen_lock"]);
+        // The other entry is someone else's node.
+        let other = match_entry(&body, "fedcba9876543210fedcba9876543210", 7);
+        assert_eq!(other.trust_level.as_deref(), Some("trusted"));
+        // Upper case and a dashed (uuid) spelling of the same id match too.
+        let dashed = "01234567-89AB-CDEF-0123-456789ABCDEF";
+        assert_eq!(match_entry(&body, dashed, 7).state, Match::Matched);
+        // The same list under `nodes`, as other fabric listings are shaped.
+        let wrapped = json!({ "nodes": body });
+        assert_eq!(match_entry(&wrapped, LIVE_ID, 7).state, Match::Matched);
+        // An id this list does not carry: not listed, and the line says the
+        // fabric answered (it is not a connection problem).
+        let v = match_entry(&body, "99999999aaaaaaaabbbbbbbbcccccccc", 7);
+        assert_eq!(v.state, Match::NotListed);
+        assert!(fabric_line(&v).contains("the fabric answered"));
+    }
+
+    #[test]
+    fn every_public_id_length_matches_and_the_longest_prefix_wins() {
+        let entry = |node: &str, level: &str| json!({"node": node, "trust_level": level});
+        for len in [8, 16, 24, 32] {
+            let v = match_entry(&json!([entry(&ID[..len], "community")]), ID, 1);
+            assert_eq!(v.state, Match::Matched, "prefix of {len}");
+        }
+        // Too short to name a node, or not a prefix of this id.
+        assert_eq!(
+            match_entry(&json!([entry(&ID[..7], "community")]), ID, 1).state,
+            Match::NotListed
+        );
+        assert_eq!(
+            match_entry(&json!([entry("8f2c1a5b00000000", "community")]), ID, 1).state,
+            Match::NotListed
+        );
+        // An older 8-character entry of another node with the same first 8
+        // characters does not hide this node's 24-character entry.
+        let v = match_entry(
+            &json!([entry(&ID[..8], "trusted"), entry(&ID[..24], "community")]),
+            ID,
+            1,
+        );
+        assert_eq!(
+            (v.state, v.trust_level.as_deref()),
+            (Match::Matched, Some("community"))
+        );
+    }
+
+    #[test]
+    fn unreachable_and_not_listed_read_differently() {
+        let down = FabricView {
+            state: Match::Unreachable,
+            detail: "error sending request: dns error".into(),
+            ..FabricView::default()
+        };
+        let line = fabric_line(&down);
+        assert!(line.contains("could not be reached"), "{line}");
+        assert!(line.contains("dns error"), "{line}");
+        let absent = FabricView {
+            state: Match::NotListed,
+            ..FabricView::default()
+        };
+        assert!(!fabric_line(&absent).contains("could not be reached"));
+        // Not found yet: read again soon. Found: the normal interval.
+        assert_eq!(next_poll(&absent), FABRIC_RETRY_INTERVAL);
+        assert_eq!(next_poll(&down), FABRIC_RETRY_INTERVAL);
+        let found = FabricView {
+            state: Match::Matched,
+            ..FabricView::default()
+        };
+        assert_eq!(next_poll(&found), FABRIC_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn readiness_counts_the_six_items_and_names_what_is_missing() {
+        use crate::security::Progress;
+        let now = 1_800_000_000;
+        let idle = Progress::default();
+        let community = FabricView {
+            state: Match::Matched,
+            trust_level: Some("community".into()),
+            ..FabricView::default()
+        };
+        // The owner's Windows PC: disk encryption and screen lock off.
+        let r = readiness(Some(&report(now)), Some(&community), &idle, now);
+        assert_eq!((r.passed, r.total, r.band), (4, 6, "amber"));
+        assert_eq!(
+            r.verdict,
+            "Ready for Trusted: 4 of 6 checks passed; missing: disk encryption, screen lock."
+        );
+        assert_eq!(readiness_bar(&r), "[-##-##] 4/6");
+        let steps: Vec<(&str, &str)> = r.steps.iter().map(|s| (s.key, s.state)).collect();
+        assert_eq!(
+            steps,
+            [
+                ("baseline", "missing"),
+                ("identity", "open"),
+                ("grant", "open")
+            ]
+        );
+        // Unknown counts as failing, like at the gateway: red at 3 of 6.
+        let mut worse = report(now);
+        worse.firewall_on = None;
+        let r = readiness(Some(&worse), None, &idle, now);
+        assert_eq!((r.passed, r.band), (3, "red"));
+        assert!(r
+            .verdict
+            .contains("missing: disk encryption, firewall, screen lock"));
+        // All six: green, and the account side is what is left.
+        let mut ok = report(now);
+        ok.disk_encrypted = Some(true);
+        ok.screen_lock = Some(true);
+        let r = readiness(Some(&ok), Some(&community), &idle, now);
+        assert_eq!((r.passed, r.band, r.steps[0].state), (6, "green", "done"));
+        assert!(r
+            .verdict
+            .contains("still needed: identity check and trust grant"));
+        // Old check: not green even when everything passed.
+        let r = readiness(Some(&ok), None, &idle, now + 7 * 3600);
+        assert_eq!(r.band, "amber");
+        assert!(r.verdict.contains("older than 6 hours"));
+        // Trusted at the fabric: every step done.
+        let trusted = FabricView {
+            trust_level: Some("trusted".into()),
+            ..community
+        };
+        let r = readiness(Some(&ok), Some(&trusted), &idle, now);
+        assert!(r.steps.iter().all(|s| s.state == "done"), "{:?}", r.steps);
+        assert_eq!(r.verdict, "Trusted: 6 of 6 checks passed.");
+        assert!(
+            !r.verdict.contains('\u{2014}'),
+            "no em dash in operator text"
+        );
+    }
+
+    #[test]
+    fn readiness_shows_a_running_check_item_by_item() {
+        use crate::security::Progress;
+        let running = Progress {
+            running: true,
+            started_at: 1,
+            done: vec!["disk_encrypted".into(), "firewall_on".into()],
+        };
+        let r = readiness(None, None, &running, 10);
+        assert!(r.checking);
+        assert_eq!((r.checked, r.band), (2, "none"));
+        assert_eq!(r.items[0].state, "checked");
+        assert_eq!(r.items[1].state, "checking");
+        assert_eq!(r.steps[0].state, "checking");
+        assert_eq!(r.verdict, "Checking: 2 of 6 checks read...");
+        assert_eq!(readiness_bar(&r), "[+.+...] 2/6 read");
+        // A re-check over a finished result keeps the result and says so.
+        let r = readiness(Some(&report(10)), None, &running, 10);
+        assert_eq!(r.passed, 4);
+        assert!(
+            r.verdict.ends_with("Re-checking now: 2 of 6 read."),
+            "{}",
+            r.verdict
+        );
     }
 
     #[test]

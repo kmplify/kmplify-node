@@ -234,7 +234,88 @@ impl Report {
 /// Run every check now. Bounded: each probe has its own timeout, so a wedged
 /// tool costs that one fact, not the report.
 pub async fn check() -> Report {
-    probe::collect(crate::identity::now_s()).await
+    progress_begin();
+    let r = probe::collect(crate::identity::now_s()).await;
+    progress_end();
+    r
+}
+
+/// How far a running check has got, for the screens that show it working
+/// ("Checking: disk encryption done, security updates ..."). Only which
+/// items have been read, never what they read: the verdicts come with the
+/// finished [`Report`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Progress {
+    /// A check is running now.
+    pub running: bool,
+    /// When it started, unix seconds.
+    pub started_at: u64,
+    /// The keys ([`Item::key`]) of the items read so far in this run.
+    pub done: Vec<String>,
+}
+
+impl Progress {
+    /// Whether this run has read `item` yet.
+    pub fn has(&self, item: Item) -> bool {
+        self.done.iter().any(|k| k == item.key())
+    }
+}
+
+fn progress_cell() -> &'static RwLock<Progress> {
+    static P: OnceLock<RwLock<Progress>> = OnceLock::new();
+    P.get_or_init(|| RwLock::new(Progress::default()))
+}
+
+/// Checks running now (the 3-hourly one and an operator's re-check may
+/// overlap).
+static RUNNING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn progress_update(f: impl FnOnce(&mut Progress)) {
+    match progress_cell().write() {
+        Ok(mut g) => f(&mut g),
+        Err(p) => f(&mut p.into_inner()),
+    }
+}
+
+fn progress_begin() {
+    RUNNING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    progress_update(|p| {
+        p.running = true;
+        p.started_at = crate::identity::now_s();
+        p.done.clear();
+    });
+}
+
+fn progress_end() {
+    let left = RUNNING
+        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+        .saturating_sub(1);
+    progress_update(|p| {
+        p.running = left > 0;
+        if !p.running {
+            p.done = Item::ALL.iter().map(|i| i.key().to_string()).collect();
+        }
+    });
+}
+
+/// Record that the running check has read these items.
+pub(crate) fn progress_mark(items: &[Item]) {
+    progress_update(|p| {
+        for i in items {
+            if !p.done.iter().any(|k| k == i.key()) {
+                p.done.push(i.key().to_string());
+            }
+        }
+    });
+}
+
+/// Where the running check is, or the last one ended.
+pub fn progress() -> Progress {
+    match progress_cell().read() {
+        Ok(g) => g.clone(),
+        Err(p) => p.into_inner().clone(),
+    }
 }
 
 fn cell() -> &'static RwLock<Option<Report>> {
@@ -498,6 +579,23 @@ pub fn render(r: &Report, now: u64, color: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_follows_a_check_from_start_to_end() {
+        progress_begin();
+        let p = progress();
+        assert!(p.running && p.done.is_empty());
+        progress_mark(&[Item::DiskEncrypted]);
+        progress_mark(&[Item::DiskEncrypted, Item::Firewall]);
+        let p = progress();
+        assert!(p.has(Item::DiskEncrypted) && p.has(Item::Firewall));
+        assert!(!p.has(Item::PatchAge));
+        assert_eq!(p.done.len(), 2, "marked once each: {:?}", p.done);
+        progress_end();
+        let p = progress();
+        assert!(!p.running);
+        assert!(Item::ALL.iter().all(|i| p.has(*i)));
+    }
 
     fn good(now: u64) -> Report {
         Report {

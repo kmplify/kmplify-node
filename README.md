@@ -341,8 +341,31 @@ what a consumer sends), Earnings (KMPLIFY Credits where the fabric reports them)
 Settings (the sharing settings `kmplify-node set` changes, editable; everything
 else with how to change it) and Logs (the newest lines, keys and tokens
 redacted). The fabric's view comes from the gateway's public `/fabric/nodes` list,
-where a node is named by the first 8 characters of its id; if the node cannot be
-matched there, the page says so.
+where a node is named by a prefix of its id (24 hex characters today; 8 and 16 on
+older gateways, all accepted). The page says which of two things went wrong when
+the level is not known: the fabric could not be reached (with the error), or it
+answered but does not list this node yet (it is read again within 30 seconds).
+
+**Trust readiness.** The Overview and the Trusted node page show a ring with how
+many of the six baseline items pass (green: all six, amber: four or five, red:
+three or fewer), the items one by one, and the three conditions for Trusted as
+separate steps: the security baseline of this machine, the identity check of the
+provider account, and the trust grant by KMPLIFY. The node cannot see the account
+side, so those two steps read "not confirmed" until the fabric lists the node as
+Trusted. While the self-check runs, the ring and the items show how far it got
+("Checking: 2 of 6 checks read..."). Every state is written out, never colour
+only, and the terminal summary, `kmplify-node status` and `kmplify-node tui` show
+the same verdict:
+
+```
+  Readiness   [-##-##] 4/6  Ready for Trusted: 4 of 6 checks passed; missing: disk encryption, screen lock.
+    Step 1  [todo] Security baseline (this machine): 4 of 6 passed
+    Step 2  [open] Identity check (provider account): your KMPLIFY provider account passes the identity check ...
+    Step 3  [open] Trust grant (KMPLIFY): KMPLIFY grants Trusted for this node once the account check passes
+```
+
+In the bar `#` is a passing item, `-` a failing or unreadable one, `.` one still
+being checked.
 
 It is the one place the node listens, so it is locked down: it binds to
 127.0.0.1 only and refuses any other address; every request needs the random
@@ -368,6 +391,34 @@ schtasks /Create /TN kmplify-node /SC ONSTART /RU SYSTEM /RL HIGHEST /TR "\"C:\P
 A task running as SYSTEM uses the node directory you give it, so point
 `--node-dir` at the directory you want the node identity in. It cannot read your
 own screen lock setting; `kmplify-node security check` run as you shows it.
+
+### On a Linux server without a desktop
+
+Nothing needs a display. Over SSH, in a container or under systemd the node
+picks `--ui terminal` by itself (no browser, no dashboard port); say it
+explicitly with `kmplify-node run --ui terminal`, or `--ui none` for plain log
+lines only.
+
+```bash
+kmplify-node run --ui terminal     # in the foreground: the startup summary, then log lines
+kmplify-node status                # any time, from another shell: link, sharing, trust readiness, checklist
+kmplify-node status --json         # the same as data, for scripts and monitors
+kmplify-node tui                   # the terminal dashboard (included in the release binaries)
+kmplify-node security check        # every baseline item with how to fix it
+```
+
+Installed as a service (`install.sh --service`), the node runs as the user
+`kmplify` with its directory in `/var/lib/kmplify-node`; read it as that user:
+
+```bash
+sudo -u kmplify KMPLIFY_NODE_DIR=/var/lib/kmplify-node kmplify-node status
+sudo -u kmplify KMPLIFY_NODE_DIR=/var/lib/kmplify-node kmplify-node tui
+systemctl status kmplify-node      # running, since when, last lines
+journalctl -u kmplify-node -f      # follow the log
+journalctl -u kmplify-node -b      # everything since the last boot
+```
+
+The startup summary, including the trust readiness, is in the journal too.
 
 ## The CLI
 
