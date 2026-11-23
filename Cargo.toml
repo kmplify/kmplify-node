@@ -87,6 +87,12 @@ codegen-units = 16
 lto = "thin"
 strip = true
 
+# The program icon of kmplify-node.exe (the KMPLIFY app icon,
+# packaging/windows/kmplify-node.ico). Built on a Windows host only; see
+# build.rs. MIT.
+[target.'cfg(windows)'.build-dependencies]
+winresource = { version = "0.1", default-features = false }
+
 [features]
 # Both lanes ship in the released binaries. The functions lane was optional
 # for a year and the result was a fabric where the gateway could sign and

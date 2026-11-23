@@ -10,6 +10,44 @@ let current = "overview";
 let logFilter = "";
 let editing = false;
 
+// ------------------------------------------------------------------ theme
+// Follows the system (prefers-color-scheme) until the toggle is used; a
+// choice that equals the system's is forgotten, so the page follows it again.
+const THEME_KEY = "kn-theme";
+const darkQuery = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+let themeChoice = null;
+try {
+  const v = localStorage.getItem(THEME_KEY);
+  if (v === "light" || v === "dark") themeChoice = v;
+} catch (_) { themeChoice = null; }
+
+function applyTheme() {
+  const root = document.documentElement;
+  const dark = themeChoice ? themeChoice === "dark" : !!(darkQuery && darkQuery.matches);
+  if (themeChoice) root.dataset.theme = themeChoice; else delete root.dataset.theme;
+  root.toggleAttribute("data-dark", dark);
+  const b = document.getElementById("theme-toggle");
+  if (b) {
+    const label = dark ? "Switch to light theme" : "Switch to dark theme";
+    b.setAttribute("aria-label", label);
+    b.title = label;
+  }
+}
+
+function toggleTheme() {
+  const next = document.documentElement.hasAttribute("data-dark") ? "light" : "dark";
+  const system = darkQuery && darkQuery.matches ? "dark" : "light";
+  themeChoice = next === system ? null : next;
+  try {
+    if (themeChoice) localStorage.setItem(THEME_KEY, themeChoice); else localStorage.removeItem(THEME_KEY);
+  } catch (_) { /* private window: the choice holds for this page only */ }
+  applyTheme();
+}
+
+applyTheme();
+if (darkQuery && darkQuery.addEventListener) darkQuery.addEventListener("change", applyTheme);
+document.getElementById("theme-toggle").addEventListener("click", toggleTheme);
+
 function el(tag, attrs, ...kids) {
   const e = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
@@ -28,6 +66,21 @@ function el(tag, attrs, ...kids) {
 
 function card(title, ...kids) {
   return el("div", { class: "card" }, title ? el("h2", { text: title }) : null, ...kids);
+}
+
+// An embedded icon (index.html, <template id="kn-icons">), cloned; no markup
+// is ever built from strings.
+function icon(name) {
+  const t = document.getElementById("kn-icons");
+  const s = t && t.content.querySelector('[data-i="' + name + '"]');
+  return s ? s.cloneNode(true) : null;
+}
+
+// A card with the Tailux icon tile next to its title.
+function cardI(name, title, ...kids) {
+  return el("div", { class: "card" },
+    el("div", { class: "card-head" }, el("span", { class: "card-ico", "aria-hidden": "true" }, icon(name)), el("h2", { text: title })),
+    ...kids);
 }
 
 function kv(pairs) {
@@ -158,17 +211,33 @@ function header(s) {
   const rd = s.trust.readiness, fab = s.trust.fabric;
   trust.textContent = (st.level === "unknown" && fab && fab.state === "unreachable" ? "Fabric not reachable" : LEVEL_TEXT[st.level] || st.level)
     + (rd && rd.band !== "none" && st.level !== "cloud" ? " | " + rd.passed + "/" + rd.total + " checks" : rd && rd.checking ? " | checking" : "");
+  viewSwitch(s.view);
   const badge = document.getElementById("badge-trust");
   const bad = s.trust.checklist.filter((i) => i.state === "fail" || i.state === "unknown").length;
   badge.hidden = bad === 0;
   badge.textContent = String(bad);
 }
 
+// ------------------------------------------------------------------- view
+
+// Web / App window / Terminal: the same views the console keys open. Shown
+// only when a person started this node (a service has no views to switch).
+function viewSwitch(v) {
+  const box = document.getElementById("view-switch");
+  box.hidden = !(v && v.switchable);
+  if (box.hidden) return;
+  for (const b of box.querySelectorAll("button")) {
+    const which = b.dataset.view;
+    b.setAttribute("aria-pressed", which === "terminal" ? String(!!v.terminal_up) : "false");
+    b.disabled = which === "terminal" && !v.console;
+  }
+}
+
 // --------------------------------------------------------------- overview
 
 function overview(s) {
   const n = s.node, m = s.machine, sh = s.sharing, st = s.trust.standing;
-  const conn = card("Connection",
+  const conn = cardI("signal", "Connection",
     kv([
       ["Fabric", n.gateway],
       ["State", n.link === "ONLINE" ? "connected" + (n.connected_s !== null ? " for " + dur(n.connected_s) : "") : n.link.toLowerCase()],
@@ -182,11 +251,15 @@ function overview(s) {
       n.paused
         ? el("button", { class: "btn", onclick: () => act("/api/resume") }, "Resume sharing")
         : el("button", { class: "btn ghost", onclick: () => act("/api/pause") }, "Pause sharing"),
-      el("button", { class: "btn ghost", onclick: () => act("/api/reconnect") }, "Reconnect now")),
+      el("button", { class: "btn ghost", onclick: () => act("/api/reconnect") }, "Reconnect now"),
+      el("button", { class: "btn ghost", onclick: () => act("/api/report") }, "Save a report"),
+      el("button", { class: "btn ghost", onclick: () => {
+        if (window.confirm("Stop this node? Hosted sessions are torn down first.")) act("/api/shutdown");
+      } }, "Stop the node")),
     n.paused ? el("p", { class: "muted small", text: "Paused: the connection and running sessions stay up; nothing new is offered until you resume." }) : null);
 
   const models = sh.inference && sh.models.length === 0;
-  const shares = card("What this node shares",
+  const shares = cardI("share", "What this node shares",
     el("div", { class: "row" }, el("div", { class: "grow" }, el("strong", { text: "Chat models" }),
       el("div", { class: "small " + (models ? "" : "muted"), text: sh.models_text })),
       sh.inference ? el("span", { class: "chip " + (sh.models.length ? "ok" : "warn"), text: sh.models.length ? String(sh.models.length) : "none" }) : onoff(false)),
@@ -202,7 +275,7 @@ function overview(s) {
     el("p", { class: "muted small" }, "Engine: ", el("code", { text: sh.engine || "not set" }),
       sh.approval_mode ? " | admission: " + sh.approval_mode : "", sh.country ? " | country: " + sh.country : ""));
 
-  const machine = card("This machine",
+  const machine = cardI("cpu", "This machine",
     kv([
       ["GPU", m.gpu_name ? m.gpu_name + (m.vram_total_mb ? ", " + gb(m.vram_total_mb) : "") + " (" + m.accelerator + ")" : (m.accelerator || "none detected")],
       ["CPU", (m.cpu_model ? m.cpu_model + ", " : "") + (m.cpus ? m.cpus + " threads" : "")],
@@ -214,7 +287,7 @@ function overview(s) {
     m.gpu_percent !== null && m.gpu_percent !== undefined ? [el("h3", { text: "GPU " + m.gpu_percent + "%" }), meter(m.gpu_percent)] : el("p", { class: "muted small", text: "GPU load: this platform does not report it." }));
 
   const missing = st.missing.slice(0, 4);
-  const trust = card("Trusted node",
+  const trust = cardI("trust", "Trusted node",
     el("p", { class: "lead" }, el("span", { class: "pill " + (st.level === "trusted" || st.level === "cloud" ? "ok" : st.level === "community" ? "warn" : ""), text: LEVEL_TEXT[st.level] || st.level }), " ", st.headline),
     s.trust.readiness ? readiness(s.trust.readiness, true) : null,
     missing.length ? el("ul", {}, missing.map((m) => el("li", { text: m }))) : el("p", { class: "muted", text: "Nothing is missing." }),
@@ -289,11 +362,14 @@ function sessionsTab(s) {
   const se = s.sessions;
   const rows = se.current.map((x) => el("tr", {},
     el("td", {}, el("code", { text: x.id })), el("td", { text: x.template }), el("td", { text: x.state }),
-    el("td", { text: x.cpus ? x.cpus + " threads" : "" }), el("td", { text: x.since ? ago(x.since) : "" })));
+    el("td", { text: x.cpus ? x.cpus + " threads" : "" }), el("td", { text: x.since ? ago(x.since) : "" }),
+    el("td", {}, el("button", { class: "btn ghost", "aria-label": "Stop session " + x.id, onclick: () => {
+      if (window.confirm("Stop session " + x.id + " and remove its container?")) act("/api/session/stop", { id: x.session_id });
+    } }, "Stop session"))));
   return el("div", { class: "grid" },
     card("Running now",
       se.current.length
-        ? el("table", { class: "sessions" }, el("thead", {}, el("tr", {}, ["Session", "App", "State", "CPU", "Started"].map((h) => el("th", { text: h })))), el("tbody", {}, rows))
+        ? el("table", { class: "sessions" }, el("thead", {}, el("tr", {}, ["Session", "App", "State", "CPU", "Started", ""].map((h) => el("th", { text: h })))), el("tbody", {}, rows))
         : el("p", { class: "muted", text: "No sessions are running on this machine." }),
       el("p", { class: "muted small", text: "Only what runs where is shown: never what a consumer sends or receives." })),
     card("Since this start",
@@ -315,7 +391,8 @@ function earningsTab(s) {
     return el("div", { class: "grid" }, card("Earnings",
       el("p", { text: "This fabric does not report KMPLIFY Credits for this node (the credit system is off here, or the node has not been answered yet)." }),
       el("p", {}, "How earning works: ", el("a", { href: "https://kmplify.io/docs", target: "_blank", rel: "noopener noreferrer", text: "kmplify.io/docs" })),
-      kv([["Delivered since start", s.delivered.jobs + s.delivered.functions + s.delivered.vector_ops + " calls"]])));
+      kv([["Delivered since start", s.delivered.jobs + s.delivered.functions + s.delivered.vector_ops + " calls"]]),
+      el("p", { class: "muted small", text: "This month, In total and Account and rate appear once the fabric reports credits." })));
   }
   return el("div", { class: "grid" },
     card("This month", el("div", { class: "big", text: String(e.earned_this_month) }), el("div", { class: "muted", text: "credits, after the platform fee" })),
@@ -400,6 +477,8 @@ function show(name) {
     b.setAttribute("aria-selected", b.dataset.tab === name ? "true" : "false");
   }
   for (const s of document.querySelectorAll(".tab")) s.hidden = s.id !== "tab-" + name;
+  const tab = document.querySelector('.tabs button[data-tab="' + name + '"] .lbl');
+  if (tab) document.getElementById("page-title").textContent = tab.textContent;
   editing = false;
   render();
   window.scrollTo(0, 0);
@@ -419,6 +498,9 @@ async function refresh() {
 
 for (const b of document.querySelectorAll(".tabs button")) {
   b.addEventListener("click", () => show(b.dataset.tab));
+}
+for (const b of document.querySelectorAll("#view-switch button")) {
+  b.addEventListener("click", () => act("/api/view", { view: b.dataset.view }));
 }
 if (location.hash && TABS[location.hash.slice(1)]) show(location.hash.slice(1));
 // Every 3 s; every second while a security check runs, so the meter moves.

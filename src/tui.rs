@@ -40,6 +40,8 @@ use kmplify_node::gpu::Backend;
 use kmplify_node::peers::{self, Peers};
 use kmplify_node::settings::Settings;
 use kmplify_node::status::{self, Link, Snapshot};
+use kmplify_node::views;
+use serde_json::Value;
 
 /// Repaint rate. Fast enough that a keypress feels immediate, slow enough that
 /// the dashboard is invisible in the node's own CPU figure.
@@ -175,6 +177,13 @@ enum View {
     /// The activity monitor: CPU, GPU, VRAM and RAM over time, per core, and
     /// what the fabric is holding.
     Activity,
+    /// The web dashboard's "Trusted node" tab, from the same model.
+    Trust,
+    /// The web dashboard's "Earnings" tab, from the same model.
+    Earnings,
+    /// The web dashboard's "Settings" tab: every setting, its value, where it
+    /// comes from and how to change it. The editor is the Sharing view.
+    Settings,
 }
 
 /// Something a spawned background call has to say: the gateway about peers,
@@ -230,6 +239,15 @@ struct App {
     /// `None` while this process owns the worker: the snapshot is read
     /// straight out of it. `Some(dir)` when attached to another process.
     attached_to: Option<PathBuf>,
+    /// Brought up by the node serving in this console (the terminal view of
+    /// a running node): leaving returns to the console, the node keeps
+    /// running, and "stop the node" asks the node to stop.
+    embedded: bool,
+    /// What every view shows ([`views::model`]), rebuilt from `snap` on each
+    /// refresh: the Trusted node, Earnings and Settings screens render it.
+    model: Value,
+    /// The engine this node lends, for the model's sharing text.
+    engine: String,
     node_dir: PathBuf,
     snap: Snapshot,
     view: View,
@@ -283,6 +301,24 @@ impl App {
             Some(dir) => status::read_published(dir).unwrap_or_default(),
             None => status::snapshot(),
         };
+        let stored = Settings::load(&self.node_dir);
+        let attached = self.attached();
+        self.model = views::model(&views::Source {
+            snap: &self.snap,
+            stored: &stored,
+            engine: &self.engine,
+            logs: if attached {
+                self.snap.logs.clone()
+            } else {
+                status::logs()
+            },
+            rechecking: !attached && kmplify_node::security::rechecking(),
+            view: if attached {
+                kmplify_node::control::ViewState::default()
+            } else {
+                kmplify_node::control::view_state()
+            },
+        });
         // The running node's gateway is the authority: attached, this process
         // may have a different environment entirely, and asking the wrong
         // gateway about "my consumers" answers about a node that is not this
@@ -319,54 +355,38 @@ impl App {
     /// dashboard said; a screenshot of a terminal is a poor way to send that,
     /// and this is a file.
     fn write_snapshot(&mut self) {
-        let s = &self.snap;
-        let mut out = String::new();
-        out.push_str(&format!("kmplify-node {}\n", s.version));
-        out.push_str(&format!(
-            "link      : {} {}\n",
-            s.link.label(),
-            if s.paused { "(paused)" } else { "" }
-        ));
-        out.push_str(&format!("node      : {}\n", s.node_id));
-        out.push_str(&format!("gateway   : {}\n", s.gateway));
-        out.push_str(&format!("uptime    : {}\n", human(s.uptime())));
-        out.push_str(&format!(
-            "accel     : {} {} ({} MB)\n",
-            s.accelerator, s.gpu_name, s.vram_total_mb
-        ));
-        out.push_str(&format!(
-            "cpu/ram   : {} · {:.0}% · {} / {} MB\n",
-            s.cpu_model, s.cpu_percent, s.ram_used_mb, s.ram_total_mb
-        ));
-        out.push_str(&format!("models    : {}\n", s.models.join(", ")));
-        out.push_str(&format!(
-            "jobs      : {} active, {} finished, {} errors, avg {} ms\n",
-            s.jobs.active, s.jobs.done, s.jobs.failed, s.jobs.avg_ms
-        ));
-        for sess in &s.sessions {
-            out.push_str(&format!(
-                "session   : {} {} {} cpus={}\n",
-                sess.session_id, sess.template, sess.state, sess.cpus
-            ));
+        // The same report the web dashboard's "Save a report" writes.
+        match views::write_report(&self.node_dir, &self.snap) {
+            Ok(path) => self.say(format!("wrote {}", path.display())),
+            Err(e) => self.say(e),
         }
-        out.push_str("\nlog\n");
-        for line in &s.logs {
-            out.push_str(line);
-            out.push('\n');
+    }
+
+    /// Ask the node serving in this console to bring up another view. Only
+    /// the node's own process can open them: attached, there is no console
+    /// of ours it could use, so this says where to go instead.
+    fn open_view(&mut self, view: &str) {
+        if self.attached() {
+            let url = kmplify_node::dashboard::read_url_file(&self.node_dir);
+            self.say(match url {
+                Some(_) => {
+                    "attached: run `kmplify-node status` here for the dashboard link".to_string()
+                }
+                None => {
+                    "the node running here has no dashboard (started with --ui none)".to_string()
+                }
+            });
+            return;
         }
-        let path = self
-            .node_dir
-            .join(format!("snapshot-{}.txt", status::now_ms()));
-        match std::fs::write(&path, out) {
-            Ok(()) => self.say(format!("wrote {}", path.display())),
-            Err(e) => self.say(format!("could not write snapshot: {e}")),
-        }
+        self.send(Command::View(view.to_string()));
     }
 
     fn rows(&self) -> usize {
         match self.view {
             View::Sessions => self.snap.sessions.len(),
             View::Models => self.snap.models.len(),
+            // Scrolled text, not rows; the paragraph stops at its end.
+            View::Trust | View::Settings => 200,
             _ => 0,
         }
     }
@@ -392,7 +412,7 @@ impl App {
                         // command as well would ask the node to stop itself
                         // through a channel only a connected session reads.
                         Confirm::Shutdown => {
-                            if self.attached() {
+                            if self.attached() || self.embedded {
                                 self.send(Command::Shutdown);
                             } else {
                                 self.quit = true;
@@ -451,6 +471,12 @@ impl App {
                 self.say("refreshed");
             }
             KeyCode::Char('w') => self.write_snapshot(),
+            KeyCode::Char('8') | KeyCode::Char('n') => self.view = View::Trust,
+            KeyCode::Char('9') | KeyCode::Char('$') => self.view = View::Earnings,
+            KeyCode::Char('0') => self.view = View::Settings,
+            KeyCode::Char('R') => self.send(Command::Recheck),
+            KeyCode::Char('b') => self.open_view("web"),
+            KeyCode::Char('a') => self.open_view("app"),
             KeyCode::Char('p') => {
                 if self.snap.paused {
                     self.send(Command::Resume);
@@ -537,6 +563,7 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
     let creds_path = cfg.creds_path.clone();
     let gateway = cfg.gateway_url.clone();
     let accel = cfg.accel();
+    let engine = cfg.ollama_base.clone();
 
     let node = if attach_mode {
         None
@@ -547,12 +574,47 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
         Some(crate::start_node(cfg, dir.clone()).await)
     };
 
+    let app = new_app(
+        dir,
+        attach_mode,
+        false,
+        creds_path,
+        gateway,
+        engine,
+        live.unwrap_or_default(),
+    );
+    let code = run(app, accel, None).await;
+    status::set_quiet(false);
+
+    if let Some(node) = node {
+        println!("[kmplify-node] stopping — tearing down hosted sessions…");
+        node.shutdown().await;
+        println!("[kmplify-node] stopped cleanly");
+    }
+    code
+}
+
+/// A dashboard App for `dir`: attached to another process, the node of
+/// this process (`kmplify-node tui` standalone), or the terminal view of the
+/// node serving in this console (`embedded`).
+fn new_app(
+    dir: PathBuf,
+    attach_mode: bool,
+    embedded: bool,
+    creds_path: PathBuf,
+    gateway: String,
+    engine: String,
+    snap: Snapshot,
+) -> (App, tokio::sync::mpsc::UnboundedReceiver<BgMsg>) {
     // The stored sharing choices are the starting point of the draft, so the
     // screen opens showing what this node is actually applying.
     let stored = Settings::load(&dir);
-    let (peer_tx, mut peer_rx) = tokio::sync::mpsc::unbounded_channel::<BgMsg>();
-    let mut app = App {
+    let (peer_tx, peer_rx) = tokio::sync::mpsc::unbounded_channel::<BgMsg>();
+    let app = App {
         attached_to: attach_mode.then(|| dir.clone()),
+        embedded,
+        model: Value::Null,
+        engine,
         node_dir: dir,
         draft: stored.clone(),
         saved: stored,
@@ -569,12 +631,14 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
         peer_tx,
         creds_path,
         gateway,
-        snap: live.unwrap_or_default(),
+        snap,
         view: View::Home,
         selected: 0,
         log_scroll: 0,
         confirm: None,
-        notice: if attach_mode {
+        notice: if embedded {
+            "terminal view of this node · q back to the console · b web · a app window".into()
+        } else if attach_mode {
             "attached to the node running here".into()
         } else {
             "started a node in this terminal".into()
@@ -584,6 +648,15 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
         quit: false,
     };
 
+    (app, peer_rx)
+}
+
+/// Draw and drive `app` until it quits, or until `quit` turns true.
+async fn run(
+    (mut app, mut peer_rx): (App, tokio::sync::mpsc::UnboundedReceiver<BgMsg>),
+    accel: Backend,
+    quit: Option<tokio::sync::watch::Receiver<bool>>,
+) -> i32 {
     // Keys are read on a blocking thread: crossterm's reader is blocking, and
     // an async runtime thread parked in it would stall every task on it.
     let (keys_tx, mut keys_rx) = tokio::sync::mpsc::unbounded_channel::<KeyEvent>();
@@ -628,7 +701,7 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
         if terminal.draw(|f| draw(f, &app)).is_err() {
             break 1;
         }
-        if app.quit {
+        if app.quit || quit.as_ref().is_some_and(|q| *q.borrow()) {
             break 0;
         }
         // While the peers screen is open, keep it current: consumers arrive
@@ -660,14 +733,151 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
     ratatui::restore();
     drop(keys_rx);
     let _ = reader.join();
-    status::set_quiet(false);
 
-    if let Some(node) = node {
-        println!("[kmplify-node] stopping — tearing down hosted sessions…");
-        node.shutdown().await;
-        println!("[kmplify-node] stopped cleanly");
-    }
     code
+}
+
+/// The terminal view of the node serving in THIS process, brought up in its
+/// console while the node keeps running (`--ui tui`, the chooser's
+/// "Terminal view", the t key, or the dashboard's View buttons). Leaving it
+/// returns to the plain console; `quit` closes it when the node stops.
+pub async fn embedded(
+    dir: PathBuf,
+    creds_path: PathBuf,
+    gateway: String,
+    engine: String,
+    accel: Backend,
+    quit: tokio::sync::watch::Receiver<bool>,
+) {
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    kmplify_node::control::set_terminal_up(true);
+    status::set_quiet(true);
+    // The console key reader polls in 100 ms steps and stands aside while
+    // this view is up; let its last poll finish before this one reads keys.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let app = new_app(
+        dir,
+        false,
+        true,
+        creds_path,
+        gateway,
+        engine,
+        status::snapshot(),
+    );
+    let stopping = *quit.borrow();
+    run(app, accel, Some(quit)).await;
+    status::set_quiet(false);
+    kmplify_node::control::set_terminal_up(false);
+    if !stopping {
+        println!(
+            "[kmplify-node] back in the console; the node keeps running. \
+             t terminal view, w web view, a app window (type the letter, then Enter)"
+        );
+    }
+}
+
+// ------------------------------------------------------------- console
+//
+// Plain console input, outside the terminal view: the start-up chooser and
+// the view keys. Read through crossterm's event reader WITHOUT raw mode, so
+// the console keeps its line editing and echo (on Windows a key arrives as
+// it is pressed, elsewhere when Enter is pressed), Ctrl-C stays a signal,
+// and the terminal view can take the same reader over while it is up.
+
+/// Ask which view to start with; `None` when there is no answer within
+/// `wait` (the caller keeps its default) or the console cannot be read.
+pub fn ask_start_view(default: &str, wait: Duration) -> Option<views::Choice> {
+    use std::io::Write;
+    println!("\n{}", views::CHOOSER_TEXT);
+    let deadline = Instant::now() + wait;
+    let mut line = String::new();
+    loop {
+        print!(
+            "Your choice (no answer in {} s starts the {default} view): ",
+            deadline.saturating_duration_since(Instant::now()).as_secs()
+        );
+        let _ = std::io::stdout().flush();
+        line.clear();
+        let entered = loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break false;
+            }
+            match event::poll(left.min(Duration::from_millis(200))) {
+                Ok(true) => match event::read() {
+                    Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => match k.code {
+                        KeyCode::Enter => break true,
+                        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                            return None
+                        }
+                        KeyCode::Char(c) => {
+                            line.push(c);
+                            if cfg!(windows) {
+                                print!("{c}");
+                                let _ = std::io::stdout().flush();
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            line.pop();
+                            if cfg!(windows) {
+                                print!("\u{8} \u{8}");
+                                let _ = std::io::stdout().flush();
+                            }
+                        }
+                        _ => {}
+                    },
+                    Ok(_) => {}
+                    Err(_) => return None,
+                },
+                Ok(false) => {}
+                Err(_) => return None,
+            }
+        };
+        if !entered {
+            println!("\nno answer: starting the {default} view");
+            return None;
+        }
+        if cfg!(windows) {
+            println!();
+        }
+        match views::parse_choice(&line) {
+            Ok(c) => return c,
+            Err(e) => println!("{e}"),
+        }
+    }
+}
+
+/// The view keys of the plain console: each key pressed (letters only),
+/// while the terminal view is not up. Ends when the receiver is dropped.
+pub fn console_keys() -> tokio::sync::mpsc::UnboundedReceiver<char> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || loop {
+        if tx.is_closed() {
+            return;
+        }
+        if kmplify_node::control::terminal_up() {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        match event::poll(Duration::from_millis(100)) {
+            Ok(true) => {
+                if let Ok(Event::Key(k)) = event::read() {
+                    if k.kind == KeyEventKind::Press {
+                        if let KeyCode::Char(c) = k.code {
+                            if tx.send(c.to_ascii_lowercase()).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(false) => {}
+            Err(_) => return,
+        }
+    });
+    rx
 }
 
 // ------------------------------------------------------------------ render
@@ -693,6 +903,9 @@ fn draw(f: &mut Frame, app: &App) {
         View::Sharing => draw_sharing(f, app, body),
         View::Peers => draw_peers(f, app, body),
         View::Activity => draw_activity(f, app, body),
+        View::Trust => draw_trust(f, app, body),
+        View::Earnings => draw_earnings(f, app, body),
+        View::Settings => draw_settings(f, app, body),
     }
     f.render_widget(footer_line(app), footer);
 
@@ -713,10 +926,13 @@ fn header_line(app: &App) -> Paragraph<'static> {
         View::Sharing => "sharing",
         View::Peers => "peers",
         View::Activity => "activity",
+        View::Trust => "trusted node",
+        View::Earnings => "earnings",
+        View::Settings => "settings",
     };
     Paragraph::new(Line::from(vec![
-        Span::styled(" ◆", Style::new().fg(GPU_C).bold()),
-        Span::styled(" kmplify-node", Style::new().fg(Color::White).bold()),
+        Span::styled(" ◆ KMPLIFY", Style::new().fg(GPU_C).bold()),
+        Span::styled("  kmplify-node", Style::new().fg(Color::White).bold()),
         Span::styled(
             "   provider · compute fabric · inference",
             Style::new().fg(MUTED),
@@ -826,6 +1042,9 @@ fn view_colour(view: View) -> Color {
         View::Sharing => GPU_C,
         View::Peers => ACCENT,
         View::Activity => CPU_C,
+        View::Trust => Color::Green,
+        View::Earnings => Color::Yellow,
+        View::Settings => GPU_C,
     }
 }
 
@@ -849,6 +1068,8 @@ fn link_style(app: &App) -> (String, Color) {
 fn footer_line(app: &App) -> Paragraph<'static> {
     let quit = if app.attached() {
         "q quit"
+    } else if app.embedded {
+        "q console"
     } else {
         "q quit (stops node)"
     };
@@ -867,7 +1088,7 @@ fn footer_line(app: &App) -> Paragraph<'static> {
         )
     } else {
         format!(
-            " {quit}   1 home  2 sessions  3 models  4 log  5 sharing  6 peers  7 activity   {pause}  c reconnect  e evict  x stop node  ? keys"
+            " {quit}   1 overview 8 trusted 2 sessions 9 earnings 0 settings 4 log   {pause}  c reconnect  R re-check  b web  a app  x stop node  ? keys"
         )
     };
     // The notice replaces the key hints for a few seconds after an action, so
@@ -886,7 +1107,7 @@ fn footer_line(app: &App) -> Paragraph<'static> {
 fn draw_home(f: &mut Frame, app: &App, area: Rect) {
     let [top, middle, logs] = Layout::vertical([
         Constraint::Length(9),
-        Constraint::Min(4),
+        Constraint::Min(12),
         Constraint::Length(7),
     ])
     .areas(area);
@@ -895,8 +1116,13 @@ fn draw_home(f: &mut Frame, app: &App, area: Rect) {
     draw_machine(f, app, left);
     draw_work(f, app, right);
 
+    let [left, right] =
+        Layout::horizontal([Constraint::Percentage(52), Constraint::Min(30)]).areas(middle);
+    let [trust, conn] = Layout::vertical([Constraint::Length(5), Constraint::Min(4)]).areas(left);
+    f.render_widget(trust_panel(app), trust);
+    f.render_widget(connection_panel(app), conn);
     let [models, sessions] =
-        Layout::horizontal([Constraint::Percentage(40), Constraint::Min(30)]).areas(middle);
+        Layout::vertical([Constraint::Percentage(50), Constraint::Min(3)]).areas(right);
     f.render_widget(models_table(app, 0), models);
     f.render_widget(sessions_table(app, false), sessions);
     f.render_widget(log_panel(app, logs.height.saturating_sub(2) as usize), logs);
@@ -910,7 +1136,7 @@ fn draw_home(f: &mut Frame, app: &App, area: Rect) {
 /// the home screen answers "is anything happening" without a keystroke.
 fn draw_machine(f: &mut Frame, app: &App, area: Rect) {
     let s = &app.snap;
-    let block = panel_coloured("machine", CPU_C);
+    let block = panel_coloured("this machine", CPU_C);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -1033,7 +1259,7 @@ fn meter_row(f: &mut Frame, area: Rect, label: &str, colour: Color, track: &Trac
 /// What the fabric is getting out of it.
 fn draw_work(f: &mut Frame, app: &App, area: Rect) {
     let s = &app.snap;
-    let block = panel_coloured("sharing", GPU_C);
+    let block = panel_coloured("what this node shares", GPU_C);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -1168,12 +1394,47 @@ fn draw_work(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_sessions(f: &mut Frame, app: &App, area: Rect) {
-    let [table, note] = Layout::vertical([Constraint::Min(4), Constraint::Length(3)]).areas(area);
+    let [table, since, note] = Layout::vertical([
+        Constraint::Min(4),
+        Constraint::Length(5),
+        Constraint::Length(3),
+    ])
+    .areas(area);
     f.render_widget(sessions_table(app, true), table);
+    let s = &app.snap;
+    let jobs = if s.jobs.failed > 0 {
+        format!("{} ({} failed)", s.jobs.done, s.jobs.failed)
+    } else {
+        s.jobs.done.to_string()
+    };
+    let rows = vec![
+        Line::from(vec![
+            field("sessions"),
+            Span::raw(format!("{} hosted", s.delivered.sessions)),
+            sep(),
+            field("machine"),
+            Span::raw(human(Duration::from_secs(s.delivered.session_seconds))),
+        ]),
+        Line::from(vec![
+            field("chat jobs"),
+            Span::raw(jobs),
+            sep(),
+            field("running"),
+            Span::raw(s.jobs.active.to_string()),
+        ]),
+        Line::from(vec![
+            field("functions"),
+            Span::raw(s.delivered.functions.to_string()),
+            sep(),
+            field("vectors"),
+            Span::raw(s.delivered.vector_ops.to_string()),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(rows).block(panel("since this start")), since);
     let text = if app.snap.sessions.is_empty() {
         "No peer is running a container here. Sessions are opt-in: PROVIDER_WORKLOADS lists the templates this node accepts."
     } else {
-        "↑/↓ select · e evict the selected session (its container is stopped and removed)"
+        "↑/↓ select · e stop session: the selected one (its container is stopped and removed)"
     };
     f.render_widget(
         Paragraph::new(text)
@@ -1232,9 +1493,12 @@ fn log_panel(app: &App, rows: usize) -> Paragraph<'static> {
         })
         .collect();
     let title = if app.log_scroll > 0 {
-        format!("log  (scrolled {} back, ↓ to follow)", app.log_scroll)
+        format!(
+            "last log lines  (scrolled {} back, ↓ to follow)",
+            app.log_scroll
+        )
     } else {
-        "log".to_string()
+        "last log lines".to_string()
     };
     Paragraph::new(shown).block(panel_coloured(&title, view_colour(View::Logs)))
 }
@@ -1281,7 +1545,7 @@ fn sessions_table(app: &App, selectable: bool) -> Table<'static> {
             .style(style)
         })
         .collect();
-    let title = format!("sessions ({})", app.snap.sessions.len());
+    let title = format!("running now ({})", app.snap.sessions.len());
     Table::new(
         rows,
         [
@@ -1367,13 +1631,17 @@ fn draw_overlay(f: &mut Frame, title: &str, body: String) {
 }
 
 fn help_text() -> String {
-    "1/h home  2/s sessions  3/m models  4/l log  5/g sharing  6 peers  7/t activity\n\
+    "1/h overview  8/n trusted node  2/s sessions  9/$ earnings  0 settings  4/l log\n\
+     3/m models  5/g sharing editor  6 peers  7/t activity\n\
      ↑/↓ or j/k   move (log: scroll back)\n\
-     p  pause or resume sharing — stays connected, advertises nothing\n\
-     c  reconnect to the gateway now\n\
-     e  evict the selected session (sessions view)\n\
-     x  stop the node   ·   w write a snapshot file   ·   r refresh\n\
-     q  leave the dashboard (stops the node only if it started here)\n\
+     p  pause sharing / resume sharing: stays connected, advertises nothing\n\
+     c  reconnect now   ·   R  re-check now (security baseline)\n\
+     e  stop session: the selected one (sessions view)\n\
+     x  stop the node   ·   w  save a report (a text file)   ·   r refresh\n\
+     b  web: the dashboard in the browser   ·   a  app window\n\
+     5  change a setting   ·   d  use environment (in the editor)\n\
+     q  leave: back to the console when the node runs here as a view,\n\
+        otherwise stops the node only if it started here\n\
      \n\
      sharing (5): space toggles, ←/→ moves a ceiling (shift for a bigger\n\
      step), enter edits a field, d hands one back to the environment,\n\
@@ -1929,11 +2197,16 @@ impl App {
             self.say("nothing to apply");
             return;
         }
-        if let Err(e) = self.draft.save(&self.node_dir) {
+        // Onto the file as it is now: the web dashboard, `kmplify-node set`
+        // or the chooser may have changed other fields since this opened.
+        let current = Settings::load(&self.node_dir);
+        let merged = views::merge_changes(&current, &self.saved, &self.draft);
+        if let Err(e) = merged.save(&self.node_dir) {
             self.say(format!("could not write settings: {e}"));
             return;
         }
-        self.saved = self.draft.clone();
+        self.draft = merged.clone();
+        self.saved = merged;
         // Same command in both modes: in-process it reaches the worker
         // directly, attached it goes through the control directory.
         self.send(Command::Reload);
@@ -2866,6 +3139,482 @@ fn panel_coloured(title: &str, colour: Color) -> Block<'static> {
         ))
 }
 
+// ------------------------------------------------- shared-model screens
+//
+// The Trusted node, Earnings and Settings screens, and the Overview's
+// trusted-node and connection panels, render `app.model`: the value the web
+// dashboard serves as /api/state. Where the web page draws a chart, these
+// say it in text (the readiness ring is a bar and n/6).
+
+fn s_of<'a>(v: &'a Value, k: &str) -> &'a str {
+    v[k].as_str().unwrap_or("")
+}
+
+const LEVEL_TEXT: [(&str, &str); 4] = [
+    ("trusted", "Trusted"),
+    ("cloud", "Cloud"),
+    ("community", "Community"),
+    ("unknown", "Not known yet"),
+];
+
+fn level_text(level: &str) -> String {
+    LEVEL_TEXT
+        .iter()
+        .find(|(k, _)| *k == level)
+        .map(|(_, v)| (*v).to_string())
+        .unwrap_or_else(|| level.to_string())
+}
+
+fn band_colour(band: &str) -> Color {
+    match band {
+        "green" => Color::Green,
+        "amber" => Color::Yellow,
+        "red" => Color::Red,
+        _ => MUTED,
+    }
+}
+
+/// The readiness ring as text, the same bar `status`, the startup summary
+/// and `trust::readiness_bar` print: `#` passes, `-` fails or is unreadable,
+/// `+` read while the first check runs, `.` still being checked.
+fn readiness_text(rd: &Value) -> String {
+    let cells: String = rd["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|i| match s_of(i, "state") {
+            "pass" | "not_applicable" => '#',
+            "checked" => '+',
+            "checking" => '.',
+            _ => '-',
+        })
+        .collect();
+    let total = rd["total"].as_u64().unwrap_or(0);
+    if s_of(rd, "band") == "none" {
+        format!(
+            "[{cells}] {}/{total} read",
+            rd["checked"].as_u64().unwrap_or(0)
+        )
+    } else {
+        format!(
+            "[{cells}] {}/{total} checks",
+            rd["passed"].as_u64().unwrap_or(0)
+        )
+    }
+}
+
+fn readiness_lines(rd: &Value) -> Vec<Line<'static>> {
+    let colour = band_colour(s_of(rd, "band"));
+    vec![
+        Line::from(vec![
+            Span::styled("trust readiness  ", Style::new().fg(MUTED)),
+            Span::styled(readiness_text(rd), Style::new().fg(colour).bold()),
+        ]),
+        Line::from(Span::styled(
+            s_of(rd, "verdict").to_string(),
+            Style::new().fg(Color::White),
+        )),
+    ]
+}
+
+/// Overview: where the node stands and how ready it is.
+fn trust_panel(app: &App) -> Paragraph<'static> {
+    let t = &app.model["trust"];
+    let st = &t["standing"];
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            level_text(s_of(st, "level")),
+            Style::new().fg(Color::White).bold(),
+        ),
+        Span::raw("  "),
+        Span::styled(s_of(st, "headline").to_string(), Style::new().fg(MUTED)),
+    ])];
+    lines.extend(readiness_lines(&t["readiness"]));
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: true })
+        .block(panel_coloured(
+            "trusted node  (8 for the checklist)",
+            Color::Green,
+        ))
+}
+
+/// Overview: the gateway link, as the web page's Connection card has it.
+fn connection_panel(app: &App) -> Paragraph<'static> {
+    let n = &app.model["node"];
+    let online = s_of(n, "link") == "ONLINE";
+    let state = if online {
+        match n["connected_s"].as_u64() {
+            Some(c) => format!("connected for {}", human(Duration::from_secs(c))),
+            None => "connected".into(),
+        }
+    } else {
+        s_of(n, "link").to_ascii_lowercase()
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            field("fabric"),
+            Span::raw(s_of(n, "gateway").to_string()),
+        ]),
+        Line::from(vec![
+            field("state"),
+            Span::raw(state),
+            if n["paused"].as_bool() == Some(true) {
+                Span::styled("  paused", Style::new().fg(Color::Yellow).bold())
+            } else {
+                Span::raw("")
+            },
+        ]),
+    ];
+    if !online && !s_of(n, "link_detail").is_empty() {
+        lines.push(Line::from(vec![
+            field("problem"),
+            Span::styled(
+                s_of(n, "link_detail").to_string(),
+                Style::new().fg(Color::Red),
+            ),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        field("running"),
+        Span::raw(human(Duration::from_secs(
+            n["uptime_s"].as_u64().unwrap_or(0),
+        ))),
+        sep(),
+        field("reconnects"),
+        Span::raw(format!(" {}", n["reconnects"].as_u64().unwrap_or(0))),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "p pause/resume sharing · c reconnect now · x stop the node",
+        Style::new().fg(MUTED),
+    )));
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: true })
+        .block(panel("connection"))
+}
+
+fn mark_for(state: &str) -> (&'static str, Color) {
+    match state {
+        "pass" => ("✓", Color::Green),
+        "fail" => ("✕", Color::Red),
+        "not_applicable" => ("–", MUTED),
+        _ => ("?", Color::Red),
+    }
+}
+
+fn draw_trust(f: &mut Frame, app: &App, area: Rect) {
+    let t = &app.model["trust"];
+    let st = &t["standing"];
+    let [top, mid, list] = Layout::vertical([
+        Constraint::Length(11),
+        Constraint::Length(6),
+        Constraint::Min(4),
+    ])
+    .areas(area);
+    let [stands, ready] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Min(30)]).areas(top);
+
+    let last = match t["checked_at"].as_u64() {
+        Some(at) => format!(
+            "{} ago (checker {})",
+            human(Duration::from_secs(
+                kmplify_node::identity::now_s().saturating_sub(at)
+            )),
+            s_of(t, "checker_version")
+        ),
+        None => "running".into(),
+    };
+    let machine = match st["baseline_ok"].as_bool() {
+        None => "check still running",
+        Some(true) => "meets the baseline",
+        Some(false) => "does not meet the baseline yet",
+    };
+    let stands_lines = vec![
+        Line::from(vec![
+            Span::styled(
+                level_text(s_of(st, "level")),
+                Style::new().fg(Color::White).bold(),
+            ),
+            Span::raw("  "),
+            Span::raw(s_of(st, "headline").to_string()),
+        ]),
+        Line::from(vec![
+            field("fabric"),
+            Span::raw(if t["fabric_line"].is_string() {
+                s_of(t, "fabric_line").to_string()
+            } else {
+                "not read yet".into()
+            }),
+        ]),
+        Line::from(vec![field("machine"), Span::raw(machine)]),
+        Line::from(vec![field("checked"), Span::raw(last)]),
+        Line::from(Span::styled(
+            if t["rechecking"].as_bool() == Some(true) {
+                "checking now…"
+            } else {
+                "R re-check now: the signed result goes to the fabric with the next heartbeat"
+            },
+            Style::new().fg(MUTED),
+        )),
+    ];
+    f.render_widget(
+        Paragraph::new(stands_lines)
+            .wrap(Wrap { trim: true })
+            .block(panel("where this node stands")),
+        stands,
+    );
+
+    let rd = &t["readiness"];
+    let mut ready_lines = readiness_lines(rd);
+    let items: Vec<Span> = rd["items"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .flat_map(|i| {
+                    let (m, c) = mark_for(match s_of(i, "state") {
+                        "checked" => "pass",
+                        "checking" => "not_applicable",
+                        other => other,
+                    });
+                    [
+                        Span::styled(format!("{m} "), Style::new().fg(c).bold()),
+                        Span::raw(format!("{}   ", s_of(i, "label"))),
+                    ]
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    ready_lines.push(Line::from(items));
+    for (n, step) in rd["steps"].as_array().into_iter().flatten().enumerate() {
+        let (word, c) = match s_of(step, "state") {
+            "done" => ("done", Color::Green),
+            "missing" => ("to do", Color::Red),
+            "open" => ("not confirmed", Color::Yellow),
+            _ => ("checking", MUTED),
+        };
+        ready_lines.push(Line::from(vec![
+            Span::styled(format!("{}. ", n + 1), Style::new().fg(MUTED)),
+            Span::raw(format!("{}  ", s_of(step, "label"))),
+            Span::styled(word, Style::new().fg(c)),
+        ]));
+    }
+    f.render_widget(
+        Paragraph::new(ready_lines)
+            .wrap(Wrap { trim: true })
+            .block(panel("trust readiness")),
+        ready,
+    );
+
+    let [missing, means] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Min(30)]).areas(mid);
+    let miss: Vec<Line> = match st["missing"].as_array() {
+        Some(m) if !m.is_empty() => m
+            .iter()
+            .map(|x| Line::raw(format!("• {}", x.as_str().unwrap_or(""))))
+            .collect(),
+        _ => vec![Line::styled("Nothing is missing.", Style::new().fg(MUTED))],
+    };
+    f.render_widget(
+        Paragraph::new(miss)
+            .wrap(Wrap { trim: true })
+            .block(panel("missing for a trusted node")),
+        missing,
+    );
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::raw("Personal or confidential work runs only on Trusted nodes. Trusted needs both: the provider account passed the identity check and KMPLIFY granted Trusted, and this machine meets the security baseline."),
+            Line::styled("The fabric decides the level; the node never sets it.", Style::new().fg(MUTED)),
+        ])
+        .wrap(Wrap { trim: true })
+        .block(panel("what trusted means")),
+        means,
+    );
+
+    let os = std::env::consts::OS;
+    let mut lines: Vec<Line> = Vec::new();
+    let checklist = t["checklist"].as_array().cloned().unwrap_or_default();
+    if checklist.is_empty() {
+        lines.push(Line::styled(
+            "The security check is still running. On Windows the update search can take up to two minutes.",
+            Style::new().fg(MUTED),
+        ));
+    }
+    for i in &checklist {
+        let state = s_of(i, "state");
+        let (m, c) = mark_for(state);
+        let fabric = match i["fabric"].as_str() {
+            Some("pass") => "fabric: passes",
+            Some(_) => "fabric: fails",
+            None => "fabric: not known",
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {m} "), Style::new().fg(c).bold()),
+            Span::styled(
+                s_of(i, "label").to_string(),
+                Style::new().fg(Color::White).bold(),
+            ),
+            Span::styled(format!("   {fabric}"), Style::new().fg(MUTED)),
+        ]));
+        lines.push(Line::raw(format!("   {}", s_of(i, "text"))));
+        if state == "fail" || state == "unknown" {
+            for (n, step) in i["steps"].as_array().into_iter().flatten().enumerate() {
+                lines.push(Line::styled(
+                    format!("     {}. {}", n + 1, step.as_str().unwrap_or("")),
+                    Style::new().fg(MUTED),
+                ));
+            }
+        }
+    }
+    for h in t["hints"].as_array().into_iter().flatten() {
+        lines.push(Line::styled(
+            format!(" note: {}", h.as_str().unwrap_or("")),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .scroll((app.selected as u16, 0))
+            .block(panel_owned(format!(
+                "security baseline  (how to fix it on {os}; ↑/↓ scroll)"
+            ))),
+        list,
+    );
+}
+
+fn draw_earnings(f: &mut Frame, app: &App, area: Rect) {
+    let e = &app.model["earnings"];
+    if e["enabled"].as_bool() != Some(true) {
+        let d = &app.model["delivered"];
+        let calls = d["jobs"].as_u64().unwrap_or(0)
+            + d["functions"].as_u64().unwrap_or(0)
+            + d["vector_ops"].as_u64().unwrap_or(0);
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::raw("This fabric does not report KMPLIFY Credits for this node (the credit system is off here, or the node has not been answered yet)."),
+                Line::raw("How earning works: kmplify.io/docs"),
+                Line::from(vec![field("delivered"), Span::raw(format!("{calls} calls since start"))]),
+                Line::styled("this month · in total · account and rate appear once the fabric reports credits", Style::new().fg(MUTED)),
+            ])
+            .wrap(Wrap { trim: true })
+            .block(panel("earnings")),
+            area,
+        );
+        return;
+    }
+    let [month, total, account] = Layout::horizontal([
+        Constraint::Percentage(25),
+        Constraint::Percentage(25),
+        Constraint::Min(30),
+    ])
+    .areas(area);
+    let big = |v: &Value, note: &'static str| {
+        vec![
+            Line::styled(
+                v.to_string().trim_matches('"').to_string(),
+                Style::new().fg(Color::White).bold(),
+            ),
+            Line::styled(note, Style::new().fg(MUTED)),
+        ]
+    };
+    f.render_widget(
+        Paragraph::new(big(
+            &e["earned_this_month"],
+            "credits, after the platform fee",
+        ))
+        .block(panel("this month")),
+        month,
+    );
+    f.render_widget(
+        Paragraph::new(big(&e["earned_total"], "credits")).block(panel("in total")),
+        total,
+    );
+    let num = |v: &Value| (!v.is_null()).then(|| v.to_string());
+    let mut lines = vec![Line::from(vec![
+        field("account"),
+        if e["linked"].as_bool() == Some(true) {
+            Span::raw("linked")
+        } else {
+            Span::styled(
+                "NOT LINKED: earnings are held until this node is linked",
+                Style::new().fg(Color::Red),
+            )
+        },
+    ])];
+    if let Some(h) = num(&e["held"]).filter(|h| h != "0") {
+        lines.push(Line::from(vec![
+            field("held"),
+            Span::raw(format!("{h} credits")),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        field("gpu class"),
+        Span::raw(
+            e["gpu_class"]
+                .as_str()
+                .map(|c| c.to_ascii_uppercase())
+                .unwrap_or_else(|| "none".into()),
+        ),
+    ]));
+    if let Some(r) = num(&e["credits_per_minute"]) {
+        lines.push(Line::from(vec![
+            field("rate"),
+            Span::raw(format!("{r} credits per minute")),
+        ]));
+    }
+    if let Some(p) = num(&e["platform_fee_percent"]) {
+        lines.push(Line::from(vec![field("fee"), Span::raw(format!("{p} %"))]));
+    }
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(panel("account and rate")),
+        account,
+    );
+}
+
+fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
+    let mut lines = vec![Line::styled(
+        "The same settings as the web dashboard and `kmplify-node set`. 5 opens the editor for the sharing settings (space, ←/→, enter, s applies); d there hands one back to the environment (use environment).",
+        Style::new().fg(MUTED),
+    )];
+    for x in app.model["settings"].as_array().into_iter().flatten() {
+        let value = match &x["value"] {
+            Value::Null => "not set".to_string(),
+            Value::String(v) if v.is_empty() => "not set".to_string(),
+            Value::String(v) => v.clone(),
+            other => other.to_string(),
+        };
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                s_of(x, "label").to_string(),
+                Style::new().fg(Color::White).bold(),
+            ),
+            Span::raw("  "),
+            Span::styled(value, Style::new().fg(ACCENT)),
+            if x["overridden"].as_bool() == Some(true) {
+                Span::styled(
+                    format!("  set here, overrides {}", s_of(x, "var")),
+                    Style::new().fg(Color::Yellow),
+                )
+            } else {
+                Span::styled(format!("  ({})", s_of(x, "var")), Style::new().fg(MUTED))
+            },
+        ]));
+        lines.push(Line::styled(
+            format!("  change: {}", s_of(x, "how")),
+            Style::new().fg(MUTED),
+        ));
+    }
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .scroll((app.selected as u16, 0))
+            .block(panel("settings  (↑/↓ scroll)")),
+        area,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2873,6 +3622,9 @@ mod tests {
     fn app() -> App {
         App {
             attached_to: None,
+            embedded: false,
+            model: Value::Null,
+            engine: "http://127.0.0.1:11434".into(),
             node_dir: std::env::temp_dir(),
             draft: Settings::default(),
             saved: Settings::default(),
@@ -2903,6 +3655,105 @@ mod tests {
 
     fn press(app: &mut App, c: char) {
         app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+
+    /// Everything on screen for `view`, lower case.
+    fn screen(a: &mut App, view: View) -> String {
+        a.view = view;
+        a.selected = 0;
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 80)).unwrap();
+        t.draw(|f| draw(f, a)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out.to_lowercase()
+    }
+
+    fn view_of(section: &str) -> View {
+        match section {
+            "overview" => View::Home,
+            "trust" => View::Trust,
+            "sessions" => View::Sessions,
+            "earnings" => View::Earnings,
+            "settings" => View::Settings,
+            "logs" => View::Logs,
+            other => panic!("section {other} has no terminal screen"),
+        }
+    }
+
+    /// The view parity contract (`kmplify_node::views`), terminal side:
+    /// every section has a screen reached by its keys, every metric is on
+    /// that screen, every setting of the shared model is listed, and every
+    /// action has its key in the help.
+    #[test]
+    fn the_terminal_view_keeps_the_view_contract() {
+        let mut a = app();
+        a.refresh();
+        for s in views::SECTIONS {
+            let want = view_of(s.id);
+            for key in s.tui_keys.split(' ') {
+                let mut b = app();
+                b.view = View::Peers; // somewhere else first
+                b.view = View::Activity;
+                press(&mut b, key.chars().next().unwrap());
+                assert!(
+                    b.view == want || (s.id == "settings" && b.view == View::Sharing),
+                    "key {key} does not open {}",
+                    s.id
+                );
+            }
+        }
+        for m in views::METRICS {
+            let text = screen(&mut a, view_of(m.section));
+            assert!(
+                text.contains(&m.label.to_lowercase()),
+                "the {} screen does not show {:?}",
+                m.section,
+                m.label
+            );
+        }
+        let text = screen(&mut a, View::Settings);
+        for x in a.model["settings"].as_array().unwrap() {
+            let label = x["label"].as_str().unwrap().to_lowercase();
+            assert!(text.contains(&label), "settings screen lacks {label:?}");
+        }
+        let help = help_text().to_lowercase();
+        for act in views::ACTIONS {
+            if act.id == "view_terminal" {
+                continue; // this is the terminal view
+            }
+            assert!(
+                help.contains(&act.label.to_lowercase()),
+                "help names no key for {}",
+                act.id
+            );
+            assert!(
+                help_text().contains(&format!("{}  ", act.tui_key)),
+                "help lacks the {} key for {}",
+                act.tui_key,
+                act.id
+            );
+        }
+    }
+
+    #[test]
+    fn the_new_keys_switch_views_and_never_quit() {
+        let mut a = app();
+        press(&mut a, '8');
+        assert!(a.view == View::Trust);
+        press(&mut a, '9');
+        assert!(a.view == View::Earnings);
+        press(&mut a, '0');
+        assert!(a.view == View::Settings);
+        // Not attached, not serving here: asks nobody, quits nothing.
+        press(&mut a, 'b');
+        press(&mut a, 'a');
+        assert!(!a.quit);
     }
 
     #[test]

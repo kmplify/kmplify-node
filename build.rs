@@ -12,7 +12,15 @@ use std::process::Command;
 /// manifests, this script, and NOTICE, which `src/lib.rs` embeds with
 /// `include_str!`. Everything else in the repository can be edited without
 /// changing a single byte of the output, so it must not flip the stamp.
-const BUILD_INPUTS: [&str; 5] = ["Cargo.toml", "Cargo.lock", "build.rs", "src", "NOTICE"];
+const BUILD_INPUTS: [&str; 6] = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "build.rs",
+    "src",
+    "NOTICE",
+    // The program icon of the Windows build.
+    "packaging/windows/kmplify-node.ico",
+];
 
 fn main() {
     // Emitting ANY rerun-if directive replaces Cargo's default "rerun when
@@ -28,6 +36,9 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=Cargo.lock");
     println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=packaging/windows/kmplify-node.ico");
+
+    windows_icon();
 
     if std::env::var("KMPLIFY_BUILD").is_ok() {
         return;
@@ -108,4 +119,25 @@ fn git(dir: &str, args: &[&str], paths: &[&str]) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The KMPLIFY app icon as the program icon of `kmplify-node.exe`.
+///
+/// Only when the target is Windows AND this build runs on Windows (the
+/// resource compiler of the Windows SDK, the same one Tauri apps need); a
+/// cross build simply has no icon. The resource is linked into this
+/// package's `kmplify-node` binary only (`rustc-link-arg-bin`), never into an
+/// application that embeds the crate as a library, which brings its own. A
+/// build without the SDK warns and carries on: an icon is never worth a
+/// failed build. The KMPLIFY logo is a trademark, not licensed under
+/// Apache-2.0 (TRADEMARKS.md).
+fn windows_icon() {
+    #[cfg(windows)]
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let mut res = winresource::WindowsResource::new();
+        res.set_icon("packaging/windows/kmplify-node.ico");
+        if let Err(e) = res.compile_for("kmplify-node") {
+            println!("cargo:warning=kmplify-node.exe gets no icon: {e}");
+        }
+    }
 }

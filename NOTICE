@@ -25,3 +25,15 @@ Container images referenced by the workload templates (vLLM, ComfyUI, Ollama
 and others) are the property of their respective publishers, are not
 distributed with this software, and are pulled at runtime under their own
 licenses.
+
+The local dashboard embeds third-party assets under their own licenses:
+
+- Inter (src/dashboard/assets/fonts/inter-latin-wght.woff2), the KMPLIFY
+  brand text face. Copyright 2016 The Inter Project Authors. SIL Open Font
+  License 1.1; the license text is src/dashboard/assets/fonts/OFL.txt.
+- Icon outlines from Heroicons 2 (src/dashboard/assets/index.html).
+  Copyright (c) Tailwind Labs, Inc. MIT License.
+
+The KMPLIFY name and logo (the dashboard mark, its tab icon and the Windows
+program icon) are trademarks of KMPLIFY and are not licensed under the Apache
+License; see TRADEMARKS.md.

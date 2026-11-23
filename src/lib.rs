@@ -41,6 +41,8 @@ pub mod status;
 pub mod summary;
 pub mod trust;
 pub mod vectors;
+#[cfg(any(feature = "dashboard", feature = "tui"))]
+pub mod views;
 pub mod vllm_managed;
 pub mod wire;
 
