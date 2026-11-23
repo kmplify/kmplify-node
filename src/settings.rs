@@ -134,6 +134,12 @@ pub struct Settings {
     /// payment system being happy — see [`crate::rewards`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rewards: Option<bool>,
+    /// The view an interactive start begins with (`KMPLIFY_NODE_UI`), as
+    /// remembered from the start-up chooser. Not a credential, and not
+    /// applied to `WorkerConfig`: it only decides what the person at the
+    /// console sees first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ui: Option<String>,
 }
 
 /// The settings a caller may address by name, in `kmplify-node set` and in
@@ -168,6 +174,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("share-vectors", "PROVIDER_SHARE_VECTORS"),
     ("max-vector-mb", "PROVIDER_MAX_VECTOR_MB"),
     ("rewards", "PROVIDER_REWARDS"),
+    ("ui", "KMPLIFY_NODE_UI"),
 ];
 
 pub fn path(node_dir: &Path) -> PathBuf {
@@ -522,6 +529,10 @@ impl Settings {
             "share-vectors" => self.share_vectors = Some(parse_bool(key, value)?),
             "max-vector-mb" => self.max_vector_mb = Some(parse_num::<u64>(key, value)?),
             "rewards" => self.rewards = Some(parse_bool(key, value)?),
+            "ui" => {
+                crate::dashboard::UiMode::parse(value)?;
+                self.ui = Some(value.to_ascii_lowercase());
+            }
             _ => {
                 return Err(format!(
                     "unknown setting {key:?} (one of: {})",
@@ -559,6 +570,7 @@ impl Settings {
             "share-vectors" => self.share_vectors = None,
             "max-vector-mb" => self.max_vector_mb = None,
             "rewards" => self.rewards = None,
+            "ui" => self.ui = None,
             _ => {
                 return Err(format!(
                     "unknown setting {key:?} (one of: {})",
@@ -631,6 +643,7 @@ impl Settings {
         push("share-vectors", self.share_vectors.map(|v| v.to_string()));
         push("max-vector-mb", self.max_vector_mb.map(|v| v.to_string()));
         push("rewards", self.rewards.map(|v| v.to_string()));
+        push("ui", self.ui.clone());
         out
     }
 }
@@ -996,6 +1009,7 @@ mod tests {
                 "vllm-kv-dtype" => "fp8",
                 "vllm-gpu-util" => "0.8",
                 "workloads" => "ollama-cpu",
+                "ui" => "gui",
                 _ => "1",
             };
             assert!(s.set(key, sample).is_ok(), "{key} not settable");

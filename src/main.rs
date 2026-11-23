@@ -1694,16 +1694,14 @@ async fn startup_summary(engine: String, dashboard_url: Option<String>) {
 /// Join the fabric and serve until told to stop. Returns the exit code.
 async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
     use kmplify_node::dashboard::{self, UiMode};
-    let ui = match UiMode::resolve(
-        env_opt("KMPLIFY_NODE_UI").as_deref(),
-        dashboard::desktop_session(),
-    ) {
+    let ui = match start_view(&dir) {
         Ok(u) => u,
         Err(e) => {
             eprintln!("kmplify-node: {e}");
             return EXIT_USAGE;
         }
     };
+    let interactive = interactive_console();
     let ui_port = match dashboard::parse_port(env_opt("KMPLIFY_NODE_UI_PORT").as_deref()) {
         Ok(p) => p,
         Err(e) => {
@@ -1752,6 +1750,8 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
     println!("[kmplify-node] joining {}", cfg.gateway_url);
     let engine = cfg.ollama_base.clone();
     let gateway = cfg.gateway_url.clone();
+    // What the terminal view needs to talk to the gateway as this node.
+    let view_bits = (cfg.creds_path.clone(), cfg.gateway_url.clone(), cfg.accel());
     let node = start_node(cfg, dir).await;
     let snap = status::snapshot();
     if !snap.node_id.is_empty() {
@@ -1784,9 +1784,11 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
         dir,
     } = node;
 
-    // The local dashboard (gui) and the startup summary (gui, terminal).
+    // The local dashboard: for the web view and the app window, and in every
+    // interactive start so any view can be switched to without a restart.
+    // The startup summary: everywhere but `none`.
     let mut dash = None;
-    if ui == UiMode::Gui {
+    if matches!(ui, UiMode::Gui | UiMode::App) || (interactive && ui != UiMode::None) {
         let ctx = dashboard::Ctx {
             token: dashboard::new_token(),
             node_dir: dir.clone(),
@@ -1804,11 +1806,19 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
                 println!("[kmplify-node] dashboard on this computer: {url}");
                 let mut errs = Vec::new();
                 let open = env_bool("KMPLIFY_NODE_UI_OPEN", true, &mut errs);
-                if open {
+                if open && ui == UiMode::Gui {
                     if let Err(e) = dashboard::open_browser(&url) {
                         println!(
                             "[kmplify-node] could not open a browser ({e}); open the link above yourself"
                         );
+                    }
+                }
+                if open && ui == UiMode::App {
+                    match dashboard::open_app_window(&url) {
+                        Ok(m) => println!("[kmplify-node] {m}"),
+                        Err(e) => println!(
+                            "[kmplify-node] could not open an app window ({e}); open the link above yourself"
+                        ),
                     }
                 }
                 dash = Some(d);
@@ -1819,11 +1829,34 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
             ),
         }
     }
+    // Views can be switched only with a person at the console.
+    let switchable = interactive && ui != UiMode::None;
+    control::set_view_host(switchable, switchable && cfg!(feature = "tui"), ui.as_str());
+    let mut views = ViewHost {
+        url: dash.as_ref().map(dashboard::Dashboard::url),
+        dir: dir.clone(),
+        engine: engine.clone(),
+        bits: view_bits,
+        terminal: None,
+        quit: tokio::sync::watch::channel(false).0,
+    };
+    #[cfg(feature = "tui")]
+    let mut keys = switchable.then(tui::console_keys);
+    #[cfg(not(feature = "tui"))]
+    let mut keys: Option<tokio::sync::mpsc::UnboundedReceiver<char>> = None;
     if ui != UiMode::None {
         tokio::spawn(startup_summary(
             engine,
             dash.as_ref().map(dashboard::Dashboard::url),
         ));
+    }
+    if ui == UiMode::Tui {
+        views.show("terminal");
+    } else if switchable && cfg!(feature = "tui") {
+        println!(
+            "[kmplify-node] views: t terminal view, w web view, a app window \
+             (type the letter, then Enter)"
+        );
     }
     let end_dashboard = |dash: Option<dashboard::Dashboard>, dir: &std::path::Path| {
         if let Some(d) = dash {
@@ -1845,6 +1878,7 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
                 code = EXIT_UNUSABLE;
             }
             let _ = stop.send(true);
+            views.close().await;
             let _ = publisher.await;
             commands.abort();
             status::clear_published(&dir);
@@ -1854,10 +1888,12 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
             }
             return code;
         }
-        // A dashboard, here or attached, asking this node to stop.
-        _ = wait_for_shutdown_command(&mut control_rx) => {}
+        // A dashboard, here or attached, asking this node to stop; and the
+        // views being switched meanwhile.
+        _ = control_loop(&mut control_rx, &mut views, &mut keys) => {}
     }
 
+    views.close().await;
     println!("[kmplify-node] stopping — tearing down hosted sessions…");
     end_dashboard(dash, &dir);
     Node {
@@ -1877,16 +1913,187 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
     code
 }
 
-/// Resolves when someone asks this node to stop; never otherwise.
-async fn wait_for_shutdown_command(rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>) {
+/// Is a person at this console: stdin and stdout both a terminal? Services,
+/// systemd units, containers without `-t` and redirected runs are not.
+fn interactive_console() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// The view this start begins with: `--ui` / `KMPLIFY_NODE_UI`, else the
+/// one remembered from the chooser, else (a person at the console) the
+/// chooser, else the default: `gui` in a desktop session, `terminal`
+/// elsewhere. Without a person at the console nothing is asked and nothing
+/// changes from before.
+fn start_view(dir: &std::path::Path) -> Result<kmplify_node::dashboard::UiMode, String> {
+    use kmplify_node::dashboard::{self, UiMode};
+    #[allow(unused_mut)]
+    let mut stored = Settings::load(dir);
+    #[allow(unused_mut)]
+    let mut setting = env_opt("KMPLIFY_NODE_UI").or_else(|| stored.ui.clone());
+    #[cfg(feature = "tui")]
+    {
+        use std::io::IsTerminal;
+        if kmplify_node::views::should_prompt(
+            std::io::stdin().is_terminal(),
+            std::io::stdout().is_terminal(),
+            setting.is_some(),
+        ) {
+            let default = UiMode::resolve(None, dashboard::desktop_session())?;
+            let shown = match default {
+                UiMode::Gui => "web",
+                _ => "terminal summary",
+            };
+            if let Some(c) = tui::ask_start_view(shown, Duration::from_secs(15)) {
+                if c.remember {
+                    stored.ui = Some(c.ui.to_string());
+                    match stored.save(dir) {
+                        Ok(()) => println!(
+                            "[kmplify-node] remembered; `kmplify-node set --clear ui` asks again"
+                        ),
+                        Err(e) => eprintln!("[kmplify-node] could not remember the choice: {e}"),
+                    }
+                }
+                setting = Some(c.ui.to_string());
+            }
+        }
+    }
+    let ui = UiMode::resolve(setting.as_deref(), dashboard::desktop_session())?;
+    // The terminal view needs a console; without one, the summary it was.
+    if ui == UiMode::Tui && (!interactive_console() || cfg!(not(feature = "tui"))) {
+        return Ok(UiMode::Terminal);
+    }
+    Ok(ui)
+}
+
+/// Opens the views of the node serving in this process.
+struct ViewHost {
+    /// The dashboard link, token included, when the dashboard runs.
+    url: Option<String>,
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    dir: PathBuf,
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    engine: String,
+    /// Credential path, gateway and accelerator, for the terminal view.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    bits: (PathBuf, String, Backend),
+    /// The terminal view, while it is up.
+    terminal: Option<tokio::task::JoinHandle<()>>,
+    /// Closes the terminal view when the node stops.
+    quit: tokio::sync::watch::Sender<bool>,
+}
+
+impl ViewHost {
+    /// Say something without drawing over the terminal view.
+    fn say(&self, msg: impl Into<String>) {
+        let msg = msg.into();
+        if control::terminal_up() {
+            status::push_log(msg);
+        } else {
+            println!("[kmplify-node] {msg}");
+        }
+    }
+
+    fn show(&mut self, view: &str) {
+        match view {
+            "web" | "app" => {
+                let Some(url) = self.url.clone() else {
+                    self.say("this build has no local dashboard, so there is no web view");
+                    return;
+                };
+                let outcome = if view == "web" {
+                    kmplify_node::dashboard::open_browser(&url)
+                        .map(|()| "opened the web view in your browser".to_string())
+                } else {
+                    kmplify_node::dashboard::open_app_window(&url)
+                };
+                match outcome {
+                    Ok(m) => self.say(m),
+                    Err(e) => self.say(format!("could not open it ({e}); open {url} yourself")),
+                }
+            }
+            "terminal" => self.show_terminal(),
+            _ => {}
+        }
+    }
+
+    #[cfg(feature = "tui")]
+    fn show_terminal(&mut self) {
+        if self.terminal.as_ref().is_some_and(|t| !t.is_finished()) {
+            return;
+        }
+        let (creds, gateway, accel) = self.bits.clone();
+        self.terminal = Some(tokio::spawn(tui::embedded(
+            self.dir.clone(),
+            creds,
+            gateway,
+            self.engine.clone(),
+            accel,
+            self.quit.subscribe(),
+        )));
+    }
+
+    #[cfg(not(feature = "tui"))]
+    fn show_terminal(&mut self) {
+        self.say("this build has no terminal view (built without the `tui` feature)");
+    }
+
+    /// Close the terminal view, so the console is a console again.
+    async fn close(&mut self) {
+        let _ = self.quit.send(true);
+        if let Some(t) = self.terminal.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(3), t).await;
+        }
+    }
+}
+
+/// Resolves when someone asks this node to stop; never otherwise. Meanwhile
+/// it opens the views asked for: by the dashboard's View buttons, the
+/// terminal view's keys, or the console keys (t, w or b, a).
+async fn control_loop(
+    rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
+    views: &mut ViewHost,
+    keys: &mut Option<tokio::sync::mpsc::UnboundedReceiver<char>>,
+) {
     loop {
-        match rx.recv().await {
-            Ok(f) if f["type"] == "node_shutdown" => return,
-            Ok(_) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            // The channel is process-global and never closed, but a future
-            // refactor must not turn this into a busy loop.
-            Err(_) => std::future::pending::<()>().await,
+        tokio::select! {
+            frame = rx.recv() => match frame {
+                Ok(f) if f["type"] == "node_shutdown" => return,
+                Ok(f) if f["type"] == "node_view" => {
+                    let v = f["view"].as_str().unwrap_or_default().to_string();
+                    let was_up = views.terminal.as_ref().is_some_and(|t| !t.is_finished());
+                    views.show(&v);
+                    if v == "terminal" && !was_up {
+                        status::push_log("terminal view opened in the console");
+                    }
+                }
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                // The channel is process-global and never closed, but a future
+                // refactor must not turn this into a busy loop.
+                Err(_) => std::future::pending::<()>().await,
+            },
+            key = async {
+                match keys.as_mut() {
+                    Some(k) => k.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let view = match key {
+                    Some('t') => "terminal",
+                    Some('w') | Some('b') => "web",
+                    Some('a') => "app",
+                    Some(_) => continue,
+                    None => {
+                        *keys = None;
+                        continue;
+                    }
+                };
+                // The same path as the dashboard's buttons.
+                if let Err(e) = control::submit(&control::Command::View(view.into())) {
+                    views.say(e);
+                }
+            }
         }
     }
 }

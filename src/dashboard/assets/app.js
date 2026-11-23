@@ -211,10 +211,26 @@ function header(s) {
   const rd = s.trust.readiness, fab = s.trust.fabric;
   trust.textContent = (st.level === "unknown" && fab && fab.state === "unreachable" ? "Fabric not reachable" : LEVEL_TEXT[st.level] || st.level)
     + (rd && rd.band !== "none" && st.level !== "cloud" ? " | " + rd.passed + "/" + rd.total + " checks" : rd && rd.checking ? " | checking" : "");
+  viewSwitch(s.view);
   const badge = document.getElementById("badge-trust");
   const bad = s.trust.checklist.filter((i) => i.state === "fail" || i.state === "unknown").length;
   badge.hidden = bad === 0;
   badge.textContent = String(bad);
+}
+
+// ------------------------------------------------------------------- view
+
+// Web / App window / Terminal: the same views the console keys open. Shown
+// only when a person started this node (a service has no views to switch).
+function viewSwitch(v) {
+  const box = document.getElementById("view-switch");
+  box.hidden = !(v && v.switchable);
+  if (box.hidden) return;
+  for (const b of box.querySelectorAll("button")) {
+    const which = b.dataset.view;
+    b.setAttribute("aria-pressed", which === "terminal" ? String(!!v.terminal_up) : "false");
+    b.disabled = which === "terminal" && !v.console;
+  }
 }
 
 // --------------------------------------------------------------- overview
@@ -235,7 +251,11 @@ function overview(s) {
       n.paused
         ? el("button", { class: "btn", onclick: () => act("/api/resume") }, "Resume sharing")
         : el("button", { class: "btn ghost", onclick: () => act("/api/pause") }, "Pause sharing"),
-      el("button", { class: "btn ghost", onclick: () => act("/api/reconnect") }, "Reconnect now")),
+      el("button", { class: "btn ghost", onclick: () => act("/api/reconnect") }, "Reconnect now"),
+      el("button", { class: "btn ghost", onclick: () => act("/api/report") }, "Save a report"),
+      el("button", { class: "btn ghost", onclick: () => {
+        if (window.confirm("Stop this node? Hosted sessions are torn down first.")) act("/api/shutdown");
+      } }, "Stop the node")),
     n.paused ? el("p", { class: "muted small", text: "Paused: the connection and running sessions stay up; nothing new is offered until you resume." }) : null);
 
   const models = sh.inference && sh.models.length === 0;
@@ -342,11 +362,14 @@ function sessionsTab(s) {
   const se = s.sessions;
   const rows = se.current.map((x) => el("tr", {},
     el("td", {}, el("code", { text: x.id })), el("td", { text: x.template }), el("td", { text: x.state }),
-    el("td", { text: x.cpus ? x.cpus + " threads" : "" }), el("td", { text: x.since ? ago(x.since) : "" })));
+    el("td", { text: x.cpus ? x.cpus + " threads" : "" }), el("td", { text: x.since ? ago(x.since) : "" }),
+    el("td", {}, el("button", { class: "btn ghost", "aria-label": "Stop session " + x.id, onclick: () => {
+      if (window.confirm("Stop session " + x.id + " and remove its container?")) act("/api/session/stop", { id: x.session_id });
+    } }, "Stop session"))));
   return el("div", { class: "grid" },
     card("Running now",
       se.current.length
-        ? el("table", { class: "sessions" }, el("thead", {}, el("tr", {}, ["Session", "App", "State", "CPU", "Started"].map((h) => el("th", { text: h })))), el("tbody", {}, rows))
+        ? el("table", { class: "sessions" }, el("thead", {}, el("tr", {}, ["Session", "App", "State", "CPU", "Started", ""].map((h) => el("th", { text: h })))), el("tbody", {}, rows))
         : el("p", { class: "muted", text: "No sessions are running on this machine." }),
       el("p", { class: "muted small", text: "Only what runs where is shown: never what a consumer sends or receives." })),
     card("Since this start",
@@ -368,7 +391,8 @@ function earningsTab(s) {
     return el("div", { class: "grid" }, card("Earnings",
       el("p", { text: "This fabric does not report KMPLIFY Credits for this node (the credit system is off here, or the node has not been answered yet)." }),
       el("p", {}, "How earning works: ", el("a", { href: "https://kmplify.io/docs", target: "_blank", rel: "noopener noreferrer", text: "kmplify.io/docs" })),
-      kv([["Delivered since start", s.delivered.jobs + s.delivered.functions + s.delivered.vector_ops + " calls"]])));
+      kv([["Delivered since start", s.delivered.jobs + s.delivered.functions + s.delivered.vector_ops + " calls"]]),
+      el("p", { class: "muted small", text: "This month, In total and Account and rate appear once the fabric reports credits." })));
   }
   return el("div", { class: "grid" },
     card("This month", el("div", { class: "big", text: String(e.earned_this_month) }), el("div", { class: "muted", text: "credits, after the platform fee" })),
@@ -474,6 +498,9 @@ async function refresh() {
 
 for (const b of document.querySelectorAll(".tabs button")) {
   b.addEventListener("click", () => show(b.dataset.tab));
+}
+for (const b of document.querySelectorAll("#view-switch button")) {
+  b.addEventListener("click", () => act("/api/view", { view: b.dataset.view }));
 }
 if (location.hash && TABS[location.hash.slice(1)]) show(location.hash.slice(1));
 // Every 3 s; every second while a security check runs, so the meter moves.

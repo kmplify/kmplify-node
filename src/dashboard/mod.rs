@@ -72,6 +72,11 @@ pub enum UiMode {
     Terminal,
     /// Plain log lines only, for services.
     None,
+    /// The terminal dashboard in this console (the terminal view).
+    Tui,
+    /// The dashboard in a chromeless app window. Interim: replaced by the
+    /// native window (router GUI port) once that exists.
+    App,
 }
 
 impl UiMode {
@@ -80,8 +85,10 @@ impl UiMode {
             "gui" | "web" | "browser" => Ok(UiMode::Gui),
             "terminal" | "console" | "tty" => Ok(UiMode::Terminal),
             "none" | "off" | "service" => Ok(UiMode::None),
+            "tui" | "dashboard" => Ok(UiMode::Tui),
+            "app" => Ok(UiMode::App),
             other => Err(format!(
-                "KMPLIFY_NODE_UI (--ui) must be gui, terminal or none, not {other:?}"
+                "KMPLIFY_NODE_UI (--ui) must be tui, gui, app, terminal or none, not {other:?}"
             )),
         }
     }
@@ -101,6 +108,8 @@ impl UiMode {
             UiMode::Gui => "gui",
             UiMode::Terminal => "terminal",
             UiMode::None => "none",
+            UiMode::Tui => "tui",
+            UiMode::App => "app",
         }
     }
 }
@@ -357,66 +366,92 @@ pub async fn route(req: &Request, ctx: &Ctx, port: u16) -> Response {
         ("GET", "/favicon.svg") => Response::new(200, "image/svg+xml", FAVICON_SVG),
         ("GET", "/inter.woff2") => Response::new(200, "font/woff2", INTER_WOFF2),
         ("GET", "/api/state") => Response::json(200, &state(ctx)),
-        ("POST", "/api/recheck") => recheck(),
+        ("POST", "/api/recheck") => command(crate::control::Command::Recheck),
         ("POST", "/api/pause") => command(crate::control::Command::Pause),
         ("POST", "/api/resume") => command(crate::control::Command::Resume),
         ("POST", "/api/reconnect") => command(crate::control::Command::Reconnect),
         ("POST", "/api/settings") => set_setting(ctx, &req.body, false),
         ("POST", "/api/settings/clear") => set_setting(ctx, &req.body, true),
+        ("POST", "/api/session/stop") => stop_session(&req.body),
+        ("POST", "/api/report") => report(ctx),
+        ("POST", "/api/shutdown") => command(crate::control::Command::Shutdown),
+        ("POST", "/api/view") => switch_view(&req.body),
         (_, p) if p.starts_with("/api/") => Response::text(404, "no such call"),
         _ => Response::text(404, "not found"),
     }
 }
 
 #[cfg(feature = "dashboard")]
-fn recheck() -> Response {
-    if crate::security::rechecking() {
-        return Response::json(
-            409,
-            &json!({"started": false, "message": "a check is already running"}),
-        );
-    }
-    tokio::spawn(async {
-        if crate::security::recheck().await.is_some() {
-            crate::status::push_log(
-                "security baseline re-checked on request; the next heartbeat sends it",
-            );
-            // The gateway receives it with the next pong (pings are seconds
-            // apart), then evaluates it; read its view after that.
-            tokio::time::sleep(Duration::from_secs(15)).await;
-            crate::trust::refresh_now();
-        }
-    });
-    Response::json(
-        202,
-        &json!({"started": true, "message": "checking now; the result goes to the fabric with the next heartbeat"}),
-    )
-}
-
-#[cfg(feature = "dashboard")]
 fn command(cmd: crate::control::Command) -> Response {
     let message = cmd.confirmation();
+    let ok = if matches!(cmd, crate::control::Command::Recheck) {
+        202
+    } else {
+        200
+    };
     match crate::control::submit(&cmd) {
-        Ok(()) => Response::json(200, &json!({"ok": true, "message": message})),
-        Err(e) => Response::json(409, &json!({"ok": false, "message": e})),
+        Ok(()) => Response::json(
+            ok,
+            &json!({"ok": true, "started": true, "message": message}),
+        ),
+        Err(e) => Response::json(409, &json!({"ok": false, "started": false, "message": e})),
+    }
+}
+
+/// The settings the views may change; one table for all of them.
+#[cfg(feature = "dashboard")]
+pub use crate::views::EDITABLE;
+
+#[cfg(feature = "dashboard")]
+fn body_str(body: &[u8], key: &str) -> Option<String> {
+    let v = serde_json::from_slice::<Value>(body).ok()?;
+    v[key].as_str().map(str::to_string)
+}
+
+/// `/api/session/stop {"id": session}`: the session must be one this node
+/// hosts now; anything else is refused before a command is sent.
+#[cfg(feature = "dashboard")]
+fn stop_session(body: &[u8]) -> Response {
+    let Some(id) = body_str(body, "id") else {
+        return Response::json(400, &json!({"ok": false, "message": "no session id"}));
+    };
+    if !crate::status::snapshot()
+        .sessions
+        .iter()
+        .any(|s| s.session_id == id)
+    {
+        return Response::json(
+            404,
+            &json!({"ok": false, "message": "no such session on this machine"}),
+        );
+    }
+    command(crate::control::Command::StopSession(id))
+}
+
+/// `/api/view {"view": "web" | "app" | "terminal"}`.
+#[cfg(feature = "dashboard")]
+fn switch_view(body: &[u8]) -> Response {
+    match body_str(body, "view") {
+        Some(v) if crate::control::VIEWS.contains(&v.as_str()) => {
+            command(crate::control::Command::View(v))
+        }
+        _ => Response::json(
+            400,
+            &json!({"ok": false, "message": "view must be web, app or terminal"}),
+        ),
     }
 }
 
 #[cfg(feature = "dashboard")]
-/// The settings the dashboard may change. Each is one the node already
-/// applies at runtime (`kmplify-node set` writes the same file and the
-/// running node re-advertises). Everything else is shown with how to change it.
-pub const EDITABLE: &[&str] = &[
-    "share-inference",
-    "share-cpu",
-    "approval-mode",
-    "country",
-    "workloads",
-    "max-cpus",
-    "max-vram-mb",
-    "max-ram-mb",
-    "max-disk-gb",
-];
+fn report(ctx: &Ctx) -> Response {
+    match crate::views::write_report(&ctx.node_dir, &crate::status::snapshot()) {
+        Ok(p) => Response::json(
+            200,
+            &json!({"ok": true, "message": format!("wrote {}", p.display())}),
+        ),
+        Err(e) => Response::json(500, &json!({"ok": false, "message": e})),
+    }
+}
 
 #[cfg(feature = "dashboard")]
 fn set_setting(ctx: &Ctx, body: &[u8], clear: bool) -> Response {
@@ -462,279 +497,19 @@ fn set_setting(ctx: &Ctx, body: &[u8], clear: bool) -> Response {
     )
 }
 
+/// Everything the page shows, in one answer: [`crate::views::model`] of this
+/// process, the value the terminal view renders too.
 #[cfg(feature = "dashboard")]
-fn opt<T: serde::Serialize>(v: Option<T>) -> Value {
-    v.map(|v| json!(v)).unwrap_or(Value::Null)
-}
-
-#[cfg(feature = "dashboard")]
-/// Everything the page shows, in one answer.
 pub fn state(ctx: &Ctx) -> Value {
     let snap = crate::status::snapshot();
-    let report = crate::security::latest();
-    let fabric = crate::trust::latest();
-    let now_s = crate::identity::now_s();
     let stored = crate::settings::Settings::load(&ctx.node_dir);
-    let standing = crate::trust::standing(report.as_ref(), fabric.as_ref(), now_s);
-    let readiness = crate::trust::readiness(
-        report.as_ref(),
-        fabric.as_ref(),
-        &crate::security::progress(),
-        now_s,
-    );
-    let checklist = report
-        .as_ref()
-        .map(|r| crate::trust::checklist(r, fabric.as_ref()))
-        .unwrap_or_default();
-    let b = &snap.baseline;
-    let setting = |key: &str,
-                   label: &str,
-                   value: Value,
-                   env: Value,
-                   overridden: bool,
-                   kind: &str,
-                   var: &str| {
-        json!({
-            "key": key, "label": label, "value": value, "env": env,
-            "overridden": overridden, "kind": kind, "var": var,
-            "editable": EDITABLE.contains(&key),
-            "how": format!("kmplify-node set {key}=VALUE (or {var} in the environment)"),
-        })
-    };
-    let settings: Vec<Value> = vec![
-        setting(
-            "share-inference",
-            "Share chat models (GPU inference)",
-            json!(snap.share_inference),
-            json!(b.share_inference),
-            stored.share_inference.is_some(),
-            "bool",
-            "PROVIDER_SHARE_INFERENCE",
-        ),
-        setting(
-            "share-cpu",
-            "Lend CPU threads and RAM",
-            json!(snap.share_cpu),
-            json!(b.share_cpu),
-            stored.share_cpu.is_some(),
-            "bool",
-            "PROVIDER_SHARE_CPU",
-        ),
-        setting(
-            "workloads",
-            "Serverless app templates (comma separated)",
-            json!(snap.workloads.join(",")),
-            json!(b.workloads.join(",")),
-            stored.workloads.is_some(),
-            "text",
-            "PROVIDER_WORKLOADS",
-        ),
-        setting(
-            "approval-mode",
-            "Admission of new consumers",
-            json!(snap.approval_mode),
-            json!(b.approval_mode),
-            stored.approval_mode.is_some(),
-            "choice",
-            "PROVIDER_APPROVAL_MODE",
-        ),
-        setting(
-            "country",
-            "Country (ISO alpha-2, self-declared)",
-            json!(snap.country),
-            json!(b.country),
-            stored.country.is_some(),
-            "text",
-            "PROVIDER_COUNTRY",
-        ),
-        setting(
-            "max-cpus",
-            "Ceiling: CPU threads lent",
-            opt(snap.max_cpus),
-            opt(b.max_cpus),
-            stored.max_cpus.is_some(),
-            "number",
-            "PROVIDER_MAX_CPUS",
-        ),
-        setting(
-            "max-vram-mb",
-            "Ceiling: VRAM (MB)",
-            opt(snap.max_vram_mb),
-            opt(b.max_vram_mb),
-            stored.max_vram_mb.is_some(),
-            "number",
-            "PROVIDER_MAX_VRAM_MB",
-        ),
-        setting(
-            "max-ram-mb",
-            "Ceiling: RAM (MB)",
-            opt(snap.max_ram_mb),
-            opt(b.max_ram_mb),
-            stored.max_ram_mb.is_some(),
-            "number",
-            "PROVIDER_MAX_RAM_MB",
-        ),
-        setting(
-            "max-disk-gb",
-            "Ceiling: disk for sessions (GB)",
-            opt(snap.max_disk_gb),
-            opt(b.max_disk_gb),
-            stored.max_disk_gb.is_some(),
-            "number",
-            "PROVIDER_MAX_DISK_GB",
-        ),
-        {
-            let mut v = setting(
-                "engine",
-                "Model engine (OpenAI-compatible URL)",
-                json!(ctx.engine),
-                Value::Null,
-                stored.engine.is_some(),
-                "text",
-                "OLLAMA_BASE",
-            );
-            v["how"] = json!("kmplify-node set engine=NAME_OR_URL (ollama, lmstudio, llamacpp, ...); kmplify-node engines lists what runs here");
-            v
-        },
-        {
-            let mut v = setting(
-                "gateway",
-                "Fabric gateway",
-                json!(snap.gateway),
-                Value::Null,
-                false,
-                "text",
-                "PROVIDER_GATEWAY_URL",
-            );
-            v["how"] = json!("set PROVIDER_GATEWAY_URL or --gateway, then restart the node");
-            v
-        },
-        {
-            let mut v = setting(
-                "functions",
-                "Host signed functions",
-                json!(snap.functions_enabled),
-                Value::Null,
-                stored.functions.is_some(),
-                "bool",
-                "PROVIDER_FUNCTIONS",
-            );
-            v["how"] = json!("kmplify-node set functions=true functions-pubkey=HEX (the key from GET /v1/functions)");
-            v
-        },
-        {
-            let mut v = setting(
-                "share-vectors",
-                "Host vector collections",
-                json!(snap.vectors_enabled),
-                Value::Null,
-                stored.share_vectors.is_some(),
-                "bool",
-                "PROVIDER_SHARE_VECTORS",
-            );
-            v["how"] = json!("kmplify-node set share-vectors=true");
-            v
-        },
-        {
-            let mut v = setting(
-                "ui",
-                "This dashboard",
-                json!("gui"),
-                Value::Null,
-                false,
-                "text",
-                "KMPLIFY_NODE_UI",
-            );
-            v["how"] = json!("kmplify-node --ui gui | terminal | none, --ui-port PORT (KMPLIFY_NODE_UI, KMPLIFY_NODE_UI_PORT); restart to change");
-            v
-        },
-    ];
-    let sessions: Vec<Value> = snap
-        .sessions
-        .iter()
-        .map(|s| {
-            json!({
-                "id": &s.session_id[..12.min(s.session_id.len())],
-                "template": s.template,
-                "state": s.state,
-                "cpus": s.cpus,
-                "since": s.since,
-            })
-        })
-        .collect();
-    let logs: Vec<String> = crate::status::logs()
-        .iter()
-        .rev()
-        .take(200)
-        .rev()
-        .map(|l| crate::trust::redact(l))
-        .collect();
-    json!({
-        "now_ms": crate::status::now_ms(),
-        "version": snap.version,
-        "os": std::env::consts::OS,
-        "node": {
-            "id_short": &snap.node_id[..8.min(snap.node_id.len())],
-            "gateway": snap.gateway,
-            "link": snap.link.label(),
-            "link_detail": snap.link_detail,
-            "uptime_s": snap.uptime().as_secs(),
-            "connected_s": snap.connected_for().map(|d| d.as_secs()),
-            "reconnects": snap.reconnects,
-            "paused": snap.paused,
-        },
-        "machine": {
-            "accelerator": snap.accelerator,
-            "gpu_name": snap.gpu_name,
-            "vram_total_mb": snap.vram_total_mb,
-            "vram_used_mb": snap.vram_used_mb,
-            "gpu_percent": snap.gpu_percent,
-            "cpu_model": snap.cpu_model,
-            "cpus": snap.cpus,
-            "cpu_percent": snap.cpu_percent,
-            "ram_total_mb": snap.ram_total_mb,
-            "ram_used_mb": snap.ram_used_mb,
-            "fabric_disk_mb": snap.fabric_disk_mb,
-            "reserved_cpus": snap.reserved_cpus,
-        },
-        "sharing": {
-            "inference": snap.share_inference,
-            "models": snap.models,
-            "models_text": crate::summary::models_text(&snap, &ctx.engine),
-            "engine": ctx.engine,
-            "workloads": snap.workloads,
-            "cpu": snap.share_cpu,
-            "functions": snap.functions_enabled,
-            "vectors": snap.vectors_enabled,
-            "max_cpus": snap.max_cpus,
-            "max_vram_mb": snap.max_vram_mb,
-            "max_ram_mb": snap.max_ram_mb,
-            "max_disk_gb": snap.max_disk_gb,
-            "approval_mode": snap.approval_mode,
-            "country": snap.country,
-        },
-        "trust": {
-            "standing": standing,
-            "readiness": readiness,
-            "checklist": checklist,
-            "checked_at": report.as_ref().map(|r| r.checked_at),
-            "checker_version": report.as_ref().map(|r| r.checker_version.clone()),
-            "hints": report.as_ref().map(|r| r.hints.clone()).unwrap_or_default(),
-            "elevated": report.as_ref().and_then(|r| r.elevated),
-            "rechecking": crate::security::rechecking(),
-            "fabric": fabric,
-            "fabric_line": fabric.as_ref().map(crate::trust::fabric_line),
-        },
-        "sessions": {
-            "current": sessions,
-            "hosted": snap.delivered.sessions,
-            "session_seconds": snap.delivered.session_seconds,
-        },
-        "jobs": snap.jobs,
-        "delivered": snap.delivered,
-        "earnings": snap.credits,
-        "settings": settings,
-        "logs": logs,
+    crate::views::model(&crate::views::Source {
+        snap: &snap,
+        stored: &stored,
+        engine: &ctx.engine,
+        logs: crate::status::logs(),
+        rechecking: crate::security::rechecking(),
+        view: crate::control::view_state(),
     })
 }
 
@@ -796,6 +571,78 @@ pub fn open_browser(url: &str) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+/// Chromium-family browsers that can show a page as an app window
+/// (`--app=URL`: no tabs, no address bar), in the order they are tried.
+fn app_browsers() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let mut out: Vec<PathBuf> = Vec::new();
+    if cfg!(windows) {
+        // Edge ships with every Windows 10 and 11, so this always finds one.
+        for var in ["ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"] {
+            if let Some(base) = std::env::var_os(var) {
+                let base = PathBuf::from(base);
+                out.push(base.join(r"Microsoft\Edge\Application\msedge.exe"));
+                out.push(base.join(r"Google\Chrome\Application\chrome.exe"));
+            }
+        }
+    } else if cfg!(target_os = "macos") {
+        let mut roots = vec![PathBuf::from("/Applications")];
+        if let Some(home) = std::env::var_os("HOME") {
+            roots.push(PathBuf::from(home).join("Applications"));
+        }
+        for root in roots {
+            for (app, bin) in [
+                ("Google Chrome.app", "Google Chrome"),
+                ("Microsoft Edge.app", "Microsoft Edge"),
+                ("Chromium.app", "Chromium"),
+                ("Brave Browser.app", "Brave Browser"),
+            ] {
+                out.push(root.join(app).join("Contents/MacOS").join(bin));
+            }
+        }
+    } else {
+        for name in [
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+            "microsoft-edge",
+            "brave-browser",
+        ] {
+            if let Some(p) = crate::proc::find(name) {
+                out.push(p);
+            }
+        }
+    }
+    out.into_iter().filter(|p| p.is_file()).collect()
+}
+
+/// Open the dashboard in an app window of its own.
+///
+/// INTERIM: a Chromium-family browser in app mode (`--app=URL`) stands in
+/// until the native window (the router GUI port) exists, which replaces it.
+/// The URL goes over as one argument, never through a shell; it carries the
+/// per-start token, which is therefore visible in this user's process list,
+/// exactly as it is when the default browser is started with it. Without
+/// such a browser the normal one opens instead, and the answer says so.
+pub fn open_app_window(url: &str) -> Result<String, String> {
+    if let Some(browser) = app_browsers().into_iter().next() {
+        let spawned = crate::proc::command(&browser)
+            .arg(format!("--app={url}"))
+            .arg("--new-window")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if spawned.is_ok() {
+            return Ok("opened the app window".into());
+        }
+    }
+    open_browser(url).map(|()| {
+        "no Edge, Chrome or Chromium found for an app window; opened your browser instead".into()
+    })
 }
 
 #[cfg(feature = "dashboard")]
@@ -917,6 +764,63 @@ mod tests {
         assert_eq!(parse_port(None), Ok(0));
         assert_eq!(parse_port(Some("8765")), Ok(8765));
         assert!(parse_port(Some("http")).is_err());
+    }
+
+    /// The view parity contract (`crate::views`), web side: every section is
+    /// a tab, every metric is rendered by the page (or carried by the model
+    /// it renders), every action has a control and a route.
+    #[test]
+    fn the_web_page_keeps_the_view_contract() {
+        use crate::views::{ACTIONS, METRICS, SECTIONS};
+        const SRC: &str = include_str!("mod.rs");
+        for s in SECTIONS {
+            assert!(
+                INDEX_HTML.contains(&format!("data-tab=\"{}\"", s.id))
+                    && INDEX_HTML.contains(&format!(">{}</span>", s.title)),
+                "section {} has no tab",
+                s.id
+            );
+        }
+        let model = crate::views::model(&crate::views::Source {
+            snap: &crate::status::Snapshot::default(),
+            stored: &crate::settings::Settings::default(),
+            engine: "",
+            logs: Vec::new(),
+            rechecking: false,
+            view: crate::control::ViewState::default(),
+        });
+        let setting_labels: Vec<String> = model["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x["label"].as_str().unwrap().to_string())
+            .collect();
+        for m in METRICS {
+            assert!(
+                APP_JS.contains(&format!("\"{}", m.label))
+                    || setting_labels.iter().any(|l| l == m.label),
+                "the page does not show {:?} ({})",
+                m.label,
+                m.section
+            );
+        }
+        for a in ACTIONS {
+            assert!(
+                SRC.contains(&format!("(\"POST\", \"{}\")", a.web)),
+                "no route for {} ({})",
+                a.id,
+                a.web
+            );
+            let offered = match a.id {
+                "view_web" => INDEX_HTML.contains("data-view=\"web\""),
+                "view_app" => INDEX_HTML.contains("data-view=\"app\""),
+                "view_terminal" => INDEX_HTML.contains("data-view=\"terminal\""),
+                // A control per editable setting: Save, Turn on/off, a choice.
+                "setting" => APP_JS.contains("act(\"/api/settings\""),
+                _ => APP_JS.contains(&format!("\"{}\"", a.label)) && APP_JS.contains(a.web),
+            };
+            assert!(offered, "the page offers no control for {}", a.id);
+        }
     }
 
     #[test]

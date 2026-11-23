@@ -174,6 +174,41 @@ async fn the_dashboard_serves_on_loopback_and_only_with_its_token() {
     )
     .await;
     assert_eq!(code, 401);
+    // The view switch: behind the token like every write ...
+    let (code, _, _) = send(addr, post(addr, "/api/view", "00", r#"{"view":"web"}"#)).await;
+    assert_eq!(code, 401);
+    // ... only the three views ...
+    let (code, _, _) = send(
+        addr,
+        post(addr, "/api/view", &token, r#"{"view":"calc.exe"}"#),
+    )
+    .await;
+    assert_eq!(code, 400);
+    // ... and never from a node nobody started at a console (this test
+    // process declared no view host, like a service): refused, nothing opens.
+    let (code, _, body) = send(addr, post(addr, "/api/view", &token, r#"{"view":"web"}"#)).await;
+    assert_eq!(code, 409, "{body}");
+    assert_eq!(v["view"]["switchable"], false);
+    // The new files: the font and the tab icon, behind the token too.
+    for (path, kind) in [
+        ("/inter.woff2", "font/woff2"),
+        ("/favicon.svg", "image/svg+xml"),
+        ("/app.css", "text/css"),
+    ] {
+        let (code, head, _) = send(addr, get(addr, &format!("{path}?t={token}"), "")).await;
+        assert_eq!(code, 200, "{path}");
+        assert!(head.contains(kind), "{path}: {head}");
+        let (code, _, _) = send(addr, get(addr, path, "")).await;
+        assert_eq!(code, 401, "{path} without the token");
+    }
+    // Stopping a session that is not here sends nothing.
+    let (code, _, _) = send(
+        addr,
+        post(addr, "/api/session/stop", &token, r#"{"id":"nope"}"#),
+    )
+    .await;
+    assert_eq!(code, 404);
+
     // An oversized body is refused before it is read.
     let (code, _, _) = send(
         addr,
