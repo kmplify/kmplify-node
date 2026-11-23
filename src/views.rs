@@ -322,7 +322,7 @@ pub const CHOOSER_TEXT: &str = "How do you want to watch this node?\n\
      \x20 1  Terminal view   the dashboard here, in this console\n\
      \x20 2  Web view        the dashboard in your browser\n\
      \x20 3  App window      the dashboard in its own window\n\
-     Type 1, 2 or 3 and press Enter; add r to remember the choice (e.g. 2r).\n\
+     Type 1, 2 or 3 (Enter is optional); add r to remember the choice (e.g. 2r).\n\
      You can switch at any time: keys in the terminal view, the View buttons on the dashboard.";
 
 // ------------------------------------------------------------------ model
@@ -355,6 +355,10 @@ pub const EDITABLE: &[&str] = &[
     "max-ram-mb",
     "max-disk-gb",
 ];
+
+fn env_value(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
 
 fn opt<T: serde::Serialize>(v: Option<T>) -> Value {
     v.map(|v| json!(v)).unwrap_or(Value::Null)
@@ -537,6 +541,40 @@ pub fn model(src: &Source) -> Value {
         ),
         with_how(
             setting(
+                "router",
+                "LAN router (off, local or lan)",
+                json!(stored
+                    .router
+                    .clone()
+                    .or_else(|| env_value("KMPLIFY_ROUTER"))
+                    .unwrap_or_else(|| "off".into())),
+                Value::Null,
+                stored.router.is_some(),
+                "text",
+                "KMPLIFY_ROUTER",
+            ),
+            "kmplify-node set router=local (this computer only) or router=lan (the network: \
+             needs router-allow and the cluster key, see kmplify-node router)",
+        ),
+        with_how(
+            setting(
+                "router-allow",
+                "LAN router allowlist",
+                json!(stored
+                    .router_allow
+                    .as_ref()
+                    .map(|v| v.join(","))
+                    .or_else(|| env_value("KMPLIFY_ROUTER_ALLOW"))
+                    .unwrap_or_default()),
+                Value::Null,
+                stored.router_allow.is_some(),
+                "text",
+                "KMPLIFY_ROUTER_ALLOW",
+            ),
+            "kmplify-node set router-allow=192.168.1.0/24 (private, link-local or VPN ranges only)",
+        ),
+        with_how(
+            setting(
                 "ui",
                 "Starting view",
                 json!(start_view_text(stored, &src.view)),
@@ -669,6 +707,180 @@ pub fn merge_changes(current: &Settings, saved: &Settings, draft: &Settings) -> 
         }
     }
     serde_json::from_value(Value::Object(out)).unwrap_or_else(|_| current.clone())
+}
+
+// ---------------------------------------------------------------- actions
+
+/// Which node an action is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// The node running in this process (the web dashboard, the terminal
+    /// view the node brought up): commands go to [`crate::control::submit`].
+    InProcess,
+    /// A node running in another process (the native app window, an
+    /// attached terminal): commands are dropped into its `control/`
+    /// directory with [`crate::control::request`], and the session list is
+    /// read from what it publishes.
+    Attached,
+}
+
+/// One of [`ACTIONS`], with what it needs. Every view turns its button or
+/// key into one of these and calls [`perform`], so an action cannot mean
+/// one thing in the browser and another in the app window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Act {
+    Pause,
+    Resume,
+    Reconnect,
+    Recheck,
+    /// Change one of [`EDITABLE`].
+    Setting {
+        key: String,
+        value: String,
+    },
+    /// Hand one of [`EDITABLE`] back to the environment.
+    SettingClear {
+        key: String,
+    },
+    StopSession(String),
+    Report,
+    StopNode,
+    /// `web`, `app` or `terminal`.
+    View(String),
+}
+
+impl Act {
+    /// The [`ACTIONS`] id this is.
+    pub fn id(&self) -> &'static str {
+        match self {
+            Act::Pause => "pause",
+            Act::Resume => "resume",
+            Act::Reconnect => "reconnect",
+            Act::Recheck => "recheck",
+            Act::Setting { .. } => "setting",
+            Act::SettingClear { .. } => "setting_clear",
+            Act::StopSession(_) => "stop_session",
+            Act::Report => "report",
+            Act::StopNode => "stop_node",
+            Act::View(v) => match v.as_str() {
+                "web" => "view_web",
+                "app" => "view_app",
+                _ => "view_terminal",
+            },
+        }
+    }
+}
+
+/// What came of an action: an HTTP-shaped status (the web dashboard answers
+/// with it as is), and the sentence to show.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Outcome {
+    pub status: u16,
+    pub ok: bool,
+    pub message: String,
+}
+
+impl Outcome {
+    fn ok(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            ok: true,
+            message: message.into(),
+        }
+    }
+
+    fn fail(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            ok: false,
+            message: message.into(),
+        }
+    }
+}
+
+fn send(target: Target, node_dir: &Path, cmd: &crate::control::Command) -> Result<(), String> {
+    match target {
+        Target::InProcess => crate::control::submit(cmd),
+        Target::Attached => crate::control::request(node_dir, cmd),
+    }
+}
+
+fn command(target: Target, node_dir: &Path, cmd: crate::control::Command) -> Outcome {
+    let message = cmd.confirmation();
+    let ok = if matches!(cmd, crate::control::Command::Recheck) {
+        202
+    } else {
+        200
+    };
+    match send(target, node_dir, &cmd) {
+        Ok(()) => Outcome::ok(ok, message),
+        Err(e) => Outcome::fail(409, e),
+    }
+}
+
+/// Carry out `act` on the node `target` names, whose directory is
+/// `node_dir`. The one implementation behind every view's controls.
+pub fn perform(target: Target, node_dir: &Path, act: &Act) -> Outcome {
+    use crate::control::Command;
+    let snapshot = || match target {
+        Target::InProcess => crate::status::snapshot(),
+        Target::Attached => crate::status::read_published(node_dir).unwrap_or_default(),
+    };
+    match act {
+        Act::Pause => command(target, node_dir, Command::Pause),
+        Act::Resume => command(target, node_dir, Command::Resume),
+        Act::Reconnect => command(target, node_dir, Command::Reconnect),
+        Act::Recheck => command(target, node_dir, Command::Recheck),
+        Act::StopNode => command(target, node_dir, Command::Shutdown),
+        Act::View(v) => {
+            if !crate::control::VIEWS.contains(&v.as_str()) {
+                return Outcome::fail(400, "view must be web, app or terminal");
+            }
+            command(target, node_dir, Command::View(v.clone()))
+        }
+        Act::StopSession(id) => {
+            if id.is_empty() {
+                return Outcome::fail(400, "no session id");
+            }
+            // Only a session this node hosts now; anything else is refused
+            // before a command is sent.
+            if !snapshot().sessions.iter().any(|s| &s.session_id == id) {
+                return Outcome::fail(404, "no such session on this machine");
+            }
+            command(target, node_dir, Command::StopSession(id.clone()))
+        }
+        Act::Report => match write_report(node_dir, &snapshot()) {
+            Ok(p) => Outcome::ok(200, format!("wrote {}", p.display())),
+            Err(e) => Outcome::fail(500, e),
+        },
+        Act::Setting { key, value } => change_setting(target, node_dir, key, Some(value)),
+        Act::SettingClear { key } => change_setting(target, node_dir, key, None),
+    }
+}
+
+/// `value: None` hands the key back to the environment.
+fn change_setting(target: Target, node_dir: &Path, key: &str, value: Option<&str>) -> Outcome {
+    if !EDITABLE.contains(&key) {
+        return Outcome::fail(
+            403,
+            format!("{key} is not changed from the dashboard; use kmplify-node set"),
+        );
+    }
+    let mut stored = Settings::load(node_dir);
+    let result = match value {
+        None => stored.clear(key),
+        Some(v) => stored.set(key, v),
+    };
+    if let Err(e) = result {
+        return Outcome::fail(400, e);
+    }
+    if let Err(e) = stored.save(node_dir) {
+        return Outcome::fail(500, format!("cannot save: {e}"));
+    }
+    // No live gateway session is fine: the worker re-reads the file before
+    // it dials again.
+    let _ = send(target, node_dir, &crate::control::Command::Reload);
+    Outcome::ok(200, "saved; the node re-advertises within seconds")
 }
 
 // ----------------------------------------------------------------- report
@@ -858,5 +1070,122 @@ mod tests {
         assert!(labels.contains(&"Starting view"));
         assert_eq!(m["view"]["switchable"], false);
         assert!(m["trust"]["readiness"].is_object());
+    }
+
+    /// Every action of the contract, from a view attached to a node in
+    /// another process (the native window), ends as that node's own control
+    /// command, settings file or report: the same handlers the web page and
+    /// the terminal reach in-process.
+    #[test]
+    fn every_action_reaches_the_node_through_its_control_commands() {
+        use crate::control::Command;
+        let dir = std::env::temp_dir().join(format!("kn-views-acts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A published snapshot with one hosted session, as a running node
+        // writes it.
+        let snap = Snapshot {
+            sessions: vec![crate::status::Session {
+                session_id: "sess-1".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        std::fs::write(
+            crate::status::status_path(&dir),
+            serde_json::to_vec(&snap).unwrap(),
+        )
+        .unwrap();
+        let drained = || -> Vec<Value> {
+            let ctl = crate::control::control_dir(&dir);
+            let mut files: Vec<_> = std::fs::read_dir(&ctl)
+                .map(|r| r.filter_map(Result::ok).map(|e| e.path()).collect())
+                .unwrap_or_default();
+            files.retain(|p| p.extension().is_some_and(|x| x == "json"));
+            files.sort();
+            let out = files
+                .iter()
+                .map(|p| serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap())
+                .collect();
+            for p in files {
+                let _ = std::fs::remove_file(p);
+            }
+            out
+        };
+        let cases: Vec<(Act, Vec<Command>)> = vec![
+            (Act::Pause, vec![Command::Pause]),
+            (Act::Resume, vec![Command::Resume]),
+            (Act::Reconnect, vec![Command::Reconnect]),
+            (Act::Recheck, vec![Command::Recheck]),
+            (Act::StopNode, vec![Command::Shutdown]),
+            (Act::View("web".into()), vec![Command::View("web".into())]),
+            (Act::View("app".into()), vec![Command::View("app".into())]),
+            (
+                Act::View("terminal".into()),
+                vec![Command::View("terminal".into())],
+            ),
+            (
+                Act::StopSession("sess-1".into()),
+                vec![Command::StopSession("sess-1".into())],
+            ),
+            (
+                Act::Setting {
+                    key: "max-cpus".into(),
+                    value: "4".into(),
+                },
+                vec![Command::Reload],
+            ),
+            (
+                Act::SettingClear {
+                    key: "max-cpus".into(),
+                },
+                vec![Command::Reload],
+            ),
+            (Act::Report, vec![]),
+        ];
+        let mut ids: Vec<&str> = Vec::new();
+        for (act, want) in cases {
+            let o = perform(Target::Attached, &dir, &act);
+            assert!(o.ok, "{act:?}: {}", o.message);
+            let frames = drained();
+            let want: Vec<Value> = want.iter().map(Command::as_frame).collect();
+            assert_eq!(frames, want, "{act:?}");
+            ids.push(act.id());
+            match &act {
+                Act::Setting { .. } => {
+                    assert_eq!(Settings::load(&dir).max_cpus, Some(4.0))
+                }
+                Act::SettingClear { .. } => assert_eq!(Settings::load(&dir).max_cpus, None),
+                _ => {}
+            }
+        }
+        // Every contract action was exercised.
+        for a in ACTIONS {
+            assert!(ids.contains(&a.id), "{} not exercised", a.id);
+        }
+        // A report file was written.
+        assert!(std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().starts_with("snapshot-")));
+        // Refusals stay refusals: an unknown session, a setting no view edits.
+        assert_eq!(
+            perform(Target::Attached, &dir, &Act::StopSession("nope".into())).status,
+            404
+        );
+        assert_eq!(
+            perform(
+                Target::Attached,
+                &dir,
+                &Act::Setting {
+                    key: "engine".into(),
+                    value: "x".into()
+                }
+            )
+            .status,
+            403
+        );
+        assert!(drained().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

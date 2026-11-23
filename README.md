@@ -271,6 +271,30 @@ Then watch and steer it from a terminal:
 kmplify-node tui
 ```
 
+### When the node ends without a word
+
+Every start writes `startup.log` to the node directory (the first line the
+node prints names it): one timestamped line per start step, the previous
+start kept as `startup.prev.log`. Whatever ended the process, the last line
+is the step it was in. A crash also writes `startup-crash.log` there, with
+the message and a backtrace (in the temp directory when the node directory
+cannot be written). Neither file holds a token or an environment value.
+
+On Windows, also look at:
+
+- `$LASTEXITCODE` right after the node returned to the prompt. `-1073741571`
+  (`0xC00000FD`) is a stack overflow, `-1073741819` (`0xC0000005`) an access
+  violation, `1` or `2` a refused start (the reason is printed) and `101` a
+  crash with a report.
+- Windows Security > Virus & threat protection > Protection history: Defender
+  stopping or quarantining `kmplify-node.exe` leaves no message in the
+  console.
+
+A Docker that is not running, or does not answer, is not a reason to stop:
+the node says so in one line, leaves containerised sessions off and keeps
+lending chat models. A GPU tool or Docker that never answers is given up on
+after 15 s and 5 s.
+
 ### Your engine, found rather than typed
 
 KMPLIFY ships no model runner of its own; the node lends whatever
@@ -318,7 +342,7 @@ you can switch between them while it runs, without a restart:
 |---|---|---|
 | Terminal view | The terminal dashboard in the console the node runs in (the same screens as `kmplify-node tui`) | `--ui tui`, or `1` in the chooser |
 | Web view | The dashboard in your browser | `--ui gui`, or `2` in the chooser |
-| App window | The same dashboard in a window of its own | `--ui app`, or `3` in the chooser |
+| App window | The node's native window: the same sections, figures and buttons, plus the LAN router | `--ui app` (or `--ui native`), `3` in the chooser, or `kmplify-node window` for a node already running |
 
 **The chooser.** Started by hand in a console (a terminal, or a double-click on
 `kmplify-node.exe`), with no `--ui` and nothing remembered, the node asks which
@@ -340,12 +364,17 @@ local dashboard runs in every view, so:
   do the same; Terminal brings the terminal view up in the console window the
   node runs in.
 
-The app window is an **interim step**: until the native window (the router GUI
-port) exists, it is the dashboard in a Chromium-family browser in app mode (no
-tabs, no address bar): Edge on Windows, Chrome, Edge, Chromium or Brave on macOS
-and Linux, else your normal browser with a note. The link goes to the browser as
-a program argument, never through a shell, so the per-start token is visible in
-your own process list, exactly as it is when the node opens your browser.
+The app window is a native window (egui, the `native-gui` feature, on by
+default) in a process of its own that attaches to the node: closing it leaves
+the node running, stopping the node closes it. Where it cannot open (no
+display, or a build without it such as the static Linux release binaries), the
+node falls back to the dashboard in a Chromium-family browser in app mode (no
+tabs, no address bar): Edge on Windows, Chrome, Edge, Chromium or Brave on
+macOS and Linux, else your normal browser with a note. The link goes to the
+browser as a program argument, never through a shell, so the per-start token
+is visible in your own process list, exactly as it is when the node opens your
+browser. The window and the LAN router it shows are described in
+[docs/ROUTER.md](docs/ROUTER.md).
 
 The other starts keep their meaning: `--ui terminal` is the startup summary in
 the console (plus the view keys when you are at it), `--ui none` plain log lines

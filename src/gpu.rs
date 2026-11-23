@@ -382,18 +382,53 @@ pub(crate) fn parse_gpu_json(out: &str) -> Option<(Option<String>, Option<u64>)>
 // Probes
 // ---------------------------------------------------------------------------
 
-async fn run(bin: &str, args: &[&str]) -> Option<String> {
-    let out = crate::proc::command(bin).args(args).output().await.ok()?;
+/// A vendor tool gets this long; a driver tool that hangs (a wedged
+/// nvidia-smi is not rare) must not hold the node's start.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// What one vendor-tool call came to.
+enum Probe {
+    /// It answered, successfully, with this stdout.
+    Out(String),
+    /// Not installed, or it answered with a failure.
+    Failed,
+    /// It did not answer within PROBE_TIMEOUT and was killed. Asking the
+    /// same tool again would only wait another PROBE_TIMEOUT.
+    Hung,
+}
+
+async fn ask(bin: &str, args: &[&str]) -> Probe {
+    let limit = PROBE_TIMEOUT;
+    let mut cmd = crate::proc::command(bin);
+    cmd.args(args).kill_on_drop(true);
+    let out = match tokio::time::timeout(limit, cmd.output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(_)) => return Probe::Failed,
+        Err(_) => {
+            eprintln!(
+                "[kmplify-node] {bin} did not answer within {} s; carrying on without it",
+                limit.as_secs()
+            );
+            return Probe::Hung;
+        }
+    };
     if !out.status.success() {
-        return None;
+        return Probe::Failed;
     }
-    Some(String::from_utf8_lossy(&out.stdout).to_string())
+    Probe::Out(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+async fn run(bin: &str, args: &[&str]) -> Option<String> {
+    match ask(bin, args).await {
+        Probe::Out(s) => Some(s),
+        Probe::Failed | Probe::Hung => None,
+    }
 }
 
 async fn probe_cuda() -> Option<Gpu> {
     // One query, every card (v3.8). The first row keeps the role the old
     // single-card probe gave it; the rest make the multi-GPU rig honest.
-    let rows = run(
+    let rows = match ask(
         "nvidia-smi",
         &[
             "--query-gpu=index,name,memory.total",
@@ -401,8 +436,13 @@ async fn probe_cuda() -> Option<Gpu> {
         ],
     )
     .await
-    .map(|o| parse_nvidia_rows(&o))
-    .unwrap_or_default();
+    {
+        Probe::Out(o) => parse_nvidia_rows(&o),
+        Probe::Failed => Vec::new(),
+        // A wedged nvidia-smi is not asked twice more: the fallback below
+        // would hold the start for another 2 x PROBE_TIMEOUT.
+        Probe::Hung => return None,
+    };
     if let Some(first) = rows.first() {
         return Some(Gpu {
             backend: Backend::Cuda,
@@ -413,10 +453,12 @@ async fn probe_cuda() -> Option<Gpu> {
     }
     // Older tooling that refuses the combined query: the two single-column
     // questions the probe always asked.
-    let name = run("nvidia-smi", &["--query-gpu=name", "--format=csv,noheader"])
-        .await
-        .and_then(|o| parse_nvidia_first(&o))
-        .unwrap_or_else(|| "NVIDIA GPU".to_string());
+    let name = match ask("nvidia-smi", &["--query-gpu=name", "--format=csv,noheader"]).await {
+        Probe::Out(o) => parse_nvidia_first(&o),
+        Probe::Failed => None,
+        Probe::Hung => return None,
+    }
+    .unwrap_or_else(|| "NVIDIA GPU".to_string());
     let total = run(
         "nvidia-smi",
         &["--query-gpu=memory.total", "--format=csv,noheader,nounits"],
@@ -428,7 +470,13 @@ async fn probe_cuda() -> Option<Gpu> {
 
 async fn probe_rocm() -> Option<Gpu> {
     // rocm-smi first (ubiquitous), amd-smi second (its replacement).
-    if let Some(out) = run("rocm-smi", &["--showmeminfo", "vram", "--csv"]).await {
+    let first = ask("rocm-smi", &["--showmeminfo", "vram", "--csv"]).await;
+    // A wedged AMD driver stack wedges both tools; one PROBE_TIMEOUT is the
+    // most the start waits for it.
+    if matches!(first, Probe::Hung) {
+        return None;
+    }
+    if let Probe::Out(out) = first {
         if let Some((total, _)) = parse_rocm_meminfo_csv(&out) {
             let name = run("rocm-smi", &["--showproductname", "--csv"])
                 .await

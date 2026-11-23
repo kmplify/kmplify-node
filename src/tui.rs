@@ -788,65 +788,182 @@ pub async fn embedded(
 
 /// Ask which view to start with; `None` when there is no answer within
 /// `wait` (the caller keeps its default) or the console cannot be read.
+///
+/// The console is read on its own thread and this function waits on a
+/// channel with a hard deadline, so the default view starts after `wait`
+/// whatever the console does. Enter is optional: a valid choice (`1`..`3`,
+/// optionally followed by `r`) is taken after a short pause without further
+/// keys, because a Windows console does not always deliver Enter as a key
+/// event outside raw mode. The console is in raw mode while the chooser is
+/// open (restored before returning), the mode the terminal view already
+/// reads keys in; Ctrl-C there stops the node as it would outside. `KMPLIFY_NODE_DEBUG_KEYS=1` prints every console
+/// event the chooser receives, for a report.
 pub fn ask_start_view(default: &str, wait: Duration) -> Option<views::Choice> {
     use std::io::Write;
-    println!("\n{}", views::CHOOSER_TEXT);
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+
+    enum Key {
+        Char(char),
+        Enter,
+        Backspace,
+        Cancel,
+        Interrupt,
+        Gone,
+    }
+
+    const SETTLE: Duration = Duration::from_millis(1500);
+    let debug = std::env::var("KMPLIFY_NODE_DEBUG_KEYS").is_ok_and(|v| v == "1");
+    let raw = ratatui::crossterm::terminal::enable_raw_mode().is_ok();
+    // In raw mode the console no longer turns "\n" into a new line on every
+    // platform, so every line this chooser prints ends in "\r\n".
+    let nl = if raw { "\r\n" } else { "\n" };
+    let say = |text: &str| {
+        print!("{}", text.replace('\n', nl));
+        let _ = std::io::stdout().flush();
+    };
+
+    let done = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel::<Key>();
+    {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                match event::poll(Duration::from_millis(100)) {
+                    Ok(true) => {
+                        let ev = match event::read() {
+                            Ok(ev) => ev,
+                            Err(_) => {
+                                let _ = tx.send(Key::Gone);
+                                return;
+                            }
+                        };
+                        if debug {
+                            eprint!("[keys] {ev:?}\r\n");
+                        }
+                        let Event::Key(k) = ev else { continue };
+                        if k.kind != KeyEventKind::Press {
+                            continue;
+                        }
+                        let key = match k.code {
+                            KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n') => {
+                                Key::Enter
+                            }
+                            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                                Key::Interrupt
+                            }
+                            KeyCode::Esc => Key::Cancel,
+                            KeyCode::Char(c) => Key::Char(c),
+                            KeyCode::Backspace => Key::Backspace,
+                            _ => continue,
+                        };
+                        if tx.send(key).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(_) => {
+                        let _ = tx.send(Key::Gone);
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    say(&format!("\n{}\n", views::CHOOSER_TEXT));
     let deadline = Instant::now() + wait;
     let mut line = String::new();
-    loop {
-        print!(
-            "Your choice (no answer in {} s starts the {default} view): ",
+    let mut last_key: Option<Instant> = None;
+    let prompt = |line: &str| {
+        format!(
+            "Your choice (no answer in {} s starts the {default} view): {line}",
             deadline.saturating_duration_since(Instant::now()).as_secs()
-        );
-        let _ = std::io::stdout().flush();
-        line.clear();
-        let entered = loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                break false;
+        )
+    };
+    say(&prompt(""));
+    let result = loop {
+        let now = Instant::now();
+        // A complete choice and a pause: take it without waiting for Enter.
+        if let Some(t) = last_key {
+            if now.duration_since(t) >= SETTLE {
+                if let Ok(Some(c)) = views::parse_choice(&line) {
+                    say("\n");
+                    break Some(c);
+                }
             }
-            match event::poll(left.min(Duration::from_millis(200))) {
-                Ok(true) => match event::read() {
-                    Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => match k.code {
-                        KeyCode::Enter => break true,
-                        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                            return None
-                        }
-                        KeyCode::Char(c) => {
-                            line.push(c);
-                            if cfg!(windows) {
-                                print!("{c}");
-                                let _ = std::io::stdout().flush();
-                            }
-                        }
-                        KeyCode::Backspace => {
-                            line.pop();
-                            if cfg!(windows) {
-                                print!("\u{8} \u{8}");
-                                let _ = std::io::stdout().flush();
-                            }
-                        }
-                        _ => {}
-                    },
-                    Ok(_) => {}
-                    Err(_) => return None,
-                },
-                Ok(false) => {}
-                Err(_) => return None,
+        }
+        if now >= deadline {
+            say(&format!("\nno answer: starting the {default} view\n"));
+            break None;
+        }
+        let step = deadline
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(200));
+        match rx.recv_timeout(step) {
+            Ok(Key::Char(c)) => {
+                line.push(c);
+                last_key = Some(Instant::now());
+                // Raw mode does not echo; a cooked Unix console echoes itself.
+                if raw || cfg!(windows) {
+                    say(&c.to_string());
+                }
             }
-        };
-        if !entered {
-            println!("\nno answer: starting the {default} view");
-            return None;
+            Ok(Key::Backspace) => {
+                line.pop();
+                last_key = Some(Instant::now());
+                if raw || cfg!(windows) {
+                    say("\u{8} \u{8}");
+                }
+            }
+            Ok(Key::Enter) => {
+                if raw || cfg!(windows) {
+                    say("\n");
+                }
+                match views::parse_choice(&line) {
+                    Ok(Some(c)) => break Some(c),
+                    // Enter alone: the default view, now.
+                    Ok(None) => {
+                        say(&format!("starting the {default} view\n"));
+                        break None;
+                    }
+                    Err(e) => {
+                        say(&format!("{e}\n"));
+                        line.clear();
+                        last_key = None;
+                        say(&prompt(""));
+                    }
+                }
+            }
+            Ok(Key::Interrupt) => {
+                if raw {
+                    let _ = ratatui::crossterm::terminal::disable_raw_mode();
+                }
+                say("\n");
+                std::process::exit(130);
+            }
+            Ok(Key::Cancel) => {
+                say(&format!("\nstarting the {default} view\n"));
+                break None;
+            }
+            Ok(Key::Gone) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // The console cannot be read: the countdown still decides.
+                if Instant::now() < deadline {
+                    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                }
+                say(&format!("\nno answer: starting the {default} view\n"));
+                break None;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
-        if cfg!(windows) {
-            println!();
-        }
-        match views::parse_choice(&line) {
-            Ok(c) => return c,
-            Err(e) => println!("{e}"),
-        }
+    };
+    done.store(true, Ordering::Relaxed);
+    if raw {
+        let _ = ratatui::crossterm::terminal::disable_raw_mode();
     }
+    // Let the reader see `done` before the console-key reader takes over.
+    std::thread::sleep(Duration::from_millis(150));
+    result
 }
 
 /// The view keys of the plain console: each key pressed (letters only),
