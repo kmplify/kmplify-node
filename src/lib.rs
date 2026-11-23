@@ -40,6 +40,7 @@ pub mod rewards;
 pub mod router;
 pub mod security;
 pub mod settings;
+pub mod startup;
 pub mod status;
 pub mod summary;
 pub mod trust;

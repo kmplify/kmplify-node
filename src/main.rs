@@ -1561,7 +1561,19 @@ pub(crate) struct Node {
 }
 
 pub(crate) async fn start_node(cfg: WorkerConfig, dir: PathBuf) -> Node {
-    match fabric_worker::ensure_identity(&cfg.gateway_url, &cfg.creds_path).await {
+    if !cfg.creds_path.exists() {
+        // The one network call before the dashboard; 10 s at most.
+        println!("[kmplify-node] registering this node with the gateway (10 s at most)…");
+        kmplify_node::startup::step("register: begin");
+    } else {
+        kmplify_node::startup::step("identity: reading the stored credential");
+    }
+    let identity = fabric_worker::ensure_identity(&cfg.gateway_url, &cfg.creds_path).await;
+    kmplify_node::startup::step(match &identity {
+        Ok(_) => "identity: established",
+        Err(_) => "identity: not established yet (the worker keeps trying)",
+    });
+    match identity {
         Ok(c) => {
             let id = c.node_id.clone();
             status::update(move |s| s.node_id = id);
@@ -1704,6 +1716,7 @@ async fn startup_summary(engine: String, dashboard_url: Option<String>) {
 /// Join the fabric and serve until told to stop. Returns the exit code.
 async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
     use kmplify_node::dashboard::{self, UiMode};
+    kmplify_node::startup::step("view: choosing");
     let ui = match start_view(&dir) {
         Ok(u) => u,
         Err(e) => {
@@ -1711,7 +1724,9 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
             return EXIT_USAGE;
         }
     };
+    kmplify_node::startup::step(format!("view: {}", ui.as_str()));
     let interactive = interactive_console();
+    kmplify_node::startup::step(format!("interactive console: {interactive}"));
     let ui_port = match dashboard::parse_port(env_opt("KMPLIFY_NODE_UI_PORT").as_deref()) {
         Ok(p) => p,
         Err(e) => {
@@ -1732,11 +1747,15 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
     // previous run left behind is removed.
     let managed_vllm = !cfg.vllm_model.trim().is_empty();
     if managed_vllm {
-        let (backend, _) = kmplify_node::gpu::detect().await;
+        // The backend main() already resolved from its one probe round
+        // (overrides included): probing every vendor tool again here cost a
+        // second wait on a wedged nvidia-smi.
+        let backend = cfg.accelerator;
         println!(
             "[kmplify-node] starting vLLM with {} (a first start downloads the engine and the model)…",
             cfg.vllm_model
         );
+        kmplify_node::startup::step("vLLM start: begin");
         match kmplify_node::vllm_managed::start(
             backend,
             cfg.vllm_model.trim(),
@@ -1746,6 +1765,7 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
         .await
         {
             Ok(base) => {
+                kmplify_node::startup::step("vLLM start: ready");
                 println!("[kmplify-node] vLLM is ready at {base}; lending it");
                 cfg.ollama_base = base;
             }
@@ -1754,10 +1774,33 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
                 cfg.ollama_base
             ),
         }
-    } else {
-        kmplify_node::vllm_managed::remove().await;
+    } else if kmplify_node::proc::find("docker").is_some() {
+        // Asked once, 5 s at most, so a Docker Desktop that is installed but
+        // not started (or wedged) is one clear line and not a silent wait.
+        println!("[kmplify-node] checking Docker…");
+        kmplify_node::startup::step("docker check: begin");
+        match fabric_worker::docker_daemon().await {
+            Ok(()) => {
+                kmplify_node::startup::step("docker check: running; clean-up begin");
+                kmplify_node::vllm_managed::remove().await;
+                kmplify_node::startup::step("docker clean-up: end");
+            }
+            Err(why) => {
+                kmplify_node::startup::step("docker check: not usable");
+                let state = if why.contains("did not answer") {
+                    "Docker does not answer"
+                } else {
+                    "Docker is not running"
+                };
+                println!(
+                    "[kmplify-node] {state}: containerised sessions are off until it is; \
+                     chat models keep working ({why})"
+                );
+            }
+        }
     }
     println!("[kmplify-node] joining {}", cfg.gateway_url);
+    kmplify_node::startup::step("joining the gateway");
     let engine = cfg.ollama_base.clone();
     let gateway = cfg.gateway_url.clone();
     // What the terminal view needs to talk to the gateway as this node.
@@ -1805,8 +1848,13 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
             engine: engine.clone(),
             gateway,
         };
+        kmplify_node::startup::step("dashboard bind: begin");
         match dashboard::start(dashboard::loopback(ui_port), ctx, stop.subscribe()).await {
             Ok(d) => {
+                kmplify_node::startup::step(format!(
+                    "dashboard bind: listening on port {}",
+                    d.addr.port()
+                ));
                 let url = d.url();
                 let port = d.addr.port();
                 status::update(move |s| s.dashboard_port = Some(port));
@@ -1825,10 +1873,13 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
                 }
                 dash = Some(d);
             }
-            Err(e) => eprintln!(
-                "[kmplify-node] the dashboard did not start ({e}); carrying on in the terminal. \
-                 Try another port with --ui-port, or --ui terminal."
-            ),
+            Err(e) => {
+                kmplify_node::startup::step("dashboard bind: failed");
+                eprintln!(
+                    "[kmplify-node] the dashboard did not start ({e}); carrying on in the terminal. \
+                     Try another port with --ui-port, or --ui terminal."
+                )
+            }
         }
     }
     // Views can be switched only with a person at the console.
@@ -1851,7 +1902,10 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
         }
     }
     #[cfg(feature = "tui")]
-    let mut keys = switchable.then(tui::console_keys);
+    let mut keys = switchable.then(|| {
+        kmplify_node::startup::step("console keys: listening (interactive console)");
+        tui::console_keys()
+    });
     #[cfg(not(feature = "tui"))]
     let mut keys: Option<tokio::sync::mpsc::UnboundedReceiver<char>> = None;
     if ui != UiMode::None {
@@ -1861,6 +1915,7 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
         ));
     }
     if ui == UiMode::Tui {
+        kmplify_node::startup::step("terminal view: opening");
         views.show("terminal");
     } else if switchable && cfg!(feature = "tui") {
         println!(
@@ -1874,6 +1929,7 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
             dashboard::remove_url_file(dir);
         }
     };
+    kmplify_node::startup::step("start complete, serving");
     let mut code = EXIT_OK;
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
@@ -1904,6 +1960,7 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
     }
 
     views.close().await;
+    kmplify_node::startup::step("stopping");
     println!("[kmplify-node] stopping — tearing down hosted sessions…");
     end_dashboard(dash, &dir);
     Node {
@@ -2215,15 +2272,58 @@ async fn control_loop(
     }
 }
 
-#[tokio::main]
-async fn main() {
+/// Stack for the thread the node's async main runs on. Windows gives the
+/// process's main thread 1 MB (macOS and Linux 8 MB), and `block_on` keeps
+/// the whole top-level future on that stack; a start that overflowed it
+/// would end on Windows only. 16 MB removes the difference.
+const MAIN_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn main() {
+    // First, before anything can panic: a crash leaves a report on stderr
+    // and in startup-crash.log instead of a silent exit.
+    kmplify_node::startup::install_panic_hook();
+    let ran = std::thread::Builder::new()
+        .name("main".into())
+        .stack_size(MAIN_STACK_BYTES)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("the async runtime")
+                .block_on(async_main())
+        })
+        .expect("the main thread")
+        .join();
+    if ran.is_err() {
+        // The hook has already said why.
+        exit(EXIT_PANIC);
+    }
+}
+
+/// The exit code after a panic, as Rust's own default.
+const EXIT_PANIC: i32 = 101;
+
+/// `std::process::exit`, with the code as the trace's last line.
+fn exit(code: i32) -> ! {
+    kmplify_node::startup::step(format!("exit with code {code}"));
+    std::process::exit(code)
+}
+
+async fn async_main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    kmplify_node::startup::step(format!(
+        "kmplify-node {} on {}/{}, args: {}",
+        kmplify_node::version_string(),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        kmplify_node::startup::redact_args(&argv)
+    ));
     let cli = match cli::parse(&argv) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("kmplify-node: {e}\n");
             eprint!("{}", cli::usage());
-            std::process::exit(EXIT_USAGE);
+            exit(EXIT_USAGE);
         }
     };
     // Before anything reads the environment, so `check` reports what `run`
@@ -2241,7 +2341,7 @@ async fn main() {
         }
         // Needs no configuration and no node directory: it reads this
         // machine, not the node.
-        cli::Cmd::Security => std::process::exit(run_security(cli.json).await),
+        cli::Cmd::Security => exit(run_security(cli.json).await),
         _ => {}
     }
 
@@ -2251,12 +2351,18 @@ async fn main() {
     if cli.cmd != cli::Cmd::Status {
         if let Err(e) = tokio::fs::create_dir_all(&dir).await {
             eprintln!("cannot create node dir {}: {e}", dir.display());
-            std::process::exit(EXIT_UNUSABLE);
+            exit(EXIT_UNUSABLE);
         }
     }
 
     if cli.cmd == cli::Cmd::Status {
-        std::process::exit(run_status(&dir, cli.json));
+        exit(run_status(&dir, cli.json));
+    }
+    // Only the commands that start a node own the trace: `status` or `set`
+    // run next to a node must not overwrite the trace of its start.
+    if matches!(cli.cmd, cli::Cmd::Run | cli::Cmd::Tui) {
+        kmplify_node::startup::set_dir(&dir);
+        kmplify_node::startup::step(format!("node dir {}", dir.display()));
     }
 
     let mut errs = Vec::new();
@@ -2277,7 +2383,7 @@ async fn main() {
                 eprintln!("  {e}");
             }
         }
-        std::process::exit(run_set(&dir, &cli, &from_env));
+        exit(run_set(&dir, &cli, &from_env));
     }
 
     if !errs.is_empty() {
@@ -2285,7 +2391,7 @@ async fn main() {
             eprintln!("kmplify-node: {e}");
         }
         eprintln!("\nnothing was started. Fix the configuration and try again.");
-        std::process::exit(EXIT_USAGE);
+        exit(EXIT_USAGE);
     }
     // Provider terms for document content: the version the operator states
     // in the environment is recorded with its first time; without the
@@ -2315,7 +2421,20 @@ async fn main() {
     // because probing four vendor tools to print a node id is pure latency in
     // whatever script called it.
     let gpus = if matches!(cli.cmd, cli::Cmd::Check | cli::Cmd::Run | cli::Cmd::Tui) {
-        gpu::detect_all().await
+        // Said before the probes, so a slow vendor tool is not a silent start.
+        // The node dir is named here so an operator knows where
+        // startup.log and startup-crash.log are.
+        if !cli.json {
+            eprintln!(
+                "[kmplify-node] {} starting (node dir {}): looking for GPUs…",
+                kmplify_node::version_string(),
+                dir.display()
+            );
+        }
+        kmplify_node::startup::step("GPU probe: begin");
+        let found = gpu::detect_all().await;
+        kmplify_node::startup::step(format!("GPU probe: end, {} card(s)", found.len()));
+        found
     } else {
         Vec::new()
     };
@@ -2351,7 +2470,7 @@ async fn main() {
             unreachable!("handled above")
         }
     };
-    std::process::exit(code);
+    exit(code);
 }
 
 /// `kmplify-node window`: the native app window of the node running here.

@@ -208,6 +208,23 @@ const PULL_HEARTBEAT: Duration = Duration::from_secs(20);
 /// Docker daemon liveness probe. Short: it runs on the telemetry path, and a
 /// daemon that cannot answer in this long is not one that can pull an image.
 const DOCKER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// A host tool asked one question (`nvidia-smi`, `icacls`, `docker exec` of
+/// a probe in a container). A wedged driver tool is not rare.
+const CONTROL_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+/// A short docker control command: rm, inspect, ps, port, logs, network and
+/// volume housekeeping. Each answers in well under a second on a healthy
+/// daemon; the limit only exists so that a Docker Desktop that accepts the
+/// connection and never answers cannot hold the caller. A time-out is
+/// treated exactly like "docker unavailable" at every call site.
+const DOCKER_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+/// `docker run -d` of a session or guard container whose image is already
+/// pulled: creating and starting it takes seconds.
+const DOCKER_START_TIMEOUT: Duration = Duration::from_secs(120);
+/// A one-off command in a throwaway container over a model volume (stat,
+/// mkdir, rm, mv, ls).
+const VOLUME_EXEC_TIMEOUT: Duration = Duration::from_secs(60);
+/// `sha256sum` of a downloaded model file, which can be tens of GB.
+const VOLUME_HASH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// The gateway's close code 4003 means a second process connected with this
 /// node's identity (kmplify-gpu-fabric docs/PROTOCOL.md): the two evict each
 /// other for as long as both run, so the message names the cure rather than
@@ -499,7 +516,13 @@ pub fn request_stop(session_id: &str) -> Result<(), String> {
 /// pinned-vs-expiring rule the worker publishes to the fabric, so the
 /// provider's own screen can never disagree with what consumers are told.
 pub async fn local_resident_models(ollama_base: &str) -> Vec<Value> {
-    loaded_models(&reqwest::Client::new(), ollama_base).await
+    // A local engine that accepts and never answers must not hold the
+    // caller: the same 5 s the worker's own probes allow.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+    loaded_models(&client, ollama_base).await
 }
 
 async fn hosted_add(session: &str, template: &str, container: &str, state: &str, cpus: f64) {
@@ -997,15 +1020,28 @@ async fn restrict_to_current_user(path: &Path) {
             return;
         }
     };
-    let out = crate::proc::command("icacls")
-        .arg(path)
+    let mut cmd = crate::proc::command("icacls");
+    cmd.arg(path)
         .arg("/inheritance:r")
         .arg("/grant:r")
         .arg(format!("{user}:F"))
         .arg("/grant:r")
         .arg("SYSTEM:F")
-        .output()
-        .await;
+        .kill_on_drop(true);
+    // On the start path (the credential is written before the dashboard):
+    // an icacls that never returns must not hold the node.
+    let out = match tokio::time::timeout(CONTROL_PROBE_TIMEOUT, cmd.output()).await {
+        Ok(r) => r,
+        Err(_) => {
+            log(format!(
+                "could not restrict {}: icacls did not finish within {} s; the file keeps \
+                 the folder's permissions",
+                path.display(),
+                CONTROL_PROBE_TIMEOUT.as_secs()
+            ));
+            return;
+        }
+    };
     match out {
         Ok(o) if o.status.success() => {}
         Ok(o) => log(format!(
@@ -1559,11 +1595,14 @@ pub async fn discover_upstreams(client: &reqwest::Client, cfg: &WorkerConfig) ->
 /// not only to the worker: the KMPLIFY desktop app picks a coding-model
 /// profile with it.
 pub async fn nvidia_vram_mb() -> Option<u64> {
-    let out = crate::proc::command("nvidia-smi")
-        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
-        .output()
-        .await
-        .ok()?;
+    // A wedged nvidia-smi is "no working nvidia-smi": None, like a missing one.
+    let out = bounded_output(
+        "nvidia-smi",
+        &["--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+        CONTROL_PROBE_TIMEOUT,
+    )
+    .await
+    .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -1800,17 +1839,45 @@ pub async fn docker_ok() -> bool {
     )
 }
 
+/// [`docker_ok`] with the reason when it is not: the CLI's own first line
+/// ("failed to connect to the docker API at npipe:…" when Docker Desktop is
+/// installed but not started), or that it did not answer in time.
+pub async fn docker_daemon() -> Result<(), String> {
+    match bounded_output(
+        "docker",
+        &["version", "--format", "{{.Server.Version}}"],
+        DOCKER_PROBE_TIMEOUT,
+    )
+    .await
+    {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(String::from_utf8_lossy(&o.stderr)
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("the docker CLI reported an error")
+            .chars()
+            .take(200)
+            .collect()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Container runtimes this Docker daemon can run a session under (protocol
 /// v3.5). "container" is plain docker and always present; "gvisor" is
 /// advertised only when `runsc` is registered as a runtime, because the
 /// gateway will only ever schedule a template that REQUIRES that level here
 /// if we say so, and saying so falsely would run it in a plain container.
 async fn docker_runtimes() -> Vec<String> {
-    let probe = crate::proc::command("docker")
-        .args(["info", "--format", "{{json .Runtimes}}"])
-        .output();
-    match tokio::time::timeout(DOCKER_PROBE_TIMEOUT, probe).await {
-        Ok(Ok(o)) if o.status.success() => runtimes_from_info(&String::from_utf8_lossy(&o.stdout)),
+    // Through docker_bounded so the CLI is also killed at the limit: the
+    // bare timeout used to return while the child lived on.
+    match docker_bounded(
+        &["info", "--format", "{{json .Runtimes}}"],
+        DOCKER_PROBE_TIMEOUT,
+    )
+    .await
+    {
+        Ok(o) if o.status.success() => runtimes_from_info(&String::from_utf8_lossy(&o.stdout)),
         _ => vec!["container".to_string()],
     }
 }
@@ -1850,11 +1917,13 @@ pub fn microvm_runtime(runtimes: &serde_json::Map<String, Value>) -> Option<&'st
 
 /// The Kata runtime installed on this host, if any.
 async fn docker_microvm_runtime() -> Option<&'static str> {
-    let probe = crate::proc::command("docker")
-        .args(["info", "--format", "{{json .Runtimes}}"])
-        .output();
-    match tokio::time::timeout(DOCKER_PROBE_TIMEOUT, probe).await {
-        Ok(Ok(o)) if o.status.success() => {
+    match docker_bounded(
+        &["info", "--format", "{{json .Runtimes}}"],
+        DOCKER_PROBE_TIMEOUT,
+    )
+    .await
+    {
+        Ok(o) if o.status.success() => {
             match serde_json::from_str::<Value>(String::from_utf8_lossy(&o.stdout).trim()) {
                 Ok(Value::Object(map)) => microvm_runtime(&map),
                 _ => None,
@@ -1993,19 +2062,15 @@ pub fn guard_run_args(container: &str, port: u64, ip: &str, label: &str) -> Vec<
 
 async fn ensure_noegress_network(container: &str) -> Result<(), String> {
     let net = noegress_network_name(container);
-    let inspect = crate::proc::command("docker")
-        .args(["network", "inspect", &net])
-        .output()
-        .await
-        .map_err(|e| format!("docker unavailable: {e}"))?;
+    let inspect = docker_bounded(&["network", "inspect", &net], DOCKER_CONTROL_TIMEOUT).await?;
     if inspect.status.success() {
         return Ok(());
     }
-    let out = crate::proc::command("docker")
-        .args(["network", "create", "--internal", &net])
-        .output()
-        .await
-        .map_err(|e| format!("docker unavailable: {e}"))?;
+    let out = docker_bounded(
+        &["network", "create", "--internal", &net],
+        DOCKER_CONTROL_TIMEOUT,
+    )
+    .await?;
     if out.status.success() {
         return Ok(());
     }
@@ -2020,36 +2085,32 @@ async fn ensure_noegress_network(container: &str) -> Result<(), String> {
 /// its name. The caller resolves the published host port from the guard.
 async fn start_guard(container: &str, port: u64) -> Result<String, String> {
     let net = noegress_network_name(container);
-    let ip = crate::proc::command("docker")
-        .args([
+    let ip = docker_bounded(
+        &[
             "inspect",
             "-f",
             &format!("{{{{(index .NetworkSettings.Networks \"{net}\").IPAddress}}}}"),
             container,
-        ])
-        .output()
-        .await
-        .map_err(|e| format!("docker unavailable: {e}"))?;
+        ],
+        DOCKER_CONTROL_TIMEOUT,
+    )
+    .await?;
     let ip = String::from_utf8_lossy(&ip.stdout).trim().to_string();
     if ip.is_empty() || ip.contains("no value") {
         return Err("the session container has no address on the no-egress network".into());
     }
-    let present = crate::proc::command("docker")
-        .args(["image", "inspect", GUARD_IMAGE])
-        .output()
+    // Unknown (docker did not answer) is "not present": the pull below then
+    // asks again, under its own limit.
+    let present = docker_bounded(&["image", "inspect", GUARD_IMAGE], DOCKER_CONTROL_TIMEOUT)
         .await
         .map(|o| o.status.success())
         .unwrap_or(false);
     if !present {
-        let pull = tokio::time::timeout(
-            Duration::from_secs(180),
-            crate::proc::command("docker")
-                .args(["pull", GUARD_IMAGE])
-                .output(),
-        )
-        .await
-        .map_err(|_| "pulling the guard image timed out".to_string())?
-        .map_err(|e| format!("docker unavailable: {e}"))?;
+        // A small image; three minutes is generous, and the CLI is killed
+        // at the limit instead of being left behind.
+        let pull = docker_bounded(&["pull", GUARD_IMAGE], Duration::from_secs(180))
+            .await
+            .map_err(|e| format!("could not pull the guard image: {e}"))?;
         if !pull.status.success() {
             return Err(format!(
                 "could not pull the guard image: {}",
@@ -2060,22 +2121,33 @@ async fn start_guard(container: &str, port: u64) -> Result<String, String> {
     let guard = guard_name(container);
     let _ = remove_container(&guard).await;
     let args = guard_run_args(container, port, &ip, &node_label().await);
-    let out = crate::proc::command("docker")
-        .args(&args)
-        .output()
-        .await
-        .map_err(|e| format!("docker unavailable: {e}"))?;
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = match docker_bounded(&argv, DOCKER_START_TIMEOUT).await {
+        Ok(o) => o,
+        Err(e) => {
+            // It may have been created before the CLI gave up.
+            let _ = remove_container(&guard).await;
+            return Err(format!("could not start the guard: {e}"));
+        }
+    };
     if !out.status.success() {
         return Err(format!(
             "could not start the guard: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let out = crate::proc::command("docker")
-        .args(["network", "connect", &net, &guard])
-        .output()
-        .await
-        .map_err(|e| format!("docker unavailable: {e}"))?;
+    let out = match docker_bounded(
+        &["network", "connect", &net, &guard],
+        DOCKER_CONTROL_TIMEOUT,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = remove_container(&guard).await;
+            return Err(e);
+        }
+    };
     if !out.status.success() {
         let _ = remove_container(&guard).await;
         return Err(format!(
@@ -2128,17 +2200,13 @@ async fn sweep_orphans(sessions: &Sessions) {
     if label.is_empty() {
         return;
     }
-    let out = crate::proc::command("docker")
-        .args([
-            "ps",
-            "-a",
-            "--filter",
-            &format!("label={NODE_LABEL}={label}"),
-            "--format",
-            "{{.Names}}",
-        ])
-        .output()
-        .await;
+    let filter = format!("label={NODE_LABEL}={label}");
+    let out = docker_bounded(
+        &["ps", "-a", "--filter", &filter, "--format", "{{.Names}}"],
+        DOCKER_CONTROL_TIMEOUT,
+    )
+    .await;
+    // No answer: nothing is swept this round (the next sweep asks again).
     let Ok(out) = out else { return };
     if !out.status.success() {
         return;
@@ -2916,16 +2984,19 @@ pub fn network_with(
 /// is alive (or still being created). A container docker no longer knows at
 /// all reports code -1 — dead is dead, even when the code is unknowable.
 async fn container_exit(name: &str) -> Option<i64> {
-    let out = crate::proc::command("docker")
-        .args([
+    // No answer from docker is "not known to be dead" (None), never a
+    // made-up exit: the same as docker being unavailable.
+    let out = docker_bounded(
+        &[
             "inspect",
             "--format",
             "{{.State.Status}} {{.State.ExitCode}}",
             name,
-        ])
-        .output()
-        .await
-        .ok()?;
+        ],
+        DOCKER_CONTROL_TIMEOUT,
+    )
+    .await
+    .ok()?;
     parse_container_state(out.status.success(), &String::from_utf8_lossy(&out.stdout))
 }
 
@@ -2940,18 +3011,16 @@ async fn containers_usage(names: &[String]) -> std::collections::HashMap<String,
     if names.is_empty() {
         return out;
     }
-    let run = crate::proc::command("docker")
-        .args([
-            "stats",
-            "--no-stream",
-            "--format",
-            "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}",
-        ])
-        .args(names)
-        .output();
+    let mut argv: Vec<&str> = vec![
+        "stats",
+        "--no-stream",
+        "--format",
+        "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}",
+    ];
+    argv.extend(names.iter().map(String::as_str));
     // `docker stats` waits for one sample per container; a wedged daemon
-    // must not hold the sampler forever.
-    let Ok(Ok(res)) = tokio::time::timeout(Duration::from_secs(12), run).await else {
+    // must not hold the sampler forever (and the CLI is killed at the limit).
+    let Ok(res) = docker_bounded(&argv, Duration::from_secs(12)).await else {
         return out;
     };
     for line in String::from_utf8_lossy(&res.stdout).lines() {
@@ -3142,21 +3211,21 @@ async fn remove_container(name: &str) -> Result<(), String> {
         let res = docker_rm(name).await;
         // The session's private network goes last, once nothing is on it.
         // A network that never existed (egress session) is not an error.
-        let _ = crate::proc::command("docker")
-            .args(["network", "rm", &noegress_network_name(name)])
-            .output()
-            .await;
+        let _ = docker_bounded(
+            &["network", "rm", &noegress_network_name(name)],
+            DOCKER_CONTROL_TIMEOUT,
+        )
+        .await;
         return res;
     }
     docker_rm(name).await
 }
 
 async fn docker_rm(name: &str) -> Result<(), String> {
-    let out = crate::proc::command("docker")
-        .args(["rm", "-f", "-v", name])
-        .output()
-        .await
-        .map_err(|e| format!("docker unavailable: {e}"))?;
+    // A time-out is an Err like "docker unavailable", never Ok: a removal
+    // nobody confirmed must not be reported as done (the GPU would be
+    // reported released while the container still holds it).
+    let out = docker_bounded(&["rm", "-f", "-v", name], DOCKER_CONTROL_TIMEOUT).await?;
     if out.status.success() {
         return Ok(());
     }
@@ -3194,7 +3263,7 @@ pub async fn docker_bounded(
     bounded_output("docker", args, limit).await
 }
 
-async fn bounded_output(
+pub(crate) async fn bounded_output(
     program: &str,
     args: &[&str],
     limit: Duration,
@@ -3332,31 +3401,25 @@ async fn drop_one_volume(name: &str) -> VolumeDrop {
     if !is_consumer_state_volume(name) {
         return VolumeDrop::Failed("refused: not a consumer state volume".into());
     }
-    let exists = crate::proc::command("docker")
-        .args(["volume", "inspect", name])
-        .output()
-        .await;
+    let exists = docker_bounded(&["volume", "inspect", name], DOCKER_CONTROL_TIMEOUT).await;
     match exists {
-        Err(e) => return VolumeDrop::Failed(format!("docker unavailable: {e}")),
+        Err(e) => return VolumeDrop::Failed(e),
         Ok(o) if !o.status.success() => return VolumeDrop::Absent,
         Ok(_) => {}
     }
     // Any container, running or not, that mounts it: docker would refuse the
     // removal anyway, and "in use" is the answer the gateway can act on.
-    let users = crate::proc::command("docker")
-        .args(["ps", "-a", "-q", "--filter", &format!("volume={name}")])
-        .output()
-        .await;
+    let users = docker_bounded(
+        &["ps", "-a", "-q", "--filter", &format!("volume={name}")],
+        DOCKER_CONTROL_TIMEOUT,
+    )
+    .await;
     if let Ok(o) = &users {
         if o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty() {
             return VolumeDrop::InUse;
         }
     }
-    match crate::proc::command("docker")
-        .args(["volume", "rm", name])
-        .output()
-        .await
-    {
+    match docker_bounded(&["volume", "rm", name], DOCKER_CONTROL_TIMEOUT).await {
         Ok(o) if o.status.success() => VolumeDrop::Removed,
         Ok(o) => {
             let err = String::from_utf8_lossy(&o.stderr)
@@ -3370,7 +3433,7 @@ async fn drop_one_volume(name: &str) -> VolumeDrop {
                 VolumeDrop::Failed(err)
             }
         }
-        Err(e) => VolumeDrop::Failed(format!("docker unavailable: {e}")),
+        Err(e) => VolumeDrop::Failed(e),
     }
 }
 
@@ -3735,18 +3798,18 @@ const DU_MEASURE_TIMEOUT: Duration = Duration::from_secs(120);
 /// then AGAIN by `is_fabric_volume`: `--filter name=` is a substring match,
 /// and only names that pass the mount rule are ever handed to `-v`.
 async fn fabric_volume_names() -> Result<Vec<String>, String> {
-    let out = crate::proc::command("docker")
-        .args([
+    let out = docker_bounded(
+        &[
             "volume",
             "ls",
             "--filter",
             "name=kmplify-fabric-",
             "--format",
             "{{.Name}}",
-        ])
-        .output()
-        .await
-        .map_err(|e| format!("docker unavailable: {e}"))?;
+        ],
+        DOCKER_CONTROL_TIMEOUT,
+    )
+    .await?;
     if !out.status.success() {
         return Err(format!(
             "docker volume ls failed: {}",
@@ -3978,7 +4041,10 @@ async fn fetch_model(
         FETCH_IMAGE.into(),
     ];
     args.extend(fetch_script_args(&path, &url));
-    let out = crate::proc::command("docker").args(&args).output().await;
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    // A download, so the generous model-fetch ceiling rather than a control
+    // limit; still a ceiling, so a hung CLI cannot keep this task forever.
+    let out = docker_bounded(&argv, MODEL_FETCH_TOTAL_TIMEOUT).await;
     match out {
         Ok(o) if o.status.success() => {
             log(format!("fetched model {path} for a peer"));
@@ -3997,7 +4063,7 @@ async fn fetch_model(
             )
             .await;
         }
-        Err(e) => report("error", format!("docker unavailable: {e}")).await,
+        Err(e) => report("error", e).await,
     }
 }
 
@@ -4213,6 +4279,17 @@ fn prefetch_container_name(session: &str) -> String {
 /// and WSL2 the volume lives inside the VM), which makes this the honest
 /// primitive rather than a convenience.
 async fn volume_exec(volume: &str, rw: bool, argv: &[&str]) -> Result<String, String> {
+    volume_exec_within(VOLUME_EXEC_TIMEOUT, volume, rw, argv).await
+}
+
+/// `volume_exec` with its own limit, for the one slow command (hashing a
+/// model file of many GB).
+async fn volume_exec_within(
+    limit: Duration,
+    volume: &str,
+    rw: bool,
+    argv: &[&str],
+) -> Result<String, String> {
     let mount = if rw {
         format!("{volume}:/models")
     } else {
@@ -4235,10 +4312,11 @@ async fn volume_exec(volume: &str, rw: bool, argv: &[&str]) -> Result<String, St
     .map(|a| a.to_string())
     .collect();
     args.extend(argv.iter().map(|a| a.to_string()));
-    match crate::proc::command("docker").args(&args).output().await {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    match docker_bounded(&args, limit).await {
         Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).trim().to_string()),
         Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
-        Err(e) => Err(format!("docker unavailable: {e}")),
+        Err(e) => Err(e),
     }
 }
 
@@ -4392,8 +4470,10 @@ async fn prefetch_models(
             // report progress, and honor a stop. Network is the default bridge —
             // this is the one helper that must reach the model host.
             let _ = remove_container(&helper).await;
-            let run = crate::proc::command("docker")
-                .args([
+            let mount = format!("{}:/models", spec.volume);
+            let target = format!("/models/{part}");
+            let run = docker_bounded(
+                &[
                     "run",
                     "-d",
                     "--name",
@@ -4407,17 +4487,18 @@ async fn prefetch_models(
                     "--pids-limit",
                     "64",
                     "-v",
-                    &format!("{}:/models", spec.volume),
+                    &mount,
                     MODEL_FETCH_IMAGE,
                     "wget",
                     "-q",
                     "-c",
                     "-O",
-                    &format!("/models/{part}"),
+                    &target,
                     &spec.url,
-                ])
-                .output()
-                .await;
+                ],
+                DOCKER_START_TIMEOUT,
+            )
+            .await;
             match run {
                 Ok(o) if o.status.success() => {}
                 Ok(o) => {
@@ -4426,7 +4507,11 @@ async fn prefetch_models(
                         String::from_utf8_lossy(&o.stderr).trim()
                     ))
                 }
-                Err(e) => return Err(format!("docker unavailable: {e}")),
+                Err(e) => {
+                    // It may have been created before the CLI gave up.
+                    let _ = remove_container(&helper).await;
+                    return Err(e);
+                }
             }
             let failure = loop {
                 tokio::time::sleep(Duration::from_secs(10)).await;
@@ -4441,15 +4526,19 @@ async fn prefetch_models(
                         MODEL_FETCH_TOTAL_TIMEOUT.as_secs() / 60
                     ));
                 }
-                let running = crate::proc::command("docker")
-                    .args([
+                // No answer within the limit counts as no answer at all,
+                // which is the branch below ("disappeared"): the same as a
+                // docker that is gone.
+                let running = docker_bounded(
+                    &[
                         "inspect",
                         "-f",
                         "{{.State.Running}} {{.State.ExitCode}}",
                         &helper,
-                    ])
-                    .output()
-                    .await;
+                    ],
+                    DOCKER_CONTROL_TIMEOUT,
+                )
+                .await;
                 let (running, exit_code) = match running {
                     Ok(o) if o.status.success() => {
                         let out = String::from_utf8_lossy(&o.stdout);
@@ -4472,18 +4561,17 @@ async fn prefetch_models(
                     if exit_code == 0 {
                         break None;
                     }
-                    let logs = crate::proc::command("docker")
-                        .args(["logs", "--tail", "3", &helper])
-                        .output()
-                        .await
-                        .map(|o| {
-                            format!(
-                                "{}{}",
-                                String::from_utf8_lossy(&o.stdout).trim(),
-                                String::from_utf8_lossy(&o.stderr).trim()
-                            )
-                        })
-                        .unwrap_or_default();
+                    let logs =
+                        docker_bounded(&["logs", "--tail", "3", &helper], DOCKER_CONTROL_TIMEOUT)
+                            .await
+                            .map(|o| {
+                                format!(
+                                    "{}{}",
+                                    String::from_utf8_lossy(&o.stdout).trim(),
+                                    String::from_utf8_lossy(&o.stderr).trim()
+                                )
+                            })
+                            .unwrap_or_default();
                     break Some(format!("download failed (exit {exit_code}): {logs}"));
                 }
                 let sofar = volume_file_size(&spec.volume, &part).await.unwrap_or(0);
@@ -4508,7 +4596,8 @@ async fn prefetch_models(
         }
         // The digest decides, not the exit code: only a file that hashes to
         // the manifest's sha256 may take the final name.
-        let digest = volume_exec(
+        let digest = volume_exec_within(
+            VOLUME_HASH_TIMEOUT,
             &spec.volume,
             false,
             &["sha256sum", &format!("/models/{part}")],
@@ -4830,10 +4919,12 @@ async fn pull_image(
     deadline: std::time::Instant,
 ) -> Result<(), String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
+    // kill_on_drop: whatever way this returns early, the CLI goes with it.
     let mut child = crate::proc::command("docker")
         .args(["pull", image])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("docker unavailable: {e}"))?;
 
@@ -4955,7 +5046,17 @@ async fn pull_image(
             .await;
         }
     }
-    let out = child.wait_with_output().await.map_err(|e| e.to_string())?;
+    // stdout is closed, so docker is finishing; a CLI that then never exits
+    // is killed (kill_on_drop) when this gives up.
+    let out = tokio::time::timeout(DOCKER_CONTROL_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| {
+            format!(
+                "docker pull did not exit within {} s after its last line",
+                DOCKER_CONTROL_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| e.to_string())?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
@@ -5586,7 +5687,9 @@ async fn start_workload(
         }
     }
 
-    let out = crate::proc::command("docker").args(&args).output().await;
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    // The image is pulled above, so `docker run -d` only creates and starts.
+    let out = docker_bounded(&argv, DOCKER_START_TIMEOUT).await;
     match out {
         Ok(o) if o.status.success() => {}
         Ok(o) => {
@@ -5596,14 +5699,11 @@ async fn start_workload(
             return;
         }
         Err(e) => {
+            // docker may have created the container before the CLI gave
+            // up: nothing of a failed start may stay on the owner's GPU.
+            let _ = remove_container(&name).await;
             hosted_remove(&session).await;
-            workload_status(
-                &sink,
-                &session,
-                "error",
-                &format!("docker unavailable: {e}"),
-            )
-            .await;
+            workload_status(&sink, &session, "error", &e).await;
             return;
         }
     }
@@ -5624,10 +5724,11 @@ async fn start_workload(
     };
 
     // The ephemeral port docker actually bound (127.0.0.1:0 above).
-    let host_port = match crate::proc::command("docker")
-        .args(["port", &port_owner, &format!("{port}/tcp")])
-        .output()
-        .await
+    let host_port = match docker_bounded(
+        &["port", &port_owner, &format!("{port}/tcp")],
+        DOCKER_CONTROL_TIMEOUT,
+    )
+    .await
     {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
             .lines()
@@ -5682,7 +5783,7 @@ async fn start_workload(
         for _ in 0..5 {
             let mut argv: Vec<&str> = vec!["exec", &name];
             argv.extend_from_slice(probe_cmd);
-            let probe = crate::proc::command("docker").args(&argv).output().await;
+            let probe = docker_bounded(&argv, CONTROL_PROBE_TIMEOUT).await;
             if matches!(&probe, Ok(o) if o.status.success()) {
                 gpu_ok = true;
                 break;
