@@ -1702,6 +1702,9 @@ async fn main() {
             println!("kmplify-node {}", kmplify_node::version_string());
             return;
         }
+        // Needs no configuration and no node directory: it reads this
+        // machine, not the node.
+        cli::Cmd::Security => std::process::exit(run_security(cli.json).await),
         _ => {}
     }
 
@@ -1802,9 +1805,35 @@ async fn main() {
         cli::Cmd::Set => unreachable!("handled above"),
         cli::Cmd::Run => serve(cfg, dir).await,
         cli::Cmd::Tui => run_tui(cfg, dir, &cli).await,
-        cli::Cmd::Status | cli::Cmd::Help | cli::Cmd::Version => unreachable!("handled above"),
+        cli::Cmd::Status | cli::Cmd::Help | cli::Cmd::Version | cli::Cmd::Security => {
+            unreachable!("handled above")
+        }
     };
     std::process::exit(code);
+}
+
+/// `kmplify-node security check`: run the baseline now and print it. Exit 0
+/// when the machine meets it, 1 when it does not.
+async fn run_security(json: bool) -> i32 {
+    use std::io::IsTerminal;
+    let report = kmplify_node::security::check().await;
+    let now = kmplify_node::identity::now_s();
+    let ok = report.baseline_ok(now);
+    if json {
+        let mut v = serde_json::to_value(&report).unwrap_or_default();
+        v["baseline_ok"] = serde_json::json!(ok);
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+    } else {
+        print!(
+            "{}",
+            kmplify_node::security::render(&report, now, std::io::stdout().is_terminal())
+        );
+    }
+    if ok {
+        0
+    } else {
+        1
+    }
 }
 
 #[cfg(feature = "tui")]

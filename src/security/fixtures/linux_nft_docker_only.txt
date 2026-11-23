@@ -1,0 +1,14 @@
+table ip filter {
+	chain DOCKER {
+		iifname != "docker0" oifname "docker0" counter packets 0 bytes 0 drop
+	}
+
+	chain FORWARD {
+		type filter hook forward priority filter; policy drop;
+		counter packets 12 bytes 900 jump DOCKER-USER
+	}
+
+	chain INPUT {
+		type filter hook input priority filter; policy accept;
+	}
+}

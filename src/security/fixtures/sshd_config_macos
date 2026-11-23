@@ -1,0 +1,16 @@
+#	$OpenBSD: sshd_config,v 1.104 2021/07/02 05:11:21 dtucker Exp $
+
+#Port 22
+#PermitRootLogin prohibit-password
+#PubkeyAuthentication yes
+
+# To disable tunneled clear text passwords, change to no here!
+#PasswordAuthentication yes
+#PermitEmptyPasswords no
+
+# Change to no to disable s/key passwords
+#KbdInteractiveAuthentication yes
+
+UsePAM yes
+
+Subsystem	sftp	/usr/libexec/sftp-server

@@ -1,0 +1,5 @@
+ID     | Command line             | Date and time    | Action(s)      | Altered
+-------------------------------------------------------------------------------
+    14 | install htop             | 2026-11-10 09:00 | Install        |    1
+    13 | upgrade -y               | 2026-11-05 07:12 | I, U           |   37 EE
+    12 | upgrade --security       | 2026-10-01 07:00 | Upgrade        |   12

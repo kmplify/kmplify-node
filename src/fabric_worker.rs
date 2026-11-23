@@ -5474,6 +5474,10 @@ static RELAYS_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 struct RelaySlot;
 
 impl RelaySlot {
+    // `fetch_update` is deprecated (renamed `try_update`) on current stable,
+    // and CI builds with -D warnings; `try_update` is newer than this crate's
+    // rust-version, so the old name stays until that floor moves.
+    #[allow(deprecated)]
     fn take() -> Option<RelaySlot> {
         use std::sync::atomic::Ordering;
         RELAYS_IN_FLIGHT
@@ -6273,6 +6277,14 @@ async fn session(
         // Provider terms for document content (protocol v5.3): version and
         // time accepted, or null. Older gateways ignore the key.
         "document_terms": crate::provider_terms::hello_block(cfg.creds_path.parent()),
+        // The signed-in operator session an embedder reported (v5.5), or
+        // null. Only a public id and its expiry, never a token.
+        "operator_session": crate::operator_session::fact(
+            creds.key().as_ref(),
+            &creds.node_id,
+            crate::identity::now_s(),
+        )
+        .unwrap_or(Value::Null),
         // General CPU/RAM lending (v2.3): threads bounded by the operator's
         // ceiling, RAM the machine's total. Absent entirely when the
         // operator has not opted in — pre-v2.3 gateways ignore the field.
@@ -6290,6 +6302,15 @@ async fn session(
             Value::Null
         },
     });
+    // Trusted node baseline (protocol v5.5): this machine's own security
+    // check, signed by the identity key. Left OUT, not null, until the first
+    // check has finished: `"security": null` withdraws the block the gateway
+    // kept, and a reconnect must not do that. The next pong carries it.
+    // Older gateways ignore the key.
+    let mut hello = hello;
+    if let Some(r) = crate::security::latest() {
+        hello["security"] = r.fact(creds.key().as_ref(), &creds.node_id);
+    }
     sink.lock()
         .await
         .send(Message::Text(hello.to_string()))
@@ -6626,6 +6647,20 @@ async fn session(
                             );
                             if !receipts.is_empty() {
                                 p["receipts"] = json!(receipts);
+                            }
+                            // v5.5: the latest baseline check and operator
+                            // session, signed, on every pong, so a gateway
+                            // that restarted or a check that finished after
+                            // the hello is current within one ping.
+                            if let Some(r) = crate::security::latest() {
+                                p["security"] = r.fact(receipt_key.as_ref(), &creds.node_id);
+                            }
+                            if let Some(s) = crate::operator_session::fact(
+                                receipt_key.as_ref(),
+                                &creds.node_id,
+                                crate::identity::now_s(),
+                            ) {
+                                p["operator_session"] = s;
                             }
                             // Live CPU/RAM, so a CPU peer is as current as a
                             // GPU one (which has had vram_used_mb all along).
@@ -7108,6 +7143,9 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
         return;
     }
     crate::hostcpu::start();
+    // The trusted node baseline: checked now and every 3 hours, sent in the
+    // hello and every pong. Idempotent, like the sampler above.
+    crate::security::start();
     // The dashboard reads the CONFIG from here too, so what it shows is what
     // this worker was actually handed rather than what the reader's own
     // environment resolves to — the two differ the moment a service unit and

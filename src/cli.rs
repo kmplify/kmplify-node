@@ -51,6 +51,9 @@ pub enum Cmd {
     /// What this node delivered, and what an optional rewards companion
     /// makes of it.
     Rewards,
+    /// `security check`: the trusted node baseline, item by item, with how
+    /// to fix what fails.
+    Security,
     Version,
     Help,
 }
@@ -221,6 +224,7 @@ pub fn usage() -> String {
          \x20 kmplify-node engines             scan localhost for inference engines\n\
          \x20 kmplify-node peers [VERB …]      who may use it; approve, block, invite\n\
          \x20 kmplify-node rewards             delivered work, and an optional payout companion\n\
+         \x20 kmplify-node security check      trusted node baseline: what passes, how to fix\n\
          \x20 kmplify-node version | help\n\
          \n\
          DASHBOARD\n\
@@ -250,7 +254,7 @@ pub fn usage() -> String {
          \x20 kmplify-node set --list\n\
          \n\
          OPTIONS\n\
-         \x20 --json                 machine-readable output (check, status, peers)\n\
+         \x20 --json                 machine-readable output (check, status, peers, security)\n\
          \x20 --timeout SECS         per-probe ceiling in check (default 5)\n\
          \x20 --attach               tui: require a running node, never start one\n\
          \x20 --standalone           tui: run the node in this process\n\
@@ -324,7 +328,7 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
                         .push((key.trim().to_string(), value.to_string()));
                     continue;
                 }
-                if cli.cmd == Cmd::Peers {
+                if cli.cmd == Cmd::Peers || cli.cmd == Cmd::Security {
                     cli.args.push(arg);
                     continue;
                 }
@@ -342,6 +346,7 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
                 "init" | "onboard" | "setup" => Cmd::Init,
                 "engines" | "engine" => Cmd::Engines,
                 "rewards" | "earnings" => Cmd::Rewards,
+                "security" | "baseline" => Cmd::Security,
                 "version" => Cmd::Version,
                 "help" => Cmd::Help,
                 other => return Err(format!("unknown command `{other}`")),
@@ -415,10 +420,12 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
     if cli.json
         && !matches!(
             cli.cmd,
-            Cmd::Check | Cmd::Status | Cmd::Peers | Cmd::Engines
+            Cmd::Check | Cmd::Status | Cmd::Peers | Cmd::Engines | Cmd::Security
         )
     {
-        return Err("--json applies to `check`, `status`, `peers` and `engines`".into());
+        return Err(
+            "--json applies to `check`, `status`, `peers`, `engines` and `security`".into(),
+        );
     }
     if (cli.attach || cli.standalone) && cli.cmd != Cmd::Tui {
         return Err("--attach and --standalone apply to `tui`".into());
@@ -434,6 +441,16 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
     }
     if cli.list && touches_settings {
         return Err("--list only reports; drop it to change a setting".into());
+    }
+    if cli.cmd == Cmd::Security {
+        match cli.args.as_slice() {
+            [] => {}
+            [one] if one == "check" => {}
+            [other, ..] => {
+                return Err(format!("`security` knows one verb, `check`; not `{other}`"))
+            }
+        }
+        cli.args.clear();
     }
     if !cli.args.is_empty() && cli.cmd != Cmd::Peers {
         return Err(format!("unexpected argument `{}`", cli.args[0]));
@@ -523,6 +540,22 @@ mod tests {
 
     fn args(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn security_check_parses_and_refuses_other_verbs() {
+        for argv in [
+            &["security"][..],
+            &["security", "check"],
+            &["baseline", "check", "--json"],
+        ] {
+            let c = parse(&args(argv)).unwrap();
+            assert_eq!(c.cmd, Cmd::Security, "{argv:?}");
+            assert!(c.args.is_empty());
+        }
+        assert!(parse(&args(&["security", "check", "--json"])).unwrap().json);
+        assert!(parse(&args(&["security", "fix"])).is_err());
+        assert!(parse(&args(&["security", "check", "extra"])).is_err());
     }
 
     #[test]

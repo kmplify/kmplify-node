@@ -1,0 +1,4 @@
+ID Command line           Date and time       Action(s) Altered
+ 9 dnf5 install htop      2026-11-10 09:00:12                  1
+ 8 dnf5 upgrade -y        2026-11-06 08:01:44                 41
+ 7 dnf5 upgrade --refresh 2026-10-02 08:00:00                 12
