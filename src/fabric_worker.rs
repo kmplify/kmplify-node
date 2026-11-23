@@ -795,6 +795,27 @@ impl Credentials {
     }
 }
 
+/// What a node with no language models says at connect, in plain words.
+pub fn no_models_line(cfg: &WorkerConfig) -> String {
+    let other = !cfg.workload_templates.is_empty()
+        || cfg.share_cpu
+        || cfg.functions.enabled
+        || cfg.vectors.enabled;
+    if other {
+        format!(
+            "info: no language models shared for chat (none found at {}); serverless apps \
+             and the other lanes are still offered",
+            cfg.ollama_base
+        )
+    } else {
+        format!(
+            "info: no language models shared for chat (none found at {}); this node is \
+             connected but has nothing to serve until the engine lists a model",
+            cfg.ollama_base
+        )
+    }
+}
+
 fn log(msg: impl std::fmt::Display) {
     let msg = msg.to_string();
     #[cfg(test)]
@@ -835,7 +856,10 @@ fn document_job_refusal(frame: &Value, terms_dir: Option<&Path>) -> Option<Value
     }
     let code = crate::provider_terms::refusal_for(terms_dir)?;
     let job_id = frame["id"].as_str().unwrap_or_default();
-    log(format!("job {} refused: document content needs {code}", &job_id[..job_id.len().min(8)]));
+    log(format!(
+        "job {} refused: document content needs {code}",
+        &job_id[..job_id.len().min(8)]
+    ));
     Some(json!({"type": "error", "id": job_id, "code": code, "message": code}))
 }
 
@@ -2772,7 +2796,12 @@ async fn containers_usage(names: &[String]) -> std::collections::HashMap<String,
         return out;
     }
     let run = crate::proc::command("docker")
-        .args(["stats", "--no-stream", "--format", "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"])
+        .args([
+            "stats",
+            "--no-stream",
+            "--format",
+            "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}",
+        ])
         .args(names)
         .output();
     // `docker stats` waits for one sample per container; a wedged daemon
@@ -2793,7 +2822,12 @@ async fn containers_usage(names: &[String]) -> std::collections::HashMap<String,
 fn parse_stats_line(line: &str) -> Option<(String, f64, f64)> {
     let mut parts = line.split('\t');
     let name = parts.next()?.trim();
-    let cpu = parts.next()?.trim().trim_end_matches('%').parse::<f64>().ok()?;
+    let cpu = parts
+        .next()?
+        .trim()
+        .trim_end_matches('%')
+        .parse::<f64>()
+        .ok()?;
     let used = parts.next()?.split('/').next()?.trim();
     let mem = parse_mem_mb(used)?;
     if name.is_empty() || !cpu.is_finite() || cpu < 0.0 {
@@ -2981,7 +3015,11 @@ async fn docker_bounded(args: &[&str], limit: Duration) -> Result<std::process::
     bounded_output("docker", args, limit).await
 }
 
-async fn bounded_output(program: &str, args: &[&str], limit: Duration) -> Result<std::process::Output, String> {
+async fn bounded_output(
+    program: &str,
+    args: &[&str],
+    limit: Duration,
+) -> Result<std::process::Output, String> {
     let mut cmd = crate::proc::command(program);
     cmd.args(args).kill_on_drop(true);
     match tokio::time::timeout(limit, cmd.output()).await {
@@ -3004,17 +3042,27 @@ mod bounded_tests {
     #[tokio::test]
     async fn a_command_that_hangs_is_given_up_at_the_limit() {
         let started = std::time::Instant::now();
-        let err = bounded_output("sleep", &["30"], Duration::from_millis(300)).await.unwrap_err();
-        assert!(started.elapsed() < Duration::from_secs(5), "returned only after {:?}", started.elapsed());
+        let err = bounded_output("sleep", &["30"], Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "returned only after {:?}",
+            started.elapsed()
+        );
         assert!(err.contains("did not answer `sleep 30`"), "{err}");
     }
 
     #[tokio::test]
     async fn a_command_that_answers_in_time_is_passed_through() {
-        let out = bounded_output("echo", &["ok"], Duration::from_secs(5)).await.unwrap();
+        let out = bounded_output("echo", &["ok"], Duration::from_secs(5))
+            .await
+            .unwrap();
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
-        let err = bounded_output("kmplify-no-such-program", &[], Duration::from_secs(5)).await.unwrap_err();
+        let err = bounded_output("kmplify-no-such-program", &[], Duration::from_secs(5))
+            .await
+            .unwrap_err();
         assert!(err.contains("unavailable"), "{err}");
     }
 }
@@ -3023,7 +3071,11 @@ async fn sample_inventory() -> (Option<u64>, Vec<String>, Option<String>) {
     // A daemon that does not answer the 5-second liveness probe is not asked
     // two slower questions: say so and move on.
     if !docker_ok().await {
-        return (None, Vec::new(), Some("docker is not running or does not answer".to_string()));
+        return (
+            None,
+            Vec::new(),
+            Some("docker is not running or does not answer".to_string()),
+        );
     }
     let (disk, disk_err) = match measure_fabric_disk().await {
         Ok(mb) => (Some(mb), None),
@@ -3044,7 +3096,11 @@ async fn sample_inventory() -> (Option<u64>, Vec<String>, Option<String>) {
 /// the provider the bandwidth and the disk. `docker images` is a metadata
 /// read — no container spawn, no filesystem walk.
 async fn cached_images() -> Result<Vec<String>, String> {
-    let out = docker_bounded(&["images", "--format", "{{.Repository}}:{{.Tag}}"], DOCKER_INVENTORY_TIMEOUT).await?;
+    let out = docker_bounded(
+        &["images", "--format", "{{.Repository}}:{{.Tag}}"],
+        DOCKER_INVENTORY_TIMEOUT,
+    )
+    .await?;
     if !out.status.success() {
         return Err(format!(
             "docker images failed: {}",
@@ -3097,7 +3153,10 @@ async fn drop_one_volume(name: &str) -> VolumeDrop {
     if !is_consumer_state_volume(name) {
         return VolumeDrop::Failed("refused: not a consumer state volume".into());
     }
-    let exists = crate::proc::command("docker").args(["volume", "inspect", name]).output().await;
+    let exists = crate::proc::command("docker")
+        .args(["volume", "inspect", name])
+        .output()
+        .await;
     match exists {
         Err(e) => return VolumeDrop::Failed(format!("docker unavailable: {e}")),
         Ok(o) if !o.status.success() => return VolumeDrop::Absent,
@@ -3114,11 +3173,23 @@ async fn drop_one_volume(name: &str) -> VolumeDrop {
             return VolumeDrop::InUse;
         }
     }
-    match crate::proc::command("docker").args(["volume", "rm", name]).output().await {
+    match crate::proc::command("docker")
+        .args(["volume", "rm", name])
+        .output()
+        .await
+    {
         Ok(o) if o.status.success() => VolumeDrop::Removed,
         Ok(o) => {
-            let err = String::from_utf8_lossy(&o.stderr).trim().chars().take(160).collect::<String>();
-            if err.contains("in use") { VolumeDrop::InUse } else { VolumeDrop::Failed(err) }
+            let err = String::from_utf8_lossy(&o.stderr)
+                .trim()
+                .chars()
+                .take(160)
+                .collect::<String>();
+            if err.contains("in use") {
+                VolumeDrop::InUse
+            } else {
+                VolumeDrop::Failed(err)
+            }
         }
         Err(e) => VolumeDrop::Failed(format!("docker unavailable: {e}")),
     }
@@ -3131,9 +3202,15 @@ async fn drop_volumes(sink: Arc<Mutex<WsSink>>, frame: Value) {
     let request = frame["request"].as_str().unwrap_or_default().to_string();
     let names: Vec<String> = frame["volumes"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).take(64).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .take(64)
+                .collect()
+        })
         .unwrap_or_default();
-    let (mut removed, mut absent, mut in_use, mut failed) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut removed, mut absent, mut in_use, mut failed) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for name in names {
         match drop_one_volume(&name).await {
             VolumeDrop::Removed => {
@@ -3196,7 +3273,11 @@ async fn measure_fabric_disk() -> Result<u64, String> {
 
 /// The cheap path: Docker's own per-volume sizes, no filesystem walk of ours.
 async fn measure_fabric_disk_via_df() -> Result<u64, String> {
-    let out = docker_bounded(&["system", "df", "-v", "--format", "{{json .Volumes}}"], DOCKER_INVENTORY_TIMEOUT).await?;
+    let out = docker_bounded(
+        &["system", "df", "-v", "--format", "{{json .Volumes}}"],
+        DOCKER_INVENTORY_TIMEOUT,
+    )
+    .await?;
     if !out.status.success() {
         return Err(format!(
             "docker system df failed: {}",
@@ -6093,7 +6174,10 @@ async fn session(
         (Vec::new(), std::collections::HashMap::new(), false)
     };
     if models.is_empty() && serving(cfg) {
-        log("no local models — connecting anyway; jobs will be refused by scheduler");
+        // Informational, not an error: the owner of a Windows PC read the
+        // old wording ("jobs will be refused by scheduler") as the reason
+        // the node did not work, while it was serving serverless apps.
+        log(no_models_line(cfg));
     }
     // The context window each model is SERVED with, where the engine says
     // (vLLM's max_model_len), so the fabric and its consumers can budget
@@ -7608,8 +7692,12 @@ mod volume_rule_tests {
     #[test]
     fn only_fabric_named_volumes_onto_absolute_paths() {
         // v5.2: only a consumer's own state volume may be removed on request.
-        assert!(is_consumer_state_volume("kmplify-fabric-floci-3cc54e4a581e2664"));
-        assert!(is_consumer_state_volume("kmplify-fabric-floci-azure-0123456789abcdef"));
+        assert!(is_consumer_state_volume(
+            "kmplify-fabric-floci-3cc54e4a581e2664"
+        ));
+        assert!(is_consumer_state_volume(
+            "kmplify-fabric-floci-azure-0123456789abcdef"
+        ));
         for shared in [
             "kmplify-fabric-comfyui-models",
             "kmplify-fabric-comfyui-cu126",
@@ -9534,7 +9622,8 @@ mod usage_sample_tests {
 
     #[test]
     fn a_stats_line_becomes_cpu_percent_and_megabytes() {
-        let (name, cpu, mem) = parse_stats_line("kmplify-s-ab12\t42.50%\t310.2MiB / 7.654GiB").unwrap();
+        let (name, cpu, mem) =
+            parse_stats_line("kmplify-s-ab12\t42.50%\t310.2MiB / 7.654GiB").unwrap();
         assert_eq!(name, "kmplify-s-ab12");
         assert_eq!(cpu, 42.5);
         assert!((mem - 310.2).abs() < 1e-9);
@@ -9556,7 +9645,14 @@ mod usage_sample_tests {
 
     #[test]
     fn broken_lines_are_dropped() {
-        for line in ["", "name only", "x\t--\t-- / --", "x\tfast%\t1MiB / 2MiB", "\t1%\t1MiB / 2MiB", "x\t-3%\t1MiB / 2MiB"] {
+        for line in [
+            "",
+            "name only",
+            "x\t--\t-- / --",
+            "x\tfast%\t1MiB / 2MiB",
+            "\t1%\t1MiB / 2MiB",
+            "x\t-3%\t1MiB / 2MiB",
+        ] {
             assert!(parse_stats_line(line).is_none(), "{line:?}");
         }
     }
@@ -9568,15 +9664,23 @@ mod builtin_model_tests {
 
     #[test]
     fn comfyui_without_a_gateway_manifest_gets_its_default_workflow_models() {
-        let mounts: std::collections::HashSet<String> = ["kmplify-fabric-comfyui-cu126", COMFYUI_MODELS_VOLUME]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let mounts: std::collections::HashSet<String> =
+            ["kmplify-fabric-comfyui-cu126", COMFYUI_MODELS_VOLUME]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
         let specs = parse_models(&session_manifest(&json!({}), "comfyui"), &mounts).unwrap();
         assert_eq!(specs.len(), 3);
-        assert!(specs.iter().any(|s| s.path == "diffusion_models/z_image_turbo_bf16.safetensors"));
+        assert!(specs
+            .iter()
+            .any(|s| s.path == "diffusion_models/z_image_turbo_bf16.safetensors"));
         // The frame's own manifest wins, and other templates get nothing.
-        assert!(parse_models(&session_manifest(&json!({"models": []}), "comfyui"), &mounts).unwrap().is_empty());
+        assert!(parse_models(
+            &session_manifest(&json!({"models": []}), "comfyui"),
+            &mounts
+        )
+        .unwrap()
+        .is_empty());
         assert!(session_manifest(&json!({}), "ollama").is_null());
     }
 }
@@ -9609,7 +9713,11 @@ mod document_terms_tests {
                         if let Some(h) = text.find("\r\n\r\n") {
                             let len = text[..h]
                                 .lines()
-                                .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
                                 .unwrap_or(0);
                             if got.len() >= h + 4 + len {
                                 break;
@@ -9652,7 +9760,13 @@ mod document_terms_tests {
             envelope: None,
             primary_openai_only: false,
         };
-        run_job(Arc::new(Mutex::new(sink)), reqwest::Client::new(), upstreams, frame).await;
+        run_job(
+            Arc::new(Mutex::new(sink)),
+            reqwest::Client::new(),
+            upstreams,
+            frame,
+        )
+        .await;
         far.await.unwrap()
     }
 
@@ -9665,18 +9779,40 @@ mod document_terms_tests {
         ]}]);
         let ok = json!({"id": "c", "object": "chat.completion", "model": "vl",
             "choices": [{"index": 0, "message": {"role": "assistant", "content": format!("Antwort {MARK}")}, "finish_reason": "stop"}]}).to_string();
-        let sse = format!("data: {}\n\ndata: [DONE]\n\n", json!({"choices": [{"index": 0, "delta": {"content": MARK}}]}));
+        let sse = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices": [{"index": 0, "delta": {"content": MARK}}]})
+        );
         let cases = vec![
             (fake_engine("200 OK", "application/json", ok).await, false),
             (fake_engine("200 OK", "text/event-stream", sse).await, true),
-            (fake_engine("400 Bad Request", "text/plain", format!("bad prompt: {MARK}")).await, false),
-            (fake_engine("500 Internal Server Error", "text/plain", format!("crash near {MARK}")).await, true),
+            (
+                fake_engine(
+                    "400 Bad Request",
+                    "text/plain",
+                    format!("bad prompt: {MARK}"),
+                )
+                .await,
+                false,
+            ),
+            (
+                fake_engine(
+                    "500 Internal Server Error",
+                    "text/plain",
+                    format!("crash near {MARK}"),
+                )
+                .await,
+                true,
+            ),
             ("http://127.0.0.1:9".to_string(), false),
         ];
         for (i, (base, stream)) in cases.into_iter().enumerate() {
             let frame = json!({"type": "job", "id": format!("nostore{i}"), "kind": "chat", "content": "document",
                 "payload": {"model": "vl", "messages": messages, "stream": stream}});
-            assert!(!run(&base, frame).await.is_empty(), "the consumer always gets an answer");
+            assert!(
+                !run(&base, frame).await.is_empty(),
+                "the consumer always gets an answer"
+            );
         }
         let refused = document_job_refusal(
             &json!({"type": "job", "id": "gate", "content": "document", "payload": {"messages": messages}}),
@@ -9685,35 +9821,65 @@ mod document_terms_tests {
         .expect("no terms without a folder");
         assert!(!refused.to_string().contains(MARK));
         let lines = super::log_capture::all();
-        assert!(lines.iter().any(|l| l.contains("refused")), "the capture sees worker lines");
+        assert!(
+            lines.iter().any(|l| l.contains("refused")),
+            "the capture sees worker lines"
+        );
         for l in &lines {
-            assert!(!l.contains(MARK), "a log line holds request or reply content: {l}");
+            assert!(
+                !l.contains(MARK),
+                "a log line holds request or reply content: {l}"
+            );
         }
         for l in crate::status::logs() {
-            assert!(!l.contains(MARK), "the status ring holds request or reply content: {l}");
+            assert!(
+                !l.contains(MARK),
+                "the status ring holds request or reply content: {l}"
+            );
         }
     }
 
     #[test]
     fn document_jobs_need_the_current_terms() {
-        let dir = std::env::temp_dir().join(format!("kmplify-node-docgate-{}-{}", std::process::id(), now_s_test()));
+        let dir = std::env::temp_dir().join(format!(
+            "kmplify-node-docgate-{}-{}",
+            std::process::id(),
+            now_s_test()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let doc = json!({"type": "job", "id": "d1", "kind": "chat", "content": "document", "payload": {"model": "m"}});
         let chat = json!({"type": "job", "id": "c1", "kind": "chat", "payload": {"model": "m"}});
-        assert_eq!(document_job_refusal(&chat, None), None, "ordinary jobs are not affected");
+        assert_eq!(
+            document_job_refusal(&chat, None),
+            None,
+            "ordinary jobs are not affected"
+        );
         let r = document_job_refusal(&doc, Some(&dir)).expect("no acceptance on file");
         assert_eq!(r["code"], "peer_document_terms_missing");
-        std::fs::write(crate::provider_terms::path(&dir), r#"{"version":"2025-01","accepted_at":1}"#).unwrap();
-        assert!(document_job_refusal(&doc, Some(&dir)).is_some(), "an older version is not enough");
+        std::fs::write(
+            crate::provider_terms::path(&dir),
+            r#"{"version":"2025-01","accepted_at":1}"#,
+        )
+        .unwrap();
+        assert!(
+            document_job_refusal(&doc, Some(&dir)).is_some(),
+            "an older version is not enough"
+        );
         crate::provider_terms::accept(&dir, crate::provider_terms::CURRENT_VERSION).unwrap();
         if crate::provider_terms::engine_logs_prompts() {
-            assert_eq!(document_job_refusal(&doc, Some(&dir)).unwrap()["code"], "peer_document_engine_logging");
+            assert_eq!(
+                document_job_refusal(&doc, Some(&dir)).unwrap()["code"],
+                "peer_document_engine_logging"
+            );
         } else {
             assert_eq!(document_job_refusal(&doc, Some(&dir)), None);
         }
     }
 
     fn now_s_test() -> u128 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     }
 }

@@ -123,6 +123,7 @@ struct Found {
     ssh: Option<(bool, bool)>,
     hints: Vec<String>,
     details: Vec<(Item, String)>,
+    elevated: Option<bool>,
 }
 
 pub(super) async fn collect(now: u64) -> Report {
@@ -146,6 +147,7 @@ pub(super) async fn collect(now: u64) -> Report {
         checker_version: CHECKER_VERSION.to_string(),
         hints: f.hints,
         details: f.details,
+        elevated: f.elevated,
     }
 }
 
@@ -334,12 +336,9 @@ async fn collect_os() -> Found {
             format!("Not protected by BitLocker: {}", plain.join(", ")),
         ));
     }
-    if disk.is_none() && !w.is_admin {
-        f.hints.push(
-            "BitLocker status needs administrator rights for some drives: run the node as \
-             administrator, or run `kmplify-node security check` as administrator to see it."
-                .into(),
-        );
+    f.elevated = Some(w.is_admin || w.is_system);
+    if disk.is_none() && !w.is_admin && !w.is_system {
+        f.hints.push(super::WINDOWS_BITLOCKER_NOT_ELEVATED.into());
     } else if disk.is_none() {
         f.hints
             .push("BitLocker status could not be read for every fixed drive.".into());
