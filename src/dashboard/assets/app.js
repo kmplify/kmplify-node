@@ -603,7 +603,7 @@ function routerTab(s) {
           el("button", { class: "btn ghost", onclick: () => {
             if (window.confirm("Make a new cluster key? Every other node must join again with it.")) act("/api/router/new-key");
           } }, "New cluster key")))),
-    el("p", { class: "muted small", text: "Off until you choose. This computer only binds 127.0.0.1. On the network answers only the addresses on the allowlist (private, link-local or VPN ranges), and only requests signed with the cluster key; the key never crosses the network and is never shown here, only its fingerprint. Show it with kmplify-node router key on this computer." }));
+    el("p", { class: "muted small", text: "Off until you choose. This computer only binds 127.0.0.1. On the network answers only the addresses on the allowlist (private, link-local or VPN ranges), and only requests signed with the cluster key; the key is never shown here, only its fingerprint, and crosses the network only sealed, during PIN pairing (Pair a device here, Join with PIN on the other device). Between v2 nodes the reports travel in mutual TLS." }));
 
   const cards = [];
   if (r.local) cards.push(nodeCard(r.local.name + " (this node)", "online", "ok", r.local, r.local_meters, ""));
@@ -616,10 +616,48 @@ function routerTab(s) {
       ? "No other node announced itself yet. Nodes appear here when they run the router in LAN mode with this cluster key and an allowlist that includes this machine."
       : r.mode === "local" ? "This computer only: other nodes are not looked for. On the network finds them." : "The router is off. Turned on, it shows the kmplify-nodes on your network side by side, with their hardware and live load." }));
 
+  // Pairing: this side shows a PIN, the other side enters it. The cluster
+  // key itself is never shown or typed (owner decision "Show key: no").
+  const pg = r.pairing;
+  const pairAt = el("input", Object.assign({ type: "text", inputmode: "decimal", autocomplete: "off", spellcheck: "false", placeholder: "192.168.1.20:" + (r.pair_port || 14419), "aria-label": "Address of the device showing the PIN" }, keep));
+  const pairPin = el("input", Object.assign({ type: "text", inputmode: "numeric", autocomplete: "one-time-code", maxlength: "7", spellcheck: "false", placeholder: "123456", "aria-label": "PIN" }, keep));
+  const pairKids = [];
+  if (pg && pg.state === "waiting") {
+    pairKids.push(
+      el("p", { class: "lead" }, el("span", { class: "chip ok", text: "Pairing open" }), " ", Math.floor(pg.seconds_left / 60) + ":" + String(pg.seconds_left % 60).padStart(2, "0") + " left"),
+      el("div", { class: "pin", "aria-label": "PIN", text: pg.pin.slice(0, 3) + " " + pg.pin.slice(3) }),
+      kv([
+        ["Address", (pg.addresses || []).join(", ")],
+        ["Reachable from", pg.scope],
+        ["Wrong PINs left", String(pg.attempts_left)],
+        ["Fingerprint", pg.fingerprint + " (the other device must show the same)"],
+      ]),
+      el("div", { class: "ctl" }, el("button", { class: "btn ghost", onclick: () => act("/api/router/pair/close") }, "Close pairing")));
+  } else {
+    if (pg && pg.state !== "none") {
+      pairKids.push(el("p", { class: "small " + (pg.state === "paired" ? "" : "warn-text"), role: "status",
+        text: pg.state === "paired" ? "Paired: " + pg.joined + " joined the cluster " + pg.fingerprint + "." : "Pairing " + pg.state_label + "." }));
+    }
+    pairKids.push(el("div", { class: "ctl" }, el("button", { class: "btn", onclick: () => act("/api/router/pair") }, "Pair a device")));
+  }
+  pairKids.push(
+    el("div", { class: "rrow" }, el("strong", { text: "Join with PIN" }),
+      el("div", { class: "ctl" }, pairAt, pairPin,
+        el("button", { class: "btn", onclick: () => {
+          const at = pairAt.value.trim();
+          const pin = pairPin.value.trim();
+          pairPin.value = "";
+          editing = false;
+          if (!at || !pin) { toast("Enter the address and the PIN the other device shows."); return; }
+          act("/api/router/join-pin", { at, pin });
+        } }, "Join with PIN"))),
+    el("p", { class: "muted small", text: "Pair a device shows a six-digit PIN for two minutes; enter it on the other device with Join with PIN. The two devices agree on a key from the PIN (SPAKE2) and the cluster key crosses encrypted; three wrong PINs void it. Without LAN mode and an allowlist only a device on this computer can join." }));
+  const pairing = cardI("key", "Pairing", ...pairKids);
+
   const pre = el("pre", { class: "log", "aria-label": "Router log" });
   pre.textContent = r.log.slice().reverse().slice(0, 20).join("\n") || "Nothing yet.";
   const log = cardI("logs", "Router log", pre);
-  return el("div", { class: "grid wide" }, me, nodes, log);
+  return el("div", { class: "grid wide" }, me, pairing, nodes, log);
 }
 
 // ----------------------------------------------------------------- frame

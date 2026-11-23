@@ -2557,7 +2557,7 @@ fn run_window(dir: &std::path::Path, cfg: &WorkerConfig) -> i32 {
     }
 }
 
-/// `kmplify-node router [key | join | new-key]`.
+/// `kmplify-node router [key | join | new-key | pair]`.
 async fn run_router(dir: &std::path::Path, cli: &cli::Cli) -> i32 {
     #[cfg(feature = "router")]
     {
@@ -2624,8 +2624,8 @@ async fn run_router(dir: &std::path::Path, cli: &cli::Cli) -> i32 {
                 }
                 println!(
                     "\nTurn it on: kmplify-node set router=local (this computer) or router=lan \
-                     router-allow=192.168.1.0/24 (the network; join the other nodes with \
-                     kmplify-node router join)."
+                     router-allow=192.168.1.0/24 (the network). Add another device with \
+                     kmplify-node router pair here and Join with PIN there."
                 );
                 EXIT_OK
             }
@@ -2649,6 +2649,100 @@ async fn run_router(dir: &std::path::Path, cli: &cli::Cli) -> i32 {
                 );
                 println!("{}", key.reveal());
                 EXIT_OK
+            }
+            Some("pair") => {
+                use router::pairing::{self, PairState};
+                let keys = router::FileKeyStore::new(dir);
+                let mut host = match pairing::Host::open(dir, &keys, cli.lan, pairing::pair_port())
+                {
+                    Ok(h) => h,
+                    Err(e) => {
+                        eprintln!("cannot open pairing: {e}");
+                        return EXIT_UNUSABLE;
+                    }
+                };
+                let v = host.view();
+                println!("Pair a device: on the other device choose Join with PIN, or run");
+                println!(
+                    "  kmplify-node router join --pin --at {}",
+                    v.addresses.first().cloned().unwrap_or_default()
+                );
+                println!();
+                println!("  PIN          {} {}", &v.pin[..3], &v.pin[3..]);
+                println!("  address      {}", v.addresses.join(", "));
+                println!("  reachable on {}", v.scope);
+                println!(
+                    "  fingerprint  {} (the other device must show the same)",
+                    v.fingerprint
+                );
+                println!();
+                println!("Valid for two minutes and three wrong PINs. Ctrl-C closes it.");
+                let last = loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                        _ = tokio::signal::ctrl_c() => {
+                            host.close();
+                            break PairState::Closed;
+                        }
+                    }
+                    let v = host.view();
+                    if v.state != PairState::Waiting {
+                        break v.state;
+                    }
+                };
+                let v = host.view();
+                match last {
+                    PairState::Paired => {
+                        println!("paired: {} joined the cluster {}.", v.joined, v.fingerprint);
+                        EXIT_OK
+                    }
+                    other => {
+                        println!("pairing {}.", other.label());
+                        EXIT_UNUSABLE
+                    }
+                }
+            }
+            Some("join") if cli.pin.is_some() => {
+                use std::io::BufRead;
+                let keys = router::FileKeyStore::new(dir);
+                let at = match &cli.at {
+                    Some(a) => a.clone(),
+                    None => {
+                        eprintln!(
+                            "where is the device showing the PIN? add --at ADDRESS[:PORT], as it \
+                             shows it"
+                        );
+                        return EXIT_USAGE;
+                    }
+                };
+                let mut pin = cli.pin.clone().unwrap_or_default();
+                if pin.is_empty() {
+                    eprintln!("Enter the six-digit PIN the other device shows, then Enter:");
+                    if std::io::stdin().lock().read_line(&mut pin).is_err() {
+                        eprintln!("nothing read");
+                        return EXIT_USAGE;
+                    }
+                }
+                let dir = dir.to_path_buf();
+                let joined = tokio::task::spawn_blocking(move || {
+                    router::pairing::join_blocking(&dir, &keys, &at, &pin)
+                })
+                .await;
+                match joined {
+                    Ok(Ok(j)) => {
+                        println!(
+                            "joined {}'s cluster: fingerprint {}. Check that the other device \
+                             shows the same. A running router picks the key up within a second.",
+                            j.inviter_name, j.fingerprint
+                        );
+                        EXIT_OK
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("not joined: {e}");
+                        EXIT_UNUSABLE
+                    }
+                    Err(_) => EXIT_UNUSABLE,
+                }
             }
             Some("join") => {
                 use std::io::BufRead;

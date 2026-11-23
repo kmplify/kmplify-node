@@ -17,10 +17,11 @@
 //! `kmplify-node router join` reads it on the others from standard input,
 //! so it never lands in a shell history.
 //!
-//! Requests travel in plain HTTP: what they carry is hardware facts and
-//! meters, authenticated but readable on the wire. Inference between
-//! machines (the routing proxies of the next phase) is not sent this way;
-//! it waits for the mutual TLS of the pairing phase. See docs/ROUTER.md.
+//! In protocol v1 requests travel in plain HTTP: hardware facts and meters,
+//! authenticated but readable on the wire. From v2 the same signed request
+//! and answer travel inside mutual TLS between members ([`super::tls`]); v1
+//! is still served for older nodes and apps on this computer. See
+//! docs/ROUTER.md.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

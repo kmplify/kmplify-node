@@ -113,6 +113,17 @@ mod snapshot {
             args.get(4).and_then(|h| h.parse().ok()).unwrap_or(780.0),
         ];
         std::fs::create_dir_all(out).expect("create OUT_DIR");
+        // KN_SNAPSHOT_PAIR=1: open a pairing invitation in this process
+        // first, so the LAN router section shows a PIN (on loopback unless
+        // the node directory has LAN mode and an allowlist).
+        if std::env::var_os("KN_SNAPSHOT_PAIR").is_some() {
+            let o = kmplify_node::views::perform(
+                kmplify_node::views::Target::Attached,
+                std::path::Path::new(dir),
+                &kmplify_node::views::Act::RouterPair,
+            );
+            eprintln!("pairing: {}", o.message);
+        }
         let snap = Snap {
             app: App::new(PathBuf::from(dir), String::new()),
             ids: section_ids(),

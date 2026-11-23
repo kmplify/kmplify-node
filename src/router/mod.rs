@@ -18,9 +18,12 @@
 //! * `lan`: on the network, but only for an allowlist of local addresses,
 //!   only with the cluster key ([`auth`]), and only then announced by mDNS.
 //!
-//! The routing proxies, PIN pairing with mutual TLS and remote engine
-//! control from the branch are the next phases; docs/ROUTER.md and the port
-//! plan list them.
+//! Phase 2 (protocol v2) adds PIN pairing ([`pairing`]: a device joins
+//! without the key being shown or typed) and mutual TLS between members
+//! ([`tls`]: certificates bound to the cluster key), with v1 still served.
+//! The routing proxies, per-GPU telemetry and remote engine control from
+//! the branch are the next phases; docs/ROUTER.md and the port plan list
+//! them.
 //!
 //! What a router publishes for other processes on this machine (the app
 //! window) is `router.json` in the node directory, owner-only, beside
@@ -36,7 +39,11 @@ mod discovery;
 #[cfg(feature = "router")]
 pub mod endpoint;
 #[cfg(feature = "router")]
+pub mod pairing;
+#[cfg(feature = "router")]
 mod peers;
+#[cfg(feature = "router")]
+pub mod tls;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -213,6 +220,11 @@ pub struct Peer {
     pub port: u16,
     /// The cluster key fingerprint it announced.
     pub key_fingerprint: String,
+    /// The router protocol it announced: 1 = signed plain HTTP, 2 = mutual
+    /// TLS with certificates bound to the cluster key.
+    pub proto: u32,
+    /// Its last report came over mutual TLS.
+    pub secure: bool,
     pub state: PeerState,
     pub detail: String,
     pub report: Option<NodeReport>,
@@ -242,6 +254,8 @@ pub struct RouterState {
     /// The address the node-info surface listens on, or "".
     pub listening: String,
     pub key_fingerprint: String,
+    /// SHA-256 of this router's certificate for this start (protocol v2).
+    pub cert_fingerprint: String,
     pub allow: Vec<String>,
     pub name: String,
     /// What discovery is doing, in words.
@@ -458,7 +472,7 @@ mod running {
         keys: Arc<dyn KeyStore>,
     ) {
         let shared: Shared = Arc::new(Mutex::new(RouterState {
-            schema: 1,
+            schema: 2,
             ..Default::default()
         }));
         let mut active: Option<Active> = None;
@@ -553,11 +567,26 @@ mod running {
             let m = config.mode;
             r.push_log(format!("router {}", m.as_str()));
         }
+        let identity = match (&key, config.mode != Mode::Off) {
+            (Some(k), true) => match tls::BoundIdentity::mint(k) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    lock(shared).push_log(format!("no TLS certificate ({e}); v1 only"));
+                    None
+                }
+            },
+            _ => None,
+        };
+        lock(shared).cert_fingerprint = identity
+            .as_ref()
+            .map(|i| i.fingerprint.clone())
+            .unwrap_or_default();
         if let (Some(key), true) = (key, config.mode != Mode::Off) {
             tasks.push(tokio::spawn(endpoint::serve(
                 shared.clone(),
                 config.clone(),
                 key.clone(),
+                identity.clone(),
             )));
             if config.mode == Mode::Lan {
                 match discovery::Discovery::start(shared.clone(), &config, &key) {
@@ -572,6 +601,7 @@ mod running {
                     shared.clone(),
                     config.clone(),
                     key,
+                    identity,
                 )));
             }
         }
