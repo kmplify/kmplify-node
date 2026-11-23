@@ -191,6 +191,12 @@ It has no account. A node registers anonymously and gets an opaque id and
 token; there is no email, no PII, and nothing tying the machine to a person
 unless you separately link it for payouts.
 
+It holds no balance. Where the fabric has KMPLIFY Credits switched on, a node
+that hosts rented GPU sessions earns credits for the account it is linked to,
+and shows what the gateway reports about them. Credits are a prepaid balance
+for KMPLIFY services, not a currency, and there is no cash payout. See
+[docs/CREDITS.md](docs/CREDITS.md).
+
 It holds no wallet. No key material, no address, no chain client, no token —
 being paid is an optional companion program that reads what this node
 publishes and settles against the fabric's own signed receipts. See
@@ -422,6 +428,20 @@ alert` is a monitor. `--json` adds every field the dashboard draws — link
 state, per-core load, VRAM, ceilings, hosted sessions, the log tail — which is
 the machine-readable half of the monitoring story below.
 
+Where the fabric has KMPLIFY Credits switched on, three more lines follow:
+what this node earned this month and in total, the rate of its GPU class with
+the platform fee, and whether the node is linked to a KMPLIFY account. With
+the credit system off they are absent and the output is as above.
+
+```
+  credits  : 1240 earned this month · 5678 in total
+  rate     : class M (24 GB) · … credits per minute · platform fee … % · about … per minute to this node
+  account  : linked
+```
+
+The rate and the fee are the gateway's, read at that moment. On a node that is
+not linked the last line reads `NOT LINKED`, and earnings wait until it is.
+
 ### `set` — change what you lend, without a restart
 
 The dashboard's sharing screen for a shell:
@@ -504,6 +524,34 @@ Invitations are meant to be scripted:
 ```bash
 INVITE=$(kmplify-node peers invite "Anna's phone")
 ```
+
+### Earning KMPLIFY Credits
+
+A node that hosts **rented GPU sessions** (GPU apps and container sessions)
+earns KMPLIFY Credits for the seconds the renter paid for.
+
+- **What they are.** A prepaid balance for KMPLIFY services. Credits are not a
+  currency, cannot be traded or transferred, and there is **no cash payout**:
+  earned credits are spent on KMPLIFY services, for example on renting a
+  bigger GPU than your own. They are valid for 24 months.
+- **The rate.** A session is priced per minute by the GPU class of the host
+  (S, M, L or XL, by the VRAM the node lends) and metered per second.
+- **The fee.** KMPLIFY keeps a platform fee, a percentage of what the renter
+  is charged. The rest is credited to you.
+- **Where the numbers are.** Rate and fee are set on the server and can
+  change, so none is written here. `kmplify-node status` and `kmplify-node
+  rewards` show the current ones.
+- **Linking.** Earnings are booked to the KMPLIFY account the node is linked
+  to. Until it is linked they wait, and they are moved when you link it: run
+  `kmplify-node id`, copy the `kmpn1…` address, and in the KMPLIFY app choose
+  Settings, "Your KMPLIFY identity", "My nodes", "Claim node".
+- **What does not earn.** Chat and embedding jobs, functions and vector
+  collections cost their users no credits and earn none.
+
+`kmplify-node rewards` shows the figures, the latest earnings and, on an
+unlinked node, the linking steps with the address already printed. The whole
+feature is switched on at the gateway; with it off, the node shows nothing
+about credits. Details: [docs/CREDITS.md](docs/CREDITS.md).
 
 ### `rewards` — what it delivered, and (optionally) what that earns
 
@@ -692,7 +740,7 @@ falling back to a default the operator did not choose.
 |---|---|---|
 | `PROVIDER_GATEWAY_URL` | the public fabric | Gateway to join. Point it at your own. |
 | `OLLAMA_BASE` | `http://127.0.0.1:11434` | Any OpenAI-compatible endpoint, despite the name. |
-| `PROVIDER_WORKLOADS` | *empty* | Container template ids to host (`vllm-openai`, `vllm-openai-lmcache`, `comfyui`, `comfyui-api`, `ollama`, `ollama-cpu`, `speaches`, `speaches-cpu`). Empty means sessions are off. |
+| `PROVIDER_WORKLOADS` | *empty* | Container template ids to host (`vllm-openai`, `vllm-openai-lmcache`, `comfyui`, `comfyui-api`, `ollama`, `ollama-cpu`, `speaches`, `speaches-cpu`, `floci`, and on managed nodes `n8n`, `jupyter`). Empty means sessions are off. |
 | `PROVIDER_COUNTRY` | *empty* | ISO alpha-2, so consumers can prefer EU capacity. Self-declared, see below. |
 | `PROVIDER_SHARE_INFERENCE` | `true` | Serve model jobs at all. |
 | `PROVIDER_SHARE_CPU` | `false` | Offer CPU and RAM as lendable capacity. |
@@ -718,6 +766,42 @@ falling back to a default the operator did not choose.
 so consumers can *prefer* EU/EEA capacity, which is a data-residency preference
 and not an attestation. Declaring a country you are not in defeats the point
 for the consumer, not for you.
+
+## Trusted node baseline
+
+Personal or confidential work only runs on Trusted nodes. Trusted needs two things:
+the provider's KMPLIFY account passed the identity check, and the machine meets a
+security baseline that the node checks itself. See what yours says:
+
+```sh
+kmplify-node security check          # the checklist, with how to fix each item
+kmplify-node security check --json   # the same as data; exit code 0 when it passes
+```
+
+| Item | Passes when | Windows | macOS | Linux |
+|---|---|---|---|---|
+| Disk encryption | the system and data volumes are encrypted | BitLocker on every fixed drive | FileVault on | every mounted filesystem but /boot and EFI on LUKS (dm-crypt), swap included |
+| Security updates | none is waiting, or the last one is at most 30 days old | Windows Update history and search, "Security Updates" classification, and hotfixes | install history (macOS updates and security responses; XProtect does not count) and `softwareupdate -l` | apt history, unattended-upgrades stamp and `apt-get -s dist-upgrade` (security pocket); dnf history and `dnf updateinfo --security`; pacman log (waiting updates unknown) |
+| Firewall | it is on | Defender Firewall on for domain, private and public | Application Firewall on | ufw or firewalld on, or an nftables input chain that drops |
+| Screen lock | desktops lock within 15 minutes | lock policy or a password screen saver | password on screen saver or display sleep | GNOME or KDE lock settings; not checked without a desktop session |
+| SSH password logins | off, or no SSH server | sshd_config of OpenSSH Server | sshd_config when Remote Login is on | `sshd -T` when allowed, sshd_config otherwise |
+| SSH root login | `PermitRootLogin` is not `yes` | does not apply | sshd_config | as above |
+
+How the node checks:
+
+- At start and every 3 hours. The result goes to the fabric in the hello and every
+  pong, signed with the node's identity key (PROTOCOL.md, v5.5). The fabric decides
+  the trust level, and a check older than 6 hours no longer counts.
+- What it cannot read is reported as unknown, never guessed, and unknown counts as
+  failing. Screen lock and SSH are the exception: without a desktop session or an
+  SSH server there is nothing to check.
+- It never asks for more rights than it has: no `sudo`, no elevation prompt. When a
+  check needs administrator rights (BitLocker on some Windows drives, the nftables
+  rules on Linux), the value is unknown and the checklist says so.
+- Only the facts above are sent: no drive names, mount points, file paths or user
+  names. The checklist shows those details on your screen only.
+- The separate network segment for a Trusted node is your declaration when you accept
+  the provider terms; it is not checked here.
 
 ## Trust model
 
@@ -761,6 +845,12 @@ gateway behaving:
 - **Containers are boxed**: `--cap-drop ALL`, `--security-opt no-new-privileges`,
   memory and PID caps, and a 127.0.0.1-only port binding. GPU passthrough is
   the only privilege granted.
+- **No-egress sessions are reachable and still sealed**: a template the
+  catalog marks `network: none` runs on a private internal network of its
+  own with a tiny socat guard on the bridge publishing its port (Docker
+  publishes nothing for `--network none` or internal networks by itself).
+  The guard forwards one port inward and nothing else; the workload has no
+  route out and cannot see another session on the same machine.
 - **Ceilings are clamped here.** A session's memory cap, CPU share and readiness
   timeout all arrive as requests and are clamped locally, so a gateway cannot
   pin a container on your machine indefinitely or hand it the whole box.
@@ -807,7 +897,7 @@ is the headless build of it.
 - 🧩 **Platform:** [KMPLIFY Compute Fabric](https://kmplify.io/platform/compute-fabric)
 - 💡 **Use case:** [Your own compute capacity](https://kmplify.io/services/own-compute-capacity)
 - ⚡ **Build for the fabric:** [Serverless apps](https://kmplify.io/platform/serverless-apps) and the [KMPLIFY Dev SDK](https://github.com/kmplify/kmplify-dev-sdk)
-- 📚 **Docs:** [kmplify.io/docs](https://kmplify.io/docs) · in this repo: [ONBOARDING](docs/ONBOARDING.md), [HEADLESS-NODE](docs/HEADLESS-NODE.md), [REWARDS](docs/REWARDS.md), [PROTOCOL](PROTOCOL.md)
+- 📚 **Docs:** [kmplify.io/docs](https://kmplify.io/docs) · in this repo: [ONBOARDING](docs/ONBOARDING.md), [HEADLESS-NODE](docs/HEADLESS-NODE.md), [CREDITS](docs/CREDITS.md), [REWARDS](docs/REWARDS.md), [PROTOCOL](PROTOCOL.md)
 
 ## Contributing
 

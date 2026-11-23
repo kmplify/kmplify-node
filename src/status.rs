@@ -265,6 +265,12 @@ pub struct Snapshot {
     /// What this node has actually served, for the operator and for an
     /// optional rewards companion.
     pub delivered: Delivered,
+    /// KMPLIFY Credits this node earned, as the gateway last reported them
+    /// (src/credits.rs). Absent, key and all, while the gateway has the
+    /// credit system off or does not know it: the file is then exactly what
+    /// it was before the field existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credits: Option<crate::credits::Report>,
 
     pub functions_enabled: bool,
     /// The catalog key this node trusts, or empty. Public by nature — it is a

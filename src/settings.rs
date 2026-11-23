@@ -54,6 +54,11 @@ pub struct Settings {
     /// Lend spare CPU threads and system RAM (`PROVIDER_SHARE_CPU`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub share_cpu: Option<bool>,
+    /// List this node in the KMPLIFY marketplace's Compute category
+    /// (`PROVIDER_MARKETPLACE`). Off unless switched on: lending is not a
+    /// request to be shown in a public catalogue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marketplace: Option<bool>,
     /// Container session templates this node accepts (`PROVIDER_WORKLOADS`).
     /// An empty list is a real choice: sessions off.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -75,12 +80,32 @@ pub struct Settings {
     /// Bearer for that gateway (`COLIBRI_API_KEY`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub colibri_api_key: Option<String>,
+    /// Model the node runs in its own vLLM (`KMPLIFY_VLLM_MODEL`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vllm_model: Option<String>,
+    /// That vLLM's context window (`KMPLIFY_VLLM_MAX_MODEL_LEN`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vllm_max_model_len: Option<u32>,
+    /// Its KV cache precision, auto or fp8 (`KMPLIFY_VLLM_KV_DTYPE`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vllm_kv_dtype: Option<String>,
+    /// Share of the GPU it may take, 0.50 to 0.95 (`KMPLIFY_VLLM_GPU_UTIL`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vllm_gpu_util: Option<f32>,
+    /// KV cache it may keep in system RAM, GiB, 0 = off (`KMPLIFY_VLLM_OFFLOAD_GB`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vllm_offload_gb: Option<u32>,
     /// Ceiling on logical CPUs lent to sessions (`PROVIDER_MAX_CPUS`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_cpus: Option<f64>,
     /// Ceiling on advertised VRAM in MB (`PROVIDER_MAX_VRAM_MB`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_vram_mb: Option<u64>,
+    /// Inference jobs this node takes at once from the pool
+    /// (`PROVIDER_MAX_INFERENCE_JOBS`, protocol v3.8). Unset = 4 per GPU, 2
+    /// on a CPU-only host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_inference_jobs: Option<u32>,
     /// Ceiling on advertised system RAM in MB (`PROVIDER_MAX_RAM_MB`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_ram_mb: Option<u64>,
@@ -119,12 +144,21 @@ pub struct Settings {
 pub const KEYS: &[(&str, &str)] = &[
     ("share-inference", "PROVIDER_SHARE_INFERENCE"),
     ("share-cpu", "PROVIDER_SHARE_CPU"),
+    ("marketplace", "PROVIDER_MARKETPLACE"),
     ("workloads", "PROVIDER_WORKLOADS"),
     ("approval-mode", "PROVIDER_APPROVAL_MODE"),
     ("country", "PROVIDER_COUNTRY"),
     ("engine", "OLLAMA_BASE"),
     ("colibri", "COLIBRI_BASE"),
     ("colibri-key", "COLIBRI_API_KEY"),
+    // A Hugging Face model id: the node starts vLLM with it (Docker, CUDA or
+    // ROCm GPU) and lends it; empty = no node-managed vLLM (vllm_managed.rs).
+    ("vllm-model", "KMPLIFY_VLLM_MODEL"),
+    ("vllm-max-model-len", "KMPLIFY_VLLM_MAX_MODEL_LEN"),
+    // How that vLLM holds its KV cache on this machine's GPU.
+    ("vllm-kv-dtype", "KMPLIFY_VLLM_KV_DTYPE"),
+    ("vllm-gpu-util", "KMPLIFY_VLLM_GPU_UTIL"),
+    ("vllm-offload-gb", "KMPLIFY_VLLM_OFFLOAD_GB"),
     ("max-cpus", "PROVIDER_MAX_CPUS"),
     ("max-vram-mb", "PROVIDER_MAX_VRAM_MB"),
     ("max-ram-mb", "PROVIDER_MAX_RAM_MB"),
@@ -179,6 +213,9 @@ impl Settings {
         if let Some(v) = self.share_cpu {
             cfg.share_cpu = v;
         }
+        if let Some(v) = self.marketplace {
+            cfg.marketplace = v;
+        }
         if let Some(v) = &self.workloads {
             cfg.workload_templates = v.clone();
         }
@@ -197,6 +234,21 @@ impl Settings {
         if let Some(v) = &self.colibri_api_key {
             cfg.colibri_api_key = v.clone();
         }
+        if let Some(v) = &self.vllm_model {
+            cfg.vllm_model = v.clone();
+        }
+        if let Some(v) = self.vllm_max_model_len {
+            cfg.vllm_max_model_len = v;
+        }
+        if let Some(v) = &self.vllm_kv_dtype {
+            cfg.vllm_tuning.kv_dtype = v.clone();
+        }
+        if let Some(v) = self.vllm_gpu_util {
+            cfg.vllm_tuning.gpu_util = v;
+        }
+        if let Some(v) = self.vllm_offload_gb {
+            cfg.vllm_tuning.offload_gb = v;
+        }
         // A ceiling of zero is how "lend none of this" is spelled on the way
         // in; the worker's contract for that is None (no explicit choice) for
         // everything except a real number, so keep zero out of the config.
@@ -205,6 +257,9 @@ impl Settings {
         }
         if let Some(v) = self.max_vram_mb {
             cfg.max_shared_vram_mb = (v > 0).then_some(v);
+        }
+        if let Some(v) = self.max_inference_jobs {
+            cfg.max_inference_jobs = (v > 0).then_some(v);
         }
         if let Some(v) = self.max_ram_mb {
             cfg.max_shared_ram_mb = (v > 0).then_some(v);
@@ -267,6 +322,13 @@ impl Settings {
                 v.to_string(),
             );
         }
+        if let Some(v) = self.marketplace {
+            note(
+                "PROVIDER_MARKETPLACE",
+                from_env.marketplace.to_string(),
+                v.to_string(),
+            );
+        }
         if let Some(v) = &self.workloads {
             note(
                 "PROVIDER_WORKLOADS",
@@ -320,6 +382,13 @@ impl Settings {
                 v.to_string(),
             );
         }
+        if let Some(v) = self.max_inference_jobs {
+            note(
+                "PROVIDER_MAX_INFERENCE_JOBS",
+                opt_str(from_env.max_inference_jobs),
+                v.to_string(),
+            );
+        }
         if let Some(v) = self.max_ram_mb {
             note(
                 "PROVIDER_MAX_RAM_MB",
@@ -344,6 +413,7 @@ impl Settings {
         match key {
             "share-inference" => self.share_inference = Some(parse_bool(key, value)?),
             "share-cpu" => self.share_cpu = Some(parse_bool(key, value)?),
+            "marketplace" => self.marketplace = Some(parse_bool(key, value)?),
             "workloads" => {
                 self.workloads = Some(
                     value
@@ -395,8 +465,45 @@ impl Settings {
                 self.colibri_base = Some(value.trim_end_matches('/').to_string());
             }
             "colibri-key" => self.colibri_api_key = Some(value.to_string()),
+            "vllm-model" => {
+                if !value.is_empty() && !crate::vllm_managed::valid_model_id(value) {
+                    return Err(format!(
+                        "{key} must be a Hugging Face model id such as Qwen/Qwen3-8B, or empty"
+                    ));
+                }
+                self.vllm_model = Some(value.to_string());
+            }
+            "vllm-max-model-len" => {
+                let n = parse_num::<u32>(key, value)?;
+                if !(4096..=1_048_576).contains(&n) {
+                    return Err(format!("{key} must be between 4096 and 1048576"));
+                }
+                self.vllm_max_model_len = Some(n);
+            }
+            "vllm-kv-dtype" => {
+                let v = value.to_ascii_lowercase();
+                if !crate::vllm_managed::valid_kv_dtype(&v) {
+                    return Err(format!("{key} must be auto or fp8"));
+                }
+                self.vllm_kv_dtype = Some(v);
+            }
+            "vllm-gpu-util" => {
+                let v = parse_num::<f32>(key, value)?;
+                if !crate::vllm_managed::valid_gpu_util(v) {
+                    return Err(format!("{key} must be between 0.50 and 0.95"));
+                }
+                self.vllm_gpu_util = Some(v);
+            }
+            "vllm-offload-gb" => {
+                let v = parse_num::<u32>(key, value)?;
+                if v > 256 {
+                    return Err(format!("{key} must be between 0 (off) and 256"));
+                }
+                self.vllm_offload_gb = Some(v);
+            }
             "max-cpus" => self.max_cpus = Some(parse_num::<f64>(key, value)?),
             "max-vram-mb" => self.max_vram_mb = Some(parse_capacity(key, value, Unit::Mb)?),
+            "max-inference-jobs" => self.max_inference_jobs = Some(parse_num::<u32>(key, value)?),
             "max-ram-mb" => self.max_ram_mb = Some(parse_capacity(key, value, Unit::Mb)?),
             "max-disk-gb" => self.max_disk_gb = Some(parse_capacity(key, value, Unit::Gb)?),
             "functions" => self.functions = Some(parse_bool(key, value)?),
@@ -430,14 +537,21 @@ impl Settings {
         match key {
             "share-inference" => self.share_inference = None,
             "share-cpu" => self.share_cpu = None,
+            "marketplace" => self.marketplace = None,
             "workloads" => self.workloads = None,
             "approval-mode" => self.approval_mode = None,
             "country" => self.country = None,
             "engine" => self.engine = None,
             "colibri" => self.colibri_base = None,
             "colibri-key" => self.colibri_api_key = None,
+            "vllm-model" => self.vllm_model = None,
+            "vllm-max-model-len" => self.vllm_max_model_len = None,
+            "vllm-kv-dtype" => self.vllm_kv_dtype = None,
+            "vllm-gpu-util" => self.vllm_gpu_util = None,
+            "vllm-offload-gb" => self.vllm_offload_gb = None,
             "max-cpus" => self.max_cpus = None,
             "max-vram-mb" => self.max_vram_mb = None,
+            "max-inference-jobs" => self.max_inference_jobs = None,
             "max-ram-mb" => self.max_ram_mb = None,
             "max-disk-gb" => self.max_disk_gb = None,
             "functions" => self.functions = None,
@@ -469,6 +583,7 @@ impl Settings {
             self.share_inference.map(|v| v.to_string()),
         );
         push("share-cpu", self.share_cpu.map(|v| v.to_string()));
+        push("marketplace", self.marketplace.map(|v| v.to_string()));
         push("workloads", self.workloads.as_ref().map(|v| v.join(",")));
         push("approval-mode", self.approval_mode.clone());
         push("country", self.country.clone());
@@ -480,8 +595,26 @@ impl Settings {
                 .as_ref()
                 .map(|k| if k.is_empty() { "(empty)" } else { "(set)" }.to_string()),
         );
+        push("vllm-model", self.vllm_model.clone());
+        push(
+            "vllm-max-model-len",
+            self.vllm_max_model_len.map(|v| v.to_string()),
+        );
+        push("vllm-kv-dtype", self.vllm_kv_dtype.clone());
+        push(
+            "vllm-gpu-util",
+            self.vllm_gpu_util.map(|v| format!("{v:.2}")),
+        );
+        push(
+            "vllm-offload-gb",
+            self.vllm_offload_gb.map(|v| v.to_string()),
+        );
         push("max-cpus", self.max_cpus.map(|v| v.to_string()));
         push("max-vram-mb", self.max_vram_mb.map(|v| v.to_string()));
+        push(
+            "max-inference-jobs",
+            self.max_inference_jobs.map(|v| v.to_string()),
+        );
         push("max-ram-mb", self.max_ram_mb.map(|v| v.to_string()));
         push("max-disk-gb", self.max_disk_gb.map(|v| v.to_string()));
         push("functions", self.functions.map(|v| v.to_string()));
@@ -634,6 +767,33 @@ mod tests {
                 "{:?}",
                 (cfg.share_inference, cfg.share_cpu, cfg.max_shared_cpus)
             )
+        );
+    }
+
+    /// Being listed in the marketplace is the operator's own switch: off
+    /// unless it is set, on for "true", and it leaves sharing alone.
+    #[test]
+    fn marketplace_listing_is_off_until_it_is_switched_on() {
+        let mut s = Settings::default();
+        let mut cfg = env_cfg();
+        s.apply(&mut cfg);
+        assert!(!cfg.marketplace, "a node is listed without having asked");
+
+        s.set("share-cpu", "true").unwrap();
+        s.apply(&mut cfg);
+        assert!(!cfg.marketplace, "lending listed the node by itself");
+
+        s.set("marketplace", "true").unwrap();
+        s.apply(&mut cfg);
+        assert!(cfg.marketplace);
+        assert!(s.set("marketplace", "sometimes").is_err());
+
+        s.clear("marketplace").unwrap();
+        let mut fresh = env_cfg();
+        s.apply(&mut fresh);
+        assert!(
+            !fresh.marketplace,
+            "clearing it did not return to the default"
         );
     }
 
@@ -831,6 +991,10 @@ mod tests {
                 "engine" => "ollama",
                 "colibri" => "http://127.0.0.1:5000",
                 "colibri-key" => "k",
+                "vllm-model" => "Qwen/Qwen3-8B",
+                "vllm-max-model-len" => "65536",
+                "vllm-kv-dtype" => "fp8",
+                "vllm-gpu-util" => "0.8",
                 "workloads" => "ollama-cpu",
                 _ => "1",
             };

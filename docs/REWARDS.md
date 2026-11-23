@@ -14,10 +14,21 @@ as it always has. Nothing about serving depends on it.
 > asked. No node earns anything today, and nothing here should be read as an
 > income promise: rewards depend on delivered, verified, demanded compute.
 
+> **KMPLIFY Credits are a different thing.** Where a fabric has them switched
+> on, a node that hosts rented GPU sessions earns platform credits, reported by
+> the gateway and shown by `status` and `rewards` with no companion and no
+> setting. They are a prepaid balance for KMPLIFY services, not a currency,
+> and have no payout path. See [CREDITS.md](CREDITS.md). Everything below is
+> about the optional payout companion only.
+
 ## The boundary
 
-1. **kmplify-node stays token-free.** No wallet, no key material, no address,
-   no chain client. The node's half is publishing facts about itself.
+1. **kmplify-node stays token-free.** No wallet, no payment key material, no
+   payout address, no chain client. The node's half is publishing facts
+   about itself. (The node's *identity* key of protocol v3.7 is not a
+   wallet: it signs statements about this node and can neither hold nor
+   move anything. Its public half is in `identity.json`; the seed is a
+   credential and stays in `fabric_node.json`.)
 2. **One direction only.** KMPLIFY works completely without any of this. A
    companion consumes what the node and the fabric publish; neither ever asks
    a companion for permission.
@@ -175,7 +186,9 @@ can.
 
 ## What the node will never do
 
-- store, generate or transmit a key, seed or address;
+- store, generate or transmit a payment key, wallet seed or payout address
+  (its identity key is an authentication credential, never a payment
+  instrument);
 - take a payout instruction from the gateway, or any instruction at all from a
   companion;
 - make scheduling, admission, pricing or consent depend on rewards;

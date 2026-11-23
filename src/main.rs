@@ -31,7 +31,13 @@
 //!   PROVIDER_COUNTRY       ISO alpha-2 for EU-only consumers, "" = undeclared
 //!   PROVIDER_SHARE_INFERENCE  serve chat/embedding jobs (default true)
 //!   PROVIDER_SHARE_CPU     lend spare CPU threads and RAM (default false)
+//!   PROVIDER_MARKETPLACE   list this node in the marketplace (default false)
 //!   PROVIDER_APPROVAL_MODE auto | manual consumer admission
+//!   PROVIDER_DOCUMENT_TERMS the Peer Compute provider terms version the
+//!                          operator accepted (e.g. 2026-11); only the current
+//!                          one enables document jobs (page vision), unset =
+//!                          none. Recorded with its first time in
+//!                          <node dir>/provider-document-terms.json
 //!   OLLAMA_BASE            host Ollama for model serving (default localhost)
 //!   COLIBRI_BASE           optional colibri gateway for frontier models
 //!   KMPLIFY_NODE_DIR       identity/credentials dir
@@ -132,7 +138,7 @@ fn node_dir() -> PathBuf {
 /// exactly the command someone runs on a broken host. `kill_on_drop` so the
 /// abandoned probe does not outlive us as an orphan.
 async fn probe(timeout: Duration, cmd: &str, args: &[&str]) -> Option<String> {
-    let child = tokio::process::Command::new(cmd)
+    let child = kmplify_node::proc::command(cmd)
         .args(args)
         .kill_on_drop(true)
         .output();
@@ -228,6 +234,23 @@ fn resolve_config(errs: &mut Vec<String>) -> WorkerConfig {
         colibri_api_key: env_opt("COLIBRI_API_KEY")
             .or_else(|| env_opt("PROVIDER_COLIBRI_API_KEY"))
             .unwrap_or_default(),
+        vllm_model: env_opt("KMPLIFY_VLLM_MODEL").unwrap_or_default(),
+        vllm_max_model_len: env_opt("KMPLIFY_VLLM_MAX_MODEL_LEN")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(kmplify_node::vllm_managed::DEFAULT_MAX_MODEL_LEN),
+        vllm_tuning: kmplify_node::vllm_managed::Tuning {
+            kv_dtype: env_opt("KMPLIFY_VLLM_KV_DTYPE")
+                .filter(|v| kmplify_node::vllm_managed::valid_kv_dtype(v))
+                .unwrap_or_else(|| "auto".into()),
+            gpu_util: env_opt("KMPLIFY_VLLM_GPU_UTIL")
+                .and_then(|v| v.parse().ok())
+                .filter(|v| kmplify_node::vllm_managed::valid_gpu_util(*v))
+                .unwrap_or(kmplify_node::vllm_managed::DEFAULT_GPU_UTIL),
+            offload_gb: env_opt("KMPLIFY_VLLM_OFFLOAD_GB")
+                .and_then(|v| v.parse().ok())
+                .filter(|v: &u32| *v <= 256)
+                .unwrap_or(0),
+        },
         creds_path: fabric_worker::default_creds_path(&dir),
         country,
         workload_templates: env_opt("PROVIDER_WORKLOADS")
@@ -241,6 +264,7 @@ fn resolve_config(errs: &mut Vec<String>) -> WorkerConfig {
             .unwrap_or_default(),
         max_shared_cpus: env_num("PROVIDER_MAX_CPUS", errs),
         max_shared_vram_mb: env_num("PROVIDER_MAX_VRAM_MB", errs),
+        max_inference_jobs: env_num("PROVIDER_MAX_INFERENCE_JOBS", errs),
         max_shared_ram_mb: env_num("PROVIDER_MAX_RAM_MB", errs),
         max_shared_disk_gb: env_num("PROVIDER_MAX_DISK_GB", errs),
         // Headless default: a node someone runs on purpose shares inference
@@ -251,6 +275,8 @@ fn resolve_config(errs: &mut Vec<String>) -> WorkerConfig {
         } else {
             env_bool("KMPLIFY_SHARE_CPU", false, errs)
         },
+        // Listed in the marketplace only when the operator says so.
+        marketplace: env_bool("PROVIDER_MARKETPLACE", false, errs),
         approval_mode,
         // Filled in by the caller once the accelerator has been probed; doing
         // it here would make every command that merely reads configuration
@@ -539,6 +565,12 @@ fn render_check_text(cfg: &WorkerConfig, pf: &Preflight) {
     println!();
     println!("configuration");
     println!("  gateway    : {}", cfg.gateway_url);
+    if let Err(e) = fabric_worker::check_gateway_url(&cfg.gateway_url) {
+        // Printed here as well as enforced at startup, so `kmplify-node check`
+        // (which the installer runs) reports it while the operator is still
+        // watching, rather than at the first silent refusal to start.
+        println!("               ^ REFUSED: {e}");
+    }
     println!("  creds      : {}", cfg.creds_path.display());
     println!("  ollama     : {}", cfg.ollama_base);
     if !cfg.colibri_base.is_empty() {
@@ -716,6 +748,7 @@ fn render_check_json(cfg: &WorkerConfig, pf: &Preflight) {
             "workloads": cfg.workload_templates,
             "max_cpus": cfg.max_shared_cpus,
             "max_vram_mb": cfg.max_shared_vram_mb,
+            "max_inference_jobs": cfg.max_inference_jobs,
             "max_ram_mb": cfg.max_shared_ram_mb,
             "max_disk_gb": cfg.max_shared_disk_gb,
             "functions": cfg.functions.enabled,
@@ -891,6 +924,10 @@ fn run_status(dir: &std::path::Path, json: bool) -> i32 {
             human_duration(Duration::from_secs(d.session_seconds))
         );
     }
+    // KMPLIFY Credits, when the gateway reports them. No lines otherwise.
+    for line in kmplify_node::credits::status_lines(snap.credits.as_ref()) {
+        println!("{line}");
+    }
     EXIT_OK
 }
 
@@ -956,11 +993,12 @@ fn run_set(dir: &std::path::Path, cli: &cli::Cli, from_env: &WorkerConfig) -> i3
         effective.approval_mode
     );
     println!(
-        "ceilings: cpus {} · vram {} · ram {} · disk {}",
+        "ceilings: cpus {} · vram {} · ram {} · disk {} · inference jobs {}",
         ceiling(effective.max_shared_cpus, ""),
         ceiling(effective.max_shared_vram_mb, " MB"),
         ceiling(effective.max_shared_ram_mb, " MB"),
         ceiling(effective.max_shared_disk_gb, " GB"),
+        ceiling(effective.max_inference_jobs, ""),
     );
 
     // Nudge the running node, if there is one. Without this the change would
@@ -1049,6 +1087,21 @@ async fn run_rewards(dir: &std::path::Path, cfg: &WorkerConfig, stored: &Setting
             human_duration(Duration::from_secs(d.session_seconds))
         );
         println!("  (the node's own count — the fabric's signed receipts are what settle)");
+    }
+
+    // KMPLIFY Credits: what the gateway says this node earned. Asked live,
+    // with the node's own token, and only of a node that has registered.
+    // A gateway with the credit system off, or without it, adds nothing here.
+    if let kmplify_node::credits::Outcome::Report(report) =
+        kmplify_node::credits::fetch_for(&cfg.gateway_url, &cfg.creds_path).await
+    {
+        let address = kmplify_node::peers::credential(&cfg.creds_path)
+            .and_then(|c| c.key())
+            .map(|k| k.address());
+        println!();
+        for line in kmplify_node::credits::detail_lines(&report, address.as_deref()) {
+            println!("{line}");
+        }
     }
 
     let enabled = stored.rewards_enabled();
@@ -1400,7 +1453,13 @@ fn print_peers_json(p: &kmplify_node::peers::Peers, cfg: &WorkerConfig) {
 async fn run_id(cfg: &WorkerConfig) -> i32 {
     match fabric_worker::ensure_identity(&cfg.gateway_url, &cfg.creds_path).await {
         Ok(c) => {
+            // The id on its own line first, exactly as before, so scripts that
+            // read `kmplify-node id` keep working; the address (v3.7) follows
+            // for a person claiming this node from their KMPLIFY account.
             println!("{}", c.node_id);
+            if let Some(key) = c.key() {
+                println!("address: {}", key.address());
+            }
             EXIT_OK
         }
         Err(e) => {
@@ -1431,10 +1490,15 @@ pub(crate) async fn start_node(cfg: WorkerConfig, dir: PathBuf) -> Node {
             status::update(move |s| s.node_id = id);
             // The PUBLIC half, in its own file, so a companion never has to
             // open the credential to learn the node id — see identity.rs.
-            kmplify_node::identity::publish_for(&dir, &c.node_id, &cfg.gateway_url);
+            kmplify_node::identity::publish_for(
+                &dir,
+                &c.node_id,
+                &cfg.gateway_url,
+                c.key().as_ref(),
+            );
             status::push_log(format!(
                 "node identity {}…",
-                &c.node_id[..8.min(c.node_id.len())]
+                &c.node_id[..16.min(c.node_id.len())]
             ));
         }
         Err(e) => {
@@ -1447,11 +1511,19 @@ pub(crate) async fn start_node(cfg: WorkerConfig, dir: PathBuf) -> Node {
         }
     }
     let accel = cfg.accel();
+    let (gateway_url, creds_path) = (cfg.gateway_url.clone(), cfg.creds_path.clone());
     let (stop, stop_rx) = tokio::sync::watch::channel(false);
     let worker = tokio::spawn(fabric_worker::run(cfg, stop_rx.clone()));
     // Publish for `status` and for a dashboard attaching from another
     // process, and accept the commands such a dashboard sends back.
     let publisher = tokio::spawn(status::publish_loop(dir.clone(), accel, stop_rx.clone()));
+    // Earned credits for `status` and the dashboard, for as long as the
+    // node runs. Ends with the stop signal; nothing waits on it.
+    tokio::spawn(kmplify_node::credits::poll_loop(
+        gateway_url,
+        creds_path,
+        stop_rx.clone(),
+    ));
     let commands = tokio::spawn(control::watch(dir.clone(), stop_rx));
     Node {
         stop,
@@ -1477,14 +1549,52 @@ impl Node {
 }
 
 /// Join the fabric and serve until told to stop. Returns the exit code.
-async fn serve(cfg: WorkerConfig, dir: PathBuf) -> i32 {
+async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
+    if let Err(e) = fabric_worker::check_gateway_url(&cfg.gateway_url) {
+        // Before ensure_identity, which is the call that would hand the token
+        // over. Exits non-zero so a service manager reports a failed unit
+        // rather than restarting into the same misconfiguration forever.
+        eprintln!("\nERROR: {e}");
+        return EXIT_UNUSABLE;
+    }
+    // `set vllm-model=<hf id>`: the node runs vLLM itself and lends it. A
+    // vLLM that cannot start leaves the configured engine in place, so the
+    // node still lends something; without the setting, a container a
+    // previous run left behind is removed.
+    let managed_vllm = !cfg.vllm_model.trim().is_empty();
+    if managed_vllm {
+        let (backend, _) = kmplify_node::gpu::detect().await;
+        println!(
+            "[kmplify-node] starting vLLM with {} (a first start downloads the engine and the model)…",
+            cfg.vllm_model
+        );
+        match kmplify_node::vllm_managed::start(
+            backend,
+            cfg.vllm_model.trim(),
+            cfg.vllm_max_model_len,
+            &cfg.vllm_tuning,
+        )
+        .await
+        {
+            Ok(base) => {
+                println!("[kmplify-node] vLLM is ready at {base}; lending it");
+                cfg.ollama_base = base;
+            }
+            Err(e) => eprintln!(
+                "[kmplify-node] vLLM did not start ({e}); lending {} instead",
+                cfg.ollama_base
+            ),
+        }
+    } else {
+        kmplify_node::vllm_managed::remove().await;
+    }
     println!("[kmplify-node] joining {}", cfg.gateway_url);
     let node = start_node(cfg, dir).await;
     let snap = status::snapshot();
     if !snap.node_id.is_empty() {
         println!(
             "[kmplify-node] node identity {}…",
-            &snap.node_id[..8.min(snap.node_id.len())]
+            &snap.node_id[..16.min(snap.node_id.len())]
         );
     }
     let mut control_rx = fabric_worker::subscribe_control();
@@ -1527,6 +1637,9 @@ async fn serve(cfg: WorkerConfig, dir: PathBuf) -> i32 {
             let _ = publisher.await;
             commands.abort();
             status::clear_published(&dir);
+            if managed_vllm {
+                kmplify_node::vllm_managed::remove().await;
+            }
             return code;
         }
         // A dashboard, here or attached, asking this node to stop.
@@ -1543,6 +1656,10 @@ async fn serve(cfg: WorkerConfig, dir: PathBuf) -> i32 {
     }
     .shutdown()
     .await;
+    // Nothing may keep running on the owner's GPU after the node stops.
+    if managed_vllm {
+        kmplify_node::vllm_managed::remove().await;
+    }
     println!("[kmplify-node] stopped cleanly");
     code
 }
@@ -1585,6 +1702,9 @@ async fn main() {
             println!("kmplify-node {}", kmplify_node::version_string());
             return;
         }
+        // Needs no configuration and no node directory: it reads this
+        // machine, not the node.
+        cli::Cmd::Security => std::process::exit(run_security(cli.json).await),
         _ => {}
     }
 
@@ -1630,6 +1750,25 @@ async fn main() {
         eprintln!("\nnothing was started. Fix the configuration and try again.");
         std::process::exit(EXIT_USAGE);
     }
+    // Provider terms for document content: the version the operator states
+    // in the environment is recorded with its first time; without the
+    // variable (or with an old version) the record is dropped and the node
+    // takes no document jobs.
+    match env_opt("PROVIDER_DOCUMENT_TERMS") {
+        Some(v) => match kmplify_node::provider_terms::accept(&dir, &v) {
+            Ok(a) => eprintln!(
+                "kmplify-node: provider document terms {} accepted at {}",
+                a.version, a.accepted_at
+            ),
+            Err(e) => {
+                let _ = kmplify_node::provider_terms::withdraw(&dir);
+                eprintln!("kmplify-node: PROVIDER_DOCUMENT_TERMS not used: {e}. No document jobs.");
+            }
+        },
+        None => {
+            let _ = kmplify_node::provider_terms::withdraw(&dir);
+        }
+    }
     // What the operator chose in the dashboard or with `set` wins over the
     // environment; see the settings module for why round that way.
     stored.apply(&mut cfg);
@@ -1669,9 +1808,35 @@ async fn main() {
         cli::Cmd::Set => unreachable!("handled above"),
         cli::Cmd::Run => serve(cfg, dir).await,
         cli::Cmd::Tui => run_tui(cfg, dir, &cli).await,
-        cli::Cmd::Status | cli::Cmd::Help | cli::Cmd::Version => unreachable!("handled above"),
+        cli::Cmd::Status | cli::Cmd::Help | cli::Cmd::Version | cli::Cmd::Security => {
+            unreachable!("handled above")
+        }
     };
     std::process::exit(code);
+}
+
+/// `kmplify-node security check`: run the baseline now and print it. Exit 0
+/// when the machine meets it, 1 when it does not.
+async fn run_security(json: bool) -> i32 {
+    use std::io::IsTerminal;
+    let report = kmplify_node::security::check().await;
+    let now = kmplify_node::identity::now_s();
+    let ok = report.baseline_ok(now);
+    if json {
+        let mut v = serde_json::to_value(&report).unwrap_or_default();
+        v["baseline_ok"] = serde_json::json!(ok);
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+    } else {
+        print!(
+            "{}",
+            kmplify_node::security::render(&report, now, std::io::stdout().is_terminal())
+        );
+    }
+    if ok {
+        0
+    } else {
+        1
+    }
 }
 
 #[cfg(feature = "tui")]
@@ -1711,6 +1876,7 @@ mod tests {
             "PROVIDER_SHARE_INFERENCE",
             "PROVIDER_SHARE_CPU",
             "KMPLIFY_SHARE_CPU",
+            "PROVIDER_MARKETPLACE",
             "PROVIDER_APPROVAL_MODE",
             "PROVIDER_WORKLOADS",
             "OLLAMA_BASE",

@@ -1,0 +1,51 @@
+{
+  "SPInstallHistoryDataType" : [
+    {
+      "_name" : "macOS 26.7.2",
+      "install_date" : "2026-10-20T09:11:02Z",
+      "install_version" : "26.7.2",
+      "package_source" : "package_source_apple"
+    },
+    {
+      "_name" : "Example Chat App",
+      "install_date" : "2026-11-05T20:32:06Z",
+      "install_version" : "1.2.3",
+      "package_source" : "package_source_other"
+    },
+    {
+      "_name" : "Safari",
+      "install_date" : "2026-11-11T19:36:26Z",
+      "install_version" : "27.3",
+      "package_source" : "package_source_apple"
+    },
+    {
+      "_name" : "macOS 26.7.3",
+      "install_date" : "2026-11-14T14:52:10Z",
+      "install_version" : "26.7.3",
+      "package_source" : "package_source_apple"
+    },
+    {
+      "_name" : "RosettaUpdateAuto",
+      "install_date" : "2026-11-14T14:52:23Z",
+      "package_source" : "package_source_apple"
+    },
+    {
+      "_name" : "GarageBand",
+      "install_date" : "2026-11-19T06:38:05Z",
+      "install_version" : "10.4.15",
+      "package_source" : "package_source_apple"
+    },
+    {
+      "_name" : "XProtectPlistConfigData",
+      "install_date" : "2026-11-21T15:40:50Z",
+      "install_version" : "5377",
+      "package_source" : "package_source_apple"
+    },
+    {
+      "_name" : "XProtectPayloads",
+      "install_date" : "2026-11-21T15:40:56Z",
+      "install_version" : "171",
+      "package_source" : "package_source_apple"
+    }
+  ]
+}

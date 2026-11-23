@@ -1,0 +1,12 @@
+Software Update Tool
+
+Finding available software
+Software Update found the following new or updated software:
+* Label: macOS Tahoe 26.7.4-25H123
+	Title: macOS Tahoe 26.7.4, Version: 26.7.4, Size: 1528000KiB, Recommended: YES, Action: restart,
+* Label: Background Security Improvement 26.7.3 (a)-25H120a
+	Title: Background Security Improvement 26.7.3 (a), Version: 26.7.3 (a), Size: 90000KiB, Recommended: YES, Action: restart,
+* Label: Command Line Tools for Xcode-27.1
+	Title: Command Line Tools for Xcode, Version: 27.1, Size: 750000KiB, Recommended: YES,
+* Label: macOS Tahoe 27.0-26A100
+	Title: macOS Tahoe 27.0, Version: 27.0, Size: 15000000KiB, Recommended: NO, Action: restart,
