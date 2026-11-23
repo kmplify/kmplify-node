@@ -322,7 +322,7 @@ pub const CHOOSER_TEXT: &str = "How do you want to watch this node?\n\
      \x20 1  Terminal view   the dashboard here, in this console\n\
      \x20 2  Web view        the dashboard in your browser\n\
      \x20 3  App window      the dashboard in its own window\n\
-     Type 1, 2 or 3 and press Enter; add r to remember the choice (e.g. 2r).\n\
+     Type 1, 2 or 3 (Enter is optional); add r to remember the choice (e.g. 2r).\n\
      You can switch at any time: keys in the terminal view, the View buttons on the dashboard.";
 
 // ------------------------------------------------------------------ model
