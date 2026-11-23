@@ -54,6 +54,11 @@ pub enum Cmd {
     /// `security check`: the trusted node baseline, item by item, with how
     /// to fix what fails.
     Security,
+    /// The native app window, attached to the node running here.
+    Window,
+    /// The LAN router: its state, and the cluster key (`router key`,
+    /// `router join`, `router new-key`).
+    Router,
     Version,
     Help,
 }
@@ -180,7 +185,7 @@ const VALUE_FLAGS: &[(&str, &str, &str)] = &[
     (
         "--ui",
         "KMPLIFY_NODE_UI",
-        "gui | terminal | none (default: gui on a desktop)",
+        "gui | app | native | tui | terminal | none (default: gui on a desktop)",
     ),
     (
         "--ui-port",
@@ -240,6 +245,8 @@ pub fn usage() -> String {
          \x20 kmplify-node peers [VERB …]      who may use it; approve, block, invite\n\
          \x20 kmplify-node rewards             delivered work, and an optional payout companion\n\
          \x20 kmplify-node security check      trusted node baseline: what passes, how to fix\n\
+         \x20 kmplify-node window              the app window of the node running here\n\
+         \x20 kmplify-node router [VERB]       the LAN router: state, key, join, new-key\n\
          \x20 kmplify-node version | help\n\
          \n\
          DASHBOARD\n\
@@ -348,7 +355,7 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
                         .push((key.trim().to_string(), value.to_string()));
                     continue;
                 }
-                if cli.cmd == Cmd::Peers || cli.cmd == Cmd::Security {
+                if cli.cmd == Cmd::Peers || cli.cmd == Cmd::Security || cli.cmd == Cmd::Router {
                     cli.args.push(arg);
                     continue;
                 }
@@ -367,6 +374,8 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
                 "engines" | "engine" => Cmd::Engines,
                 "rewards" | "earnings" => Cmd::Rewards,
                 "security" | "baseline" => Cmd::Security,
+                "window" | "app" => Cmd::Window,
+                "router" => Cmd::Router,
                 "version" => Cmd::Version,
                 "help" => Cmd::Help,
                 other => return Err(format!("unknown command `{other}`")),
@@ -472,7 +481,23 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
         }
         cli.args.clear();
     }
-    if !cli.args.is_empty() && cli.cmd != Cmd::Peers {
+    if cli.cmd == Cmd::Router {
+        match cli.args.as_slice() {
+            [] => {}
+            [one] if ROUTER_VERBS.iter().any(|(v, _)| v == one) => {}
+            [other, ..] => {
+                return Err(format!(
+                    "`router` knows {}; not `{other}`",
+                    ROUTER_VERBS
+                        .iter()
+                        .map(|(v, _)| format!("`{v}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            }
+        }
+    }
+    if !cli.args.is_empty() && cli.cmd != Cmd::Peers && cli.cmd != Cmd::Router {
         return Err(format!("unexpected argument `{}`", cli.args[0]));
     }
     if cli.cmd == Cmd::Peers {
@@ -480,6 +505,22 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
     }
     Ok(cli)
 }
+
+/// What `kmplify-node router <verb>` accepts.
+pub const ROUTER_VERBS: &[(&str, &str)] = &[
+    (
+        "key",
+        "show this node's cluster key, to join another node to it",
+    ),
+    (
+        "join",
+        "read a cluster key from standard input and use it here",
+    ),
+    (
+        "new-key",
+        "replace the cluster key; every other node must join again",
+    ),
+];
 
 /// What `kmplify-node peers <verb>` accepts, and how many arguments each
 /// verb takes. One table, so the parser, the usage text and the runner

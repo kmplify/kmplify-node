@@ -301,6 +301,10 @@ pub struct Snapshot {
     /// token is in its own owner-only file (`dashboard::URL_FILE`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dashboard_port: Option<u16>,
+    /// Where the views of the publishing process stand, so a view in
+    /// another process (the native app window) offers the same view
+    /// switches the web page does. Filled in when published.
+    pub view: crate::control::ViewState,
 
     /// Tail of the log ring, oldest first.
     pub logs: Vec<String>,
@@ -724,6 +728,7 @@ pub async fn publish_loop(
 
 async fn write_snapshot(path: &Path, tmp: &Path, snap: &Snapshot) {
     let mut snap = snap.clone();
+    snap.view = crate::control::view_state();
     let all = logs();
     snap.logs = all
         .iter()

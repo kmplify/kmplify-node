@@ -134,7 +134,8 @@ static VIEW_START: std::sync::Mutex<String> = std::sync::Mutex::new(String::new(
 
 /// Where the views of this process stand, for the dashboard and the
 /// terminal view alike.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ViewState {
     /// Views can be switched: a person started this node interactively.
     /// A service, a container or a redirected run never switches.

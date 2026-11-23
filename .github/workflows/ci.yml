@@ -85,6 +85,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets
+      # What kmplify-desktop embeds, and what the static release binaries
+      # build: both must stay clean without the window (and the first
+      # without the router and the views).
+      - run: cargo clippy --no-default-features --features provider-core
+      - run: cargo clippy --all-targets --no-default-features --features tui,wasm,dashboard,router
 
   # The whole point of the repository is that nothing copyleft ends up in a
   # binary people run on their own machines, and that the licence stays

@@ -959,7 +959,7 @@ fn document_job_refusal(frame: &Value, terms_dir: Option<&Path>) -> Option<Value
 /// 0644: every local account could read the token and impersonate the node.
 /// A headless box is exactly where other accounts exist. Mode is set at
 /// creation, not afterwards, so there is no window with a readable file.
-async fn write_private(path: &Path, bytes: Vec<u8>) -> std::io::Result<()> {
+pub(crate) async fn write_private(path: &Path, bytes: Vec<u8>) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use tokio::io::AsyncWriteExt;
