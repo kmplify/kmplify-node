@@ -175,6 +175,11 @@ pub const METRICS: &[Metric] = &[
         terminal_form: "",
     },
     Metric {
+        section: "earnings",
+        label: "Link code",
+        terminal_form: "",
+    },
+    Metric {
         section: "settings",
         label: "Settings",
         terminal_form: "",
@@ -259,6 +264,12 @@ pub const ACTIONS: &[Action] = &[
         label: "Stop session",
         web: "/api/session/stop",
         tui_key: "e",
+    },
+    Action {
+        id: "link_code",
+        label: "Make a link code",
+        web: "/api/link-code",
+        tui_key: "L",
     },
     Action {
         id: "report",
@@ -910,6 +921,12 @@ pub enum Act {
     RouterNewKey,
     /// Take the cluster key another node shows (`kmplify-node router key`).
     RouterJoin(JoinKey),
+    /// A fresh link code from this node's credential, bound to an account
+    /// when `nonce` carries that account's challenge. The code is in the
+    /// outcome's message only; it is never stored or logged.
+    LinkCode {
+        nonce: Option<String>,
+    },
 }
 
 /// A cluster key typed into a view. Never printed: its `Debug` says only
@@ -943,6 +960,7 @@ impl Act {
             },
             Act::RouterNewKey => "router_new_key",
             Act::RouterJoin(_) => "router_join",
+            Act::LinkCode { .. } => "link_code",
         }
     }
 }
@@ -1059,6 +1077,17 @@ pub fn perform_with(
                     ),
                 ),
                 Err(e) => Outcome::fail(500, e),
+            }
+        }
+        Act::LinkCode { nonce } => {
+            let creds = crate::fabric_worker::default_creds_path(node_dir);
+            match crate::link::for_credentials(&creds, nonce.as_deref()) {
+                Ok(c) => {
+                    let mut lines = crate::link::instructions(&c, nonce.is_some());
+                    lines.push(c.code);
+                    Outcome::ok(200, lines.join("\n"))
+                }
+                Err(e) => Outcome::fail(409, e),
             }
         }
         Act::RouterJoin(JoinKey(text)) => {
@@ -1405,6 +1434,12 @@ mod tests {
                 _ => {}
             }
         }
+        // A link code needs the node's credential; without one it is refused
+        // with a reason, never a code.
+        let o = perform(Target::Attached, &dir, &Act::LinkCode { nonce: None });
+        assert!(!o.ok && o.status == 409, "{}", o.message);
+        assert!(drained().is_empty());
+        ids.push("link_code");
         // Every contract action was exercised.
         for a in ACTIONS {
             assert!(ids.contains(&a.id), "{} not exercised", a.id);

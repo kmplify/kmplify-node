@@ -127,6 +127,9 @@ pub struct App {
     /// When a re-check was asked for here, and the checked_at of the
     /// report on screen at that moment.
     recheck_asked: Option<(Instant, Option<u64>)>,
+    /// The last link code made in this window, with its instructions. It
+    /// lives only in memory and is never written anywhere.
+    link_text: Option<String>,
     /// The KMPLIFY mark, uploaded once.
     mark: Option<egui::TextureHandle>,
     /// The width of the content area this frame, read before the scroll
@@ -240,6 +243,7 @@ impl App {
             log_filter: String::new(),
             closing: false,
             recheck_asked: None,
+            link_text: None,
             mark: None,
             content_width: 0.0,
         };
@@ -288,6 +292,7 @@ impl App {
             log_filter: String::new(),
             closing: false,
             recheck_asked: None,
+            link_text: None,
             mark: None,
             content_width: 0.0,
         }
@@ -357,7 +362,16 @@ impl App {
         if a == Act::Recheck && o.ok {
             self.recheck_asked = Some((Instant::now(), self.checked_at()));
         }
-        self.notice = Some((o.message, o.ok, Instant::now()));
+        if matches!(a, Act::LinkCode { .. }) && o.ok {
+            self.link_text = Some(o.message.clone());
+            self.notice = Some((
+                "link code made: valid for 10 minutes, once".into(),
+                true,
+                Instant::now(),
+            ));
+        } else {
+            self.notice = Some((o.message, o.ok, Instant::now()));
+        }
         if a == Act::StopNode && o.ok {
             self.closing = true;
         }
@@ -1153,6 +1167,31 @@ impl App {
     }
 
     fn earnings(&mut self, ui: &mut egui::Ui, m: &Value) {
+        let mut make_code = false;
+        card(ui, "Link code", |ui| {
+            muted(
+                ui,
+                "Links this machine to your KMPLIFY account: enter the code on the marketplace (Settings > Peer Compute) within 10 minutes. It works once.",
+            );
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Make a link code").clicked() {
+                    make_code = true;
+                }
+            });
+            if let Some(t) = &self.link_text {
+                let code = t.lines().last().unwrap_or_default().to_string();
+                for l in t.lines().take(t.lines().count().saturating_sub(1)) {
+                    muted(ui, l);
+                }
+                ui.add(egui::Label::new(RichText::new(&code).monospace()).wrap());
+                if ui.button("Copy").clicked() {
+                    ui.ctx().copy_text(code);
+                }
+            }
+        });
+        if make_code {
+            self.act(Act::LinkCode { nonce: None });
+        }
         let e = &m["earnings"];
         let d = &m["delivered"];
         if !e["enabled"].as_bool().unwrap_or(false) {
@@ -2136,6 +2175,7 @@ mod tests {
                 "view_terminal" => "Act::View(\"terminal\"",
                 "router_new_key" => "Act::RouterNewKey",
                 "router_join" => "Act::RouterJoin(",
+                "link_code" => "Act::LinkCode {",
                 other => panic!("an action the window does not know: {other}"),
             };
             assert!(

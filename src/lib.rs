@@ -30,6 +30,7 @@ pub mod gpu;
 pub mod host;
 pub mod hostcpu;
 pub mod identity;
+pub mod link;
 #[cfg(feature = "native-gui")]
 pub mod native;
 pub mod operator_session;

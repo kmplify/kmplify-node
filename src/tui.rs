@@ -293,6 +293,9 @@ struct App {
     /// The node's credential, for talking to the gateway as this node.
     creds_path: PathBuf,
     gateway: String,
+    /// The last link code made here (key L), shown on the earnings screen
+    /// until it expires. Never logged, never published.
+    link_code: Option<kmplify_node::link::LinkCode>,
     /// Last thing this dashboard did, shown in the footer.
     notice: String,
     notice_at: Instant,
@@ -364,6 +367,20 @@ impl App {
     /// The first thing anyone is asked for when a node misbehaves is what its
     /// dashboard said; a screenshot of a terminal is a poor way to send that,
     /// and this is a file.
+    /// A fresh link code from this node's credential (the library call the
+    /// web dashboard and `kmplify-node link-code` make), shown on the
+    /// earnings screen.
+    fn make_link_code(&mut self) {
+        match kmplify_node::link::for_credentials(&self.creds_path, None) {
+            Ok(c) => {
+                self.link_code = Some(c);
+                self.view = View::Earnings;
+                self.say("link code made: valid for 10 minutes, once (earnings screen)");
+            }
+            Err(e) => self.say(e),
+        }
+    }
+
     fn write_snapshot(&mut self) {
         // The same report the web dashboard's "Save a report" writes.
         match views::write_report(&self.node_dir, &self.snap) {
@@ -485,6 +502,7 @@ impl App {
                 self.say("refreshed");
             }
             KeyCode::Char('w') => self.write_snapshot(),
+            KeyCode::Char('L') => self.make_link_code(),
             KeyCode::Char('8') | KeyCode::Char('n') => self.view = View::Trust,
             KeyCode::Char('9') | KeyCode::Char('$') => self.view = View::Earnings,
             KeyCode::Char('0') => self.view = View::Settings,
@@ -649,6 +667,7 @@ fn new_app(
         peer_tx,
         creds_path,
         gateway,
+        link_code: None,
         snap,
         view: View::Home,
         selected: 0,
@@ -1776,6 +1795,7 @@ fn help_text() -> String {
      c  reconnect now   ·   R  re-check now (security baseline)\n\
      e  stop session: the selected one (sessions view)\n\
      x  stop the node   ·   w  save a report (a text file)   ·   r refresh\n\
+     L  make a link code: links this machine to your account (earnings view)\n\
      b  web: the dashboard in the browser   ·   a  app window\n\
      5  change a setting   ·   d  use environment (in the editor)\n\
      o  LAN router: M mode (off, local, lan)   ·   A allowlist   ·   N name\n\
@@ -3638,7 +3658,38 @@ fn draw_trust(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// The link code panel of the earnings screen: the code made with L, or how
+/// to make one.
+fn draw_link_code(f: &mut Frame, app: &App, area: Rect) {
+    let now = kmplify_node::identity::now_s();
+    let lines = match app.link_code.as_ref() {
+        Some(c) if c.expires_at > now => {
+            let mut l = vec![Line::styled(c.code.clone(), Style::new().fg(Color::White).bold())];
+            l.extend(
+                kmplify_node::link::instructions(c, false)
+                    .into_iter()
+                    .map(|t| Line::styled(t, Style::new().fg(MUTED))),
+            );
+            l
+        }
+        Some(_) => vec![Line::raw("That code has expired. Press L for a new one.")],
+        None => vec![
+            Line::raw("Links this machine to your KMPLIFY account, so the marketplace shows your @alias on its card."),
+            Line::styled("Press L to make a link code (valid for 10 minutes, once; no personal data). Same as kmplify-node link-code.", Style::new().fg(MUTED)),
+            Line::styled("A code made here is not bound to an account: whoever has it within 10 minutes can redeem it. Binding is recommended: KMPLIFY Desktop, or kmplify-node link-code --nonce CHALLENGE.", Style::new().fg(MUTED)),
+        ],
+    };
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(panel("link code  (L)")),
+        area,
+    );
+}
+
 fn draw_earnings(f: &mut Frame, app: &App, area: Rect) {
+    let [area, link] = Layout::vertical([Constraint::Min(6), Constraint::Length(11)]).areas(area);
+    draw_link_code(f, app, link);
     let e = &app.model["earnings"];
     if e["enabled"].as_bool() != Some(true) {
         let d = &app.model["delivered"];
@@ -4124,6 +4175,7 @@ mod tests {
             peer_tx: tokio::sync::mpsc::unbounded_channel().0,
             creds_path: std::env::temp_dir().join("fabric_node.json"),
             gateway: "https://gw.example".into(),
+            link_code: None,
             snap: Snapshot::default(),
             view: View::Home,
             selected: 0,
@@ -4223,6 +4275,33 @@ mod tests {
                 act.id
             );
         }
+    }
+
+    #[test]
+    fn l_makes_a_link_code_and_the_earnings_screen_shows_it() {
+        let dir = std::env::temp_dir().join(format!("kn-tui-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = app();
+        a.creds_path = dir.join("fabric_node.json");
+        // No credential yet: says why, shows how.
+        press(&mut a, 'L');
+        assert!(a.link_code.is_none());
+        assert!(a.notice.contains("not joined"), "{}", a.notice);
+        std::fs::write(
+            &a.creds_path,
+            "{\"node_id\":\"0b79ed9d11112222aaaabbbbcccc0000\",\"token\":\"t\",\
+             \"seed_hex\":\"9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60\"}",
+        )
+        .unwrap();
+        press(&mut a, 'L');
+        assert!(a.view == View::Earnings);
+        let code = a.link_code.clone().unwrap().code;
+        a.refresh();
+        let text = screen(&mut a, View::Earnings);
+        // The code is long and wraps: its first characters are on screen.
+        assert!(text.contains(&code[..60].to_lowercase()), "{text}");
+        assert!(text.contains("settings > peer compute > link code"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
