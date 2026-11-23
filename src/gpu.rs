@@ -462,10 +462,11 @@ async fn probe_metal() -> Option<Gpu> {
     }
     // Read from the kernel, not by starting `sysctl`.
     #[cfg(target_os = "macos")]
-    let chip = crate::proc::sysctl_string(c"machdep.cpu.brand_string");
+    let name = crate::proc::sysctl_string(c"machdep.cpu.brand_string")
+        .unwrap_or_else(|| "Apple Silicon".to_string());
+    // Unreachable off macOS (the early return above), but it must compile.
     #[cfg(not(target_os = "macos"))]
-    let chip: Option<String> = None;
-    let name = chip.unwrap_or_else(|| "Apple Silicon".to_string());
+    let name = "Apple Silicon".to_string();
     // What the GPU can actually address, not total RAM: unified memory is
     // shared and the GPU is capped well below the machine's total.
     Some(Gpu::single(

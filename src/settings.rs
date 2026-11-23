@@ -601,8 +601,14 @@ impl Settings {
             self.vllm_max_model_len.map(|v| v.to_string()),
         );
         push("vllm-kv-dtype", self.vllm_kv_dtype.clone());
-        push("vllm-gpu-util", self.vllm_gpu_util.map(|v| format!("{v:.2}")));
-        push("vllm-offload-gb", self.vllm_offload_gb.map(|v| v.to_string()));
+        push(
+            "vllm-gpu-util",
+            self.vllm_gpu_util.map(|v| format!("{v:.2}")),
+        );
+        push(
+            "vllm-offload-gb",
+            self.vllm_offload_gb.map(|v| v.to_string()),
+        );
         push("max-cpus", self.max_cpus.map(|v| v.to_string()));
         push("max-vram-mb", self.max_vram_mb.map(|v| v.to_string()));
         push(
