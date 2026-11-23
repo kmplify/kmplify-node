@@ -10,6 +10,8 @@ and buttons as the web dashboard and the terminal view, plus the LAN router.
 
 ## The app window
 
+![The app window, LAN router section, dark scheme](images/app-window-router-dark.png)
+
 ```
 kmplify-node --ui app        # start the node with its window (also: --ui native)
 kmplify-node window          # open the window of the node already running here
