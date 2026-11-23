@@ -1800,6 +1800,7 @@ fn help_text() -> String {
      5  change a setting   ·   d  use environment (in the editor)\n\
      o  LAN router: M mode (off, local, lan)   ·   A allowlist   ·   N name\n\
      K  new cluster key   ·   J  join a cluster (the key is typed, never shown)\n\
+     P  pair a device (shows a PIN) / close pairing   ·   I  join with PIN\n\
      q  leave: back to the console when the node runs here as a view,\n\
         otherwise stops the node only if it started here\n\
      \n\
@@ -2318,6 +2319,16 @@ impl App {
                     }
                     "router-join" => {
                         self.router_act(views::Act::RouterJoin(views::JoinKey(value)));
+                        return;
+                    }
+                    "router-join-pin" => {
+                        // "ADDRESS PIN": the address the other device shows,
+                        // then its PIN (which may carry a space).
+                        let mut parts = value.split_whitespace();
+                        let at = parts.next().unwrap_or_default().to_string();
+                        let pin: String = parts.collect();
+                        self.say("pairing…");
+                        self.router_act(views::Act::RouterJoinPin(views::PinJoin { at, pin }));
                         return;
                     }
                     _ => {}
@@ -3865,6 +3876,21 @@ impl App {
                     masked: false,
                 });
             }
+            KeyCode::Char('P') => {
+                if s_of(&self.model["router"]["pairing"], "state") == "waiting" {
+                    self.router_act(views::Act::RouterPairClose);
+                } else {
+                    self.router_act(views::Act::RouterPair);
+                }
+            }
+            KeyCode::Char('I') => {
+                self.editing = Some(Editing {
+                    key: "router-join-pin",
+                    label: "Join with PIN: the address and the PIN the other device shows (192.168.1.20:14419 123456)",
+                    buffer: String::new(),
+                    masked: false,
+                });
+            }
             KeyCode::Char('K') => self.confirm = Some(Confirm::NewKey),
             KeyCode::Char('J') => {
                 self.editing = Some(Editing {
@@ -4052,8 +4078,70 @@ fn draw_router(f: &mut Frame, app: &App, area: Rect) {
     ] {
         me.push(Line::from(vec![field(k), Span::raw(v)]));
     }
+    // Pairing: the PIN this process shows, while it waits.
+    let pg = &r["pairing"];
+    match s_of(pg, "state") {
+        "waiting" => {
+            let pin = s_of(pg, "pin");
+            let left = pg["seconds_left"].as_u64().unwrap_or(0);
+            me.push(Line::from(vec![
+                field("pairing"),
+                Span::styled(
+                    format!(
+                        "PIN {} {}",
+                        &pin[..pin.len().min(3)],
+                        &pin[pin.len().min(3)..]
+                    ),
+                    Style::new().fg(Color::Green).bold(),
+                ),
+                Span::raw(format!(
+                    "  {}:{:02} left · {} wrong PINs left",
+                    left / 60,
+                    left % 60,
+                    pg["attempts_left"].as_u64().unwrap_or(0)
+                )),
+            ]));
+            let addrs: Vec<&str> = pg["addresses"]
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            me.push(Line::from(vec![
+                field("address"),
+                Span::raw(format!("{} ({})", addrs.join(", "), s_of(pg, "scope"))),
+            ]));
+            me.push(Line::from(vec![
+                field("compare"),
+                Span::raw(format!(
+                    "fingerprint {} must show on the other device",
+                    s_of(pg, "fingerprint")
+                )),
+            ]));
+        }
+        "" | "none" => me.push(Line::from(vec![
+            field("pairing"),
+            Span::styled(
+                "P shows a PIN for two minutes; I joins with a PIN another device shows",
+                Style::new().fg(MUTED),
+            ),
+        ])),
+        "paired" => me.push(Line::from(vec![
+            field("pairing"),
+            Span::raw(format!(
+                "paired: {} joined the cluster {}",
+                s_of(pg, "joined"),
+                s_of(pg, "fingerprint")
+            )),
+        ])),
+        _ => me.push(Line::from(vec![
+            field("pairing"),
+            Span::styled(
+                s_of(pg, "state_label").to_string(),
+                Style::new().fg(Color::Yellow),
+            ),
+        ])),
+    }
     me.push(Line::styled(
-        "M mode · A allowlist · N name · K new cluster key · J join a cluster",
+        "M mode · A allowlist · N name · P pair a device · I join with PIN · K new key · J join by key",
         Style::new().fg(ACCENT),
     ));
     let mut nodes: Vec<Line> = Vec::new();

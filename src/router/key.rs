@@ -85,6 +85,12 @@ impl ClusterKey {
         &self.0
     }
 
+    /// A key that arrived sealed through PIN pairing.
+    #[cfg(feature = "router")]
+    pub(crate) fn from_array(b: [u8; 32]) -> Self {
+        Self(b)
+    }
+
     #[cfg(test)]
     pub(crate) fn from_bytes(b: [u8; 32]) -> Self {
         Self(b)

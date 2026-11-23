@@ -29,7 +29,9 @@ impl Discovery {
         let daemon = ServiceDaemon::new().map_err(|e| e.to_string())?;
         let host = format!("{}.local.", config.name);
         let fingerprint = key.fingerprint();
-        let props = [("v", "1"), ("kf", fingerprint.as_str())];
+        // v=2: this node answers mutual TLS on the node-info port (and still
+        // signed plain HTTP for v1 nodes and loopback apps).
+        let props = [("v", "2"), ("kf", fingerprint.as_str())];
         let info = ServiceInfo::new(
             SERVICE_TYPE,
             &config.name,
@@ -85,6 +87,11 @@ impl Discovery {
                                     .unwrap_or_default()
                                     .to_string(),
                                 addresses: addrs,
+                                proto: svc
+                                    .txt_properties
+                                    .get_property_val_str("v")
+                                    .and_then(|v| v.trim().parse().ok())
+                                    .unwrap_or(1),
                             };
                             upsert(
                                 &shared,
@@ -124,6 +131,8 @@ pub(crate) struct Found {
     pub port: u16,
     pub key_fingerprint: String,
     pub addresses: Vec<std::net::IpAddr>,
+    /// The router protocol it announced (`v`): 2 = mutual TLS.
+    pub proto: u32,
 }
 
 /// Fold an announcement into the peer list. Only an address on the
@@ -171,6 +180,7 @@ pub(crate) fn upsert(
             p.seen_ms = now_ms;
             p.port = found.port;
             p.key_fingerprint = found.key_fingerprint;
+            p.proto = found.proto;
             if p.address != shown
                 || matches!(state, PeerState::NotAllowed | PeerState::OtherCluster)
             {
@@ -187,6 +197,7 @@ pub(crate) fn upsert(
                 address: shown,
                 port: found.port,
                 key_fingerprint: found.key_fingerprint,
+                proto: found.proto,
                 state,
                 detail,
                 seen_ms: now_ms,
@@ -208,6 +219,7 @@ mod tests {
             port: 14418,
             key_fingerprint: kf.into(),
             addresses: vec![addr.parse().unwrap()],
+            proto: 2,
         }
     }
 

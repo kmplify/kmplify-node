@@ -1,6 +1,6 @@
 [package]
 name = "kmplify-node"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 # What the dependency floor actually is, now that both lanes ship by default:
 # ratatui asks for 1.88 and wasmtime for 1.95. Claiming 1.77 while the tree
@@ -87,6 +87,26 @@ mdns-sd = { version = "0.21", optional = true }
 # cluster key, so the key itself never crosses the network. RustCrypto, the
 # same family as the sha2 above. Apache-2.0 OR MIT.
 hmac = { version = "0.12", optional = true }
+# Router phase 2 (src/router/pairing.rs, src/router/tls.rs): PIN pairing
+# and mutual TLS between cluster members.
+# * spake2: the PAKE behind the six-digit PIN (RustCrypto PAKEs, MIT OR
+#   Apache-2.0). NOT independently audited (its README says so); built on
+#   curve25519-dalek, sha2 and hkdf. See docs/ROUTER.md, "Pairing".
+# * hkdf: the pairing key schedule (RustCrypto, Apache-2.0 OR MIT; already
+#   in the tree through hpke and spake2).
+# * rustls, tokio-rustls, rustls-webpki: TLS 1.3 between members with
+#   certificates bound to the cluster key (already in the tree through
+#   reqwest; ring provider, Apache-2.0/ISC/MIT).
+# * rcgen: the per-start self-signed certificate (MIT OR Apache-2.0).
+# * if-addrs: this computer's LAN addresses for the pairing screen (MIT OR
+#   BSD-3-Clause; already in the tree through mdns-sd).
+spake2 = { version = "0.4", optional = true }
+hkdf = { version = "0.12", optional = true }
+rustls = { version = "0.23.46", optional = true, default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring"] }
+webpki = { package = "rustls-webpki", version = "0.103.17", optional = true, default-features = false, features = ["alloc", "ring"] }
+rcgen = { version = "0.14", optional = true, default-features = false, features = ["crypto", "ring"] }
+if-addrs = { version = "0.15", optional = true }
 # The native app window (src/native, feature `native-gui`): the node's views
 # drawn with egui. The OpenGL backend only (the smaller tree; enough for a
 # dashboard), and WITHOUT egui's bundled default fonts: those carry the
@@ -137,7 +157,17 @@ dashboard = []
 # (`kmplify-node set router=local|lan`). Loopback only unless LAN mode is
 # chosen, and then only for an allowlist and with the cluster key; see
 # src/router/mod.rs and docs/ROUTER.md.
-router = ["dep:mdns-sd", "dep:hmac"]
+router = [
+    "dep:mdns-sd",
+    "dep:hmac",
+    "dep:spake2",
+    "dep:hkdf",
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:webpki",
+    "dep:rcgen",
+    "dep:if-addrs",
+]
 # The native app window (`--ui app`, `--ui native`, `kmplify-node window`):
 # the node's views in an egui window with the same sections, metrics and
 # actions as the web dashboard and the terminal view (src/views.rs). Without

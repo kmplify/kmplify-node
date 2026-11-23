@@ -201,6 +201,11 @@ pub const METRICS: &[Metric] = &[
     },
     Metric {
         section: "router",
+        label: "Pairing",
+        terminal_form: "",
+    },
+    Metric {
+        section: "router",
         label: "Nodes on the network",
         terminal_form: "a text bar per meter instead of the one-minute charts",
     },
@@ -312,6 +317,24 @@ pub const ACTIONS: &[Action] = &[
         label: "Join a cluster",
         web: "/api/router/join",
         tui_key: "J",
+    },
+    Action {
+        id: "router_pair",
+        label: "Pair a device",
+        web: "/api/router/pair",
+        tui_key: "P",
+    },
+    Action {
+        id: "router_pair_close",
+        label: "Close pairing",
+        web: "/api/router/pair/close",
+        tui_key: "P",
+    },
+    Action {
+        id: "router_join_pin",
+        label: "Join with PIN",
+        web: "/api/router/join-pin",
+        tui_key: "I",
     },
 ];
 
@@ -828,6 +851,9 @@ pub fn router_model(input: &RouterInput, stored: &Settings, node_id: &str) -> Va
                 "peers": peers,
                 "log": r.log.iter().map(|l| crate::trust::redact(l)).collect::<Vec<_>>(),
                 "modes": modes,
+                "cert_fingerprint": r.cert_fingerprint,
+                "pair_port": pair_port(),
+                "pairing": pairing_model(),
             })
         }
         None => json!({
@@ -847,8 +873,20 @@ pub fn router_model(input: &RouterInput, stored: &Settings, node_id: &str) -> Va
             "peers": [],
             "log": [],
             "modes": modes,
+            "cert_fingerprint": "",
+            "pair_port": pair_port(),
+            "pairing": pairing_model(),
         }),
     }
+}
+
+fn pair_port() -> u16 {
+    #[cfg(feature = "router")]
+    {
+        crate::router::pairing::pair_port()
+    }
+    #[cfg(not(feature = "router"))]
+    0
 }
 
 /// Apply the fields an editor changed (`draft` against the `saved` it
@@ -921,12 +959,54 @@ pub enum Act {
     RouterNewKey,
     /// Take the cluster key another node shows (`kmplify-node router key`).
     RouterJoin(JoinKey),
+    /// Open a pairing invitation in this process: a six-digit PIN for two
+    /// minutes (`kmplify-node router pair`).
+    RouterPair,
+    /// Close this process's pairing invitation.
+    RouterPairClose,
+    /// Get the cluster key from the device showing a PIN (`kmplify-node
+    /// router join --pin`).
+    RouterJoinPin(PinJoin),
     /// A fresh link code from this node's credential, bound to an account
     /// when `nonce` carries that account's challenge. The code is in the
     /// outcome's message only; it is never stored or logged.
     LinkCode {
         nonce: Option<String>,
     },
+}
+
+/// A PIN typed into a view, with the address the other device shows. The
+/// PIN is never printed: `Debug` shows the address only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PinJoin {
+    pub at: String,
+    pub pin: String,
+}
+
+impl std::fmt::Debug for PinJoin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PinJoin({}, ..)", self.at)
+    }
+}
+
+/// This process's pairing invitation, if one was opened here. The PIN lives
+/// here, in memory, and nowhere else.
+#[cfg(feature = "router")]
+static PAIRING: std::sync::Mutex<Option<crate::router::pairing::Host>> =
+    std::sync::Mutex::new(None);
+
+/// What a view shows of this process's invitation, or `null`.
+pub fn pairing_model() -> Value {
+    #[cfg(feature = "router")]
+    {
+        let g = PAIRING.lock().unwrap_or_else(|p| p.into_inner());
+        match g.as_ref() {
+            Some(h) => json!(h.view()),
+            None => Value::Null,
+        }
+    }
+    #[cfg(not(feature = "router"))]
+    Value::Null
 }
 
 /// A cluster key typed into a view. Never printed: its `Debug` says only
@@ -960,6 +1040,9 @@ impl Act {
             },
             Act::RouterNewKey => "router_new_key",
             Act::RouterJoin(_) => "router_join",
+            Act::RouterPair => "router_pair",
+            Act::RouterPairClose => "router_pair_close",
+            Act::RouterJoinPin(_) => "router_join_pin",
             Act::LinkCode { .. } => "link_code",
         }
     }
@@ -1113,7 +1196,80 @@ pub fn perform_with(
                 Err(e) => Outcome::fail(500, e),
             }
         }
+        Act::RouterPair => pair_open(node_dir, keys),
+        Act::RouterPairClose => {
+            #[cfg(feature = "router")]
+            {
+                let mut g = PAIRING.lock().unwrap_or_else(|p| p.into_inner());
+                match g.take() {
+                    Some(mut h) => {
+                        h.close();
+                        Outcome::ok(200, "pairing closed")
+                    }
+                    None => Outcome::ok(200, "no pairing was open"),
+                }
+            }
+            #[cfg(not(feature = "router"))]
+            Outcome::fail(501, "this build has no router")
+        }
+        Act::RouterJoinPin(PinJoin { at, pin }) => {
+            #[cfg(feature = "router")]
+            {
+                match crate::router::pairing::join_blocking(node_dir, keys, at, pin) {
+                    Ok(j) => Outcome::ok(
+                        200,
+                        format!(
+                            "joined {}'s cluster: fingerprint {}. Check that the other device \
+                             shows the same fingerprint. A running router picks the key up \
+                             within a second.",
+                            j.inviter_name, j.fingerprint
+                        ),
+                    ),
+                    Err(e) => Outcome::fail(400, e),
+                }
+            }
+            #[cfg(not(feature = "router"))]
+            {
+                let _ = (at, pin);
+                Outcome::fail(501, "this build has no router")
+            }
+        }
     }
+}
+
+#[cfg(feature = "router")]
+fn pair_open(node_dir: &Path, keys: &dyn crate::router::KeyStore) -> Outcome {
+    let mut g = PAIRING.lock().unwrap_or_else(|p| p.into_inner());
+    // A new PIN replaces an open one (and its listener).
+    if let Some(mut old) = g.take() {
+        old.close();
+    }
+    match crate::router::pairing::Host::open(
+        node_dir,
+        keys,
+        false,
+        crate::router::pairing::pair_port(),
+    ) {
+        Ok(h) => {
+            let v = h.view();
+            *g = Some(h);
+            Outcome::ok(
+                200,
+                format!(
+                    "pairing open for two minutes on {} ({}); enter the PIN on the other \
+                     device with Join with PIN",
+                    v.addresses.join(", "),
+                    v.scope
+                ),
+            )
+        }
+        Err(e) => Outcome::fail(409, e),
+    }
+}
+
+#[cfg(not(feature = "router"))]
+fn pair_open(_node_dir: &Path, _keys: &dyn crate::router::KeyStore) -> Outcome {
+    Outcome::fail(501, "this build has no router")
 }
 
 /// `value: None` hands the key back to the environment.
@@ -1434,6 +1590,54 @@ mod tests {
                 _ => {}
             }
         }
+        #[cfg(feature = "router")]
+        {
+            // Pairing: open (loopback, no allowlist in this directory), shown in
+            // the model with its PIN, closed; joining a PIN where nothing
+            // listens fails cleanly and stores nothing new.
+            let before = crate::router::FileKeyStore::new(&dir).load().unwrap();
+            let o = perform(Target::Attached, &dir, &Act::RouterPair);
+            if o.ok {
+                let m = pairing_model();
+                assert_eq!(m["state"], "waiting");
+                assert_eq!(m["pin"].as_str().unwrap().len(), 6);
+                assert!(m["addresses"][0]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("127.0.0.1:"));
+            } else {
+                // The pairing port is taken on this machine; the action still
+                // says why instead of failing silently.
+                assert!(o.message.contains("cannot listen"), "{}", o.message);
+            }
+            ids.push(Act::RouterPair.id());
+            assert!(perform(Target::Attached, &dir, &Act::RouterPairClose).ok);
+            assert!(pairing_model().is_null());
+            ids.push(Act::RouterPairClose.id());
+            let j = perform(
+                Target::Attached,
+                &dir,
+                &Act::RouterJoinPin(PinJoin {
+                    at: "127.0.0.1:1".into(),
+                    pin: "123456".into(),
+                }),
+            );
+            assert!(!j.ok);
+            assert!(!j.message.contains("123456"));
+            assert_eq!(
+                crate::router::FileKeyStore::new(&dir).load().unwrap(),
+                before
+            );
+            ids.push(
+                Act::RouterJoinPin(PinJoin {
+                    at: String::new(),
+                    pin: String::new(),
+                })
+                .id(),
+            );
+        }
+        #[cfg(not(feature = "router"))]
+        ids.extend(["router_pair", "router_pair_close", "router_join_pin"]);
         // A link code needs the node's credential; without one it is refused
         // with a reason, never a code.
         let o = perform(Target::Attached, &dir, &Act::LinkCode { nonce: None });
