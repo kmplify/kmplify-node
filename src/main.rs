@@ -451,13 +451,33 @@ fn judge(cfg: &WorkerConfig, pf: &mut Preflight) {
     // Same reasoning one layer up: a node that shares inference but lists no
     // models joins the fabric, counts toward online_nodes, and has every job
     // refused — silently, because connecting SUCCEEDED.
+    //
+    // With another lane shared (sessions, CPU, functions, vectors) the node
+    // is NOT serving nothing: it is a node that lends no chat models, which
+    // is a choice an operator may well have made. Then it is a warning,
+    // worded so it does not read as the reason setup stopped.
     if cfg.share_inference && pf.models.is_empty() {
-        pf.errors.push(format!(
-            "no models at {} — nothing to serve. Check the endpoint lists them:\n\
-             \x20   curl {}/v1/models      # vLLM, LiteLLM, TGI\n\
-             \x20   curl {}/api/tags       # Ollama",
-            cfg.ollama_base, cfg.ollama_base, cfg.ollama_base
-        ));
+        let other_lanes = !cfg.workload_templates.is_empty()
+            || cfg.share_cpu
+            || cfg.functions.enabled
+            || cfg.vectors.enabled;
+        if other_lanes {
+            pf.warnings.push(format!(
+                "no language models found at {}: chat and embeddings are not shared. \
+                 Everything else this node offers (serverless apps, CPU, functions, \
+                 vectors as configured) still is. To share models, start the engine \
+                 and check it lists them: curl {}/v1/models (vLLM, LiteLLM, TGI) or \
+                 curl {}/api/tags (Ollama)",
+                cfg.ollama_base, cfg.ollama_base, cfg.ollama_base
+            ));
+        } else {
+            pf.errors.push(format!(
+                "no models at {} — nothing to serve. Check the endpoint lists them:\n\
+                 \x20   curl {}/v1/models      # vLLM, LiteLLM, TGI\n\
+                 \x20   curl {}/api/tags       # Ollama",
+                cfg.ollama_base, cfg.ollama_base, cfg.ollama_base
+            ));
+        }
     }
     // Every lane counts as sharing, the v3.0 ones included: a functions-only
     // node is a real provider, not a misconfiguration.
@@ -849,6 +869,12 @@ fn run_status(dir: &std::path::Path, json: bool) -> i32 {
     if json {
         let mut body = serde_json::to_value(&snap).unwrap_or_default();
         body["running"] = serde_json::json!(snap.is_fresh());
+        body["trust"] = serde_json::to_value(kmplify_node::trust::standing(
+            snap.security.as_ref(),
+            snap.fabric_trust.as_ref(),
+            kmplify_node::identity::now_s(),
+        ))
+        .unwrap_or_default();
         body["age_ms"] = serde_json::json!(snap.age().as_millis() as u64);
         println!(
             "{}",
@@ -924,7 +950,37 @@ fn run_status(dir: &std::path::Path, json: bool) -> i32 {
             human_duration(Duration::from_secs(d.session_seconds))
         );
     }
+    // What is shared, in words, and where the node stands on the way to
+    // Trusted: the same lines the startup summary prints.
+    println!(
+        "  chat     : {}",
+        kmplify_node::summary::models_text(&snap, "")
+    );
+    let color = color_out();
+    let now = kmplify_node::identity::now_s();
+    match &snap.security {
+        Some(r) => {
+            for line in
+                kmplify_node::summary::trust_lines(Some(r), snap.fabric_trust.as_ref(), now, color)
+            {
+                println!("{line}");
+            }
+            for line in kmplify_node::summary::checklist_lines(r, snap.fabric_trust.as_ref(), color)
+            {
+                println!("{line}");
+            }
+        }
+        None => println!(
+            "  Trust       the running node has not published a security check yet; \
+             `kmplify-node security check` checks this machine now"
+        ),
+    }
+    if let Some(url) = kmplify_node::dashboard::read_url_file(dir) {
+        println!("  Dashboard   {url}  (opens only on this computer)");
+    }
+    println!("  Details     `kmplify-node security check`  every item with how to fix it");
     // KMPLIFY Credits, when the gateway reports them. No lines otherwise.
+    // Last, so the output of a node without them is exactly the lines above.
     for line in kmplify_node::credits::status_lines(snap.credits.as_ref()) {
         println!("{line}");
     }
@@ -1512,6 +1568,7 @@ pub(crate) async fn start_node(cfg: WorkerConfig, dir: PathBuf) -> Node {
     }
     let accel = cfg.accel();
     let (gateway_url, creds_path) = (cfg.gateway_url.clone(), cfg.creds_path.clone());
+    let trust_gateway = cfg.gateway_url.clone();
     let (stop, stop_rx) = tokio::sync::watch::channel(false);
     let worker = tokio::spawn(fabric_worker::run(cfg, stop_rx.clone()));
     // Publish for `status` and for a dashboard attaching from another
@@ -1522,6 +1579,13 @@ pub(crate) async fn start_node(cfg: WorkerConfig, dir: PathBuf) -> Node {
     tokio::spawn(kmplify_node::credits::poll_loop(
         gateway_url,
         creds_path,
+        stop_rx.clone(),
+    ));
+    // The fabric's view of this node (trust level, baseline as evaluated),
+    // read from the gateway's public node list for the summary, `status`
+    // and the dashboard.
+    tokio::spawn(kmplify_node::trust::poll_loop(
+        trust_gateway,
         stop_rx.clone(),
     ));
     let commands = tokio::spawn(control::watch(dir.clone(), stop_rx));
@@ -1548,8 +1612,87 @@ impl Node {
     }
 }
 
+/// Whether to paint the terminal.
+fn color_out() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+/// Print the startup summary once the node is connected (or has tried for a
+/// while), and the trusted node part again if the self-check finishes later.
+async fn startup_summary(engine: String, dashboard_url: Option<String>) {
+    let started = std::time::Instant::now();
+    let wait_until = |secs: u64| started + Duration::from_secs(secs);
+    // Connected, or 30 s of trying: either way the person should hear what
+    // is going on rather than watch reconnect lines.
+    while status::snapshot().link != status::Link::Online
+        && std::time::Instant::now() < wait_until(30)
+    {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    // A little longer for the self-check and the fabric's first reading.
+    while (kmplify_node::security::latest().is_none() || kmplify_node::trust::latest().is_none())
+        && std::time::Instant::now() < wait_until(45)
+    {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let snap = status::snapshot();
+    let report = kmplify_node::security::latest();
+    let fabric = kmplify_node::trust::latest();
+    print!(
+        "{}",
+        kmplify_node::summary::render(&kmplify_node::summary::Facts {
+            snap: &snap,
+            report: report.as_ref(),
+            fabric: fabric.as_ref(),
+            engine: &engine,
+            dashboard_url: dashboard_url.as_deref(),
+            now_s: kmplify_node::identity::now_s(),
+            color: color_out(),
+        })
+    );
+    if report.is_some() {
+        return;
+    }
+    // Windows' update search may take two minutes; say the result when it
+    // is there instead of leaving "still running" as the last word.
+    while kmplify_node::security::latest().is_none() && std::time::Instant::now() < wait_until(300)
+    {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    if let Some(r) = kmplify_node::security::latest() {
+        println!("[kmplify-node] security check finished:");
+        for line in kmplify_node::summary::trust_lines(
+            Some(&r),
+            kmplify_node::trust::latest().as_ref(),
+            kmplify_node::identity::now_s(),
+            color_out(),
+        ) {
+            println!("{line}");
+        }
+    }
+}
+
 /// Join the fabric and serve until told to stop. Returns the exit code.
 async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
+    use kmplify_node::dashboard::{self, UiMode};
+    let ui = match UiMode::resolve(
+        env_opt("KMPLIFY_NODE_UI").as_deref(),
+        dashboard::desktop_session(),
+    ) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("kmplify-node: {e}");
+            return EXIT_USAGE;
+        }
+    };
+    let ui_port = match dashboard::parse_port(env_opt("KMPLIFY_NODE_UI_PORT").as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("kmplify-node: {e}");
+            return EXIT_USAGE;
+        }
+    };
     if let Err(e) = fabric_worker::check_gateway_url(&cfg.gateway_url) {
         // Before ensure_identity, which is the call that would hand the token
         // over. Exits non-zero so a service manager reports a failed unit
@@ -1589,6 +1732,8 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
         kmplify_node::vllm_managed::remove().await;
     }
     println!("[kmplify-node] joining {}", cfg.gateway_url);
+    let engine = cfg.ollama_base.clone();
+    let gateway = cfg.gateway_url.clone();
     let node = start_node(cfg, dir).await;
     let snap = status::snapshot();
     if !snap.node_id.is_empty() {
@@ -1620,6 +1765,54 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
         commands,
         dir,
     } = node;
+
+    // The local dashboard (gui) and the startup summary (gui, terminal).
+    let mut dash = None;
+    if ui == UiMode::Gui {
+        let ctx = dashboard::Ctx {
+            token: dashboard::new_token(),
+            node_dir: dir.clone(),
+            engine: engine.clone(),
+            gateway,
+        };
+        match dashboard::start(dashboard::loopback(ui_port), ctx, stop.subscribe()).await {
+            Ok(d) => {
+                let url = d.url();
+                let port = d.addr.port();
+                status::update(move |s| s.dashboard_port = Some(port));
+                if let Err(e) = dashboard::write_url_file(&dir, &url) {
+                    eprintln!("[kmplify-node] could not save the dashboard link: {e}");
+                }
+                println!("[kmplify-node] dashboard on this computer: {url}");
+                let mut errs = Vec::new();
+                let open = env_bool("KMPLIFY_NODE_UI_OPEN", true, &mut errs);
+                if open {
+                    if let Err(e) = dashboard::open_browser(&url) {
+                        println!(
+                            "[kmplify-node] could not open a browser ({e}); open the link above yourself"
+                        );
+                    }
+                }
+                dash = Some(d);
+            }
+            Err(e) => eprintln!(
+                "[kmplify-node] the dashboard did not start ({e}); carrying on in the terminal. \
+                 Try another port with --ui-port, or --ui terminal."
+            ),
+        }
+    }
+    if ui != UiMode::None {
+        tokio::spawn(startup_summary(
+            engine,
+            dash.as_ref().map(dashboard::Dashboard::url),
+        ));
+    }
+    let end_dashboard = |dash: Option<dashboard::Dashboard>, dir: &std::path::Path| {
+        if let Some(d) = dash {
+            d.stop();
+            dashboard::remove_url_file(dir);
+        }
+    };
     let mut code = EXIT_OK;
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
@@ -1637,6 +1830,7 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
             let _ = publisher.await;
             commands.abort();
             status::clear_published(&dir);
+            end_dashboard(dash, &dir);
             if managed_vllm {
                 kmplify_node::vllm_managed::remove().await;
             }
@@ -1647,6 +1841,7 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
     }
 
     println!("[kmplify-node] stopping — tearing down hosted sessions…");
+    end_dashboard(dash, &dir);
     Node {
         stop,
         worker,
@@ -2026,6 +2221,38 @@ mod tests {
             !pf2.errors.iter().any(|e| e.contains("nothing is shared")),
             "a functions-only node shares plenty"
         );
+        clear();
+    }
+
+    #[test]
+    fn no_models_stops_setup_only_when_nothing_else_is_shared() {
+        let _g = env_lock();
+        clear();
+        let mut errs = Vec::new();
+        let cfg = resolve_config(&mut errs);
+        // Inference only, no models: nothing to serve, an error.
+        let mut pf = empty_preflight();
+        pf.docker = Some("29".into());
+        judge(&cfg, &mut pf);
+        assert!(pf.errors.iter().any(|e| e.contains("no models at")));
+        // Serverless apps too: the node serves those, so a warning that
+        // says what still works, and setup continues.
+        let mut cfg2 = cfg.clone();
+        cfg2.workload_templates = vec!["comfyui".into()];
+        let mut pf2 = empty_preflight();
+        pf2.docker = Some("29".into());
+        judge(&cfg2, &mut pf2);
+        assert!(
+            !pf2.errors.iter().any(|e| e.contains("models")),
+            "{:?}",
+            pf2.errors
+        );
+        let w = pf2
+            .warnings
+            .iter()
+            .find(|w| w.contains("no language models"))
+            .expect("a warning");
+        assert!(w.contains("serverless apps"), "{w}");
         clear();
     }
 

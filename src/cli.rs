@@ -177,6 +177,16 @@ const VALUE_FLAGS: &[(&str, &str, &str)] = &[
         "KMPLIFY_GPU_BACKEND",
         "force cuda | rocm | oneapi | metal | cpu",
     ),
+    (
+        "--ui",
+        "KMPLIFY_NODE_UI",
+        "gui | terminal | none (default: gui on a desktop)",
+    ),
+    (
+        "--ui-port",
+        "KMPLIFY_NODE_UI_PORT",
+        "port of the local dashboard (default: a free one)",
+    ),
 ];
 
 /// Switches, each with a `--no-` twin, over the same environment variables.
@@ -206,6 +216,11 @@ const BOOL_FLAGS: &[(&str, &str, &str)] = &[
         "PROVIDER_SHARE_VECTORS",
         "host vector collections",
     ),
+    (
+        "--ui-open",
+        "KMPLIFY_NODE_UI_OPEN",
+        "open the dashboard in the browser at start (gui)",
+    ),
 ];
 
 pub fn usage() -> String {
@@ -217,7 +232,7 @@ pub fn usage() -> String {
          \x20 kmplify-node [run] [options]     join the fabric and serve (logs to stdout)\n\
          \x20 kmplify-node tui [options]       live dashboard: watch and control the node\n\
          \x20 kmplify-node check [options]     preflight this host, then exit\n\
-         \x20 kmplify-node status [--json]     one-shot report of the running node\n\
+         \x20 kmplify-node status [--json]     the running node: shared, trust, checklist\n\
          \x20 kmplify-node id                  print this install's node id\n\
          \x20 kmplify-node set KEY=VALUE …     change what this machine lends, durably\n\
          \x20 kmplify-node init                first-run wizard: engine, sharing, preflight\n\
@@ -228,6 +243,11 @@ pub fn usage() -> String {
          \x20 kmplify-node version | help\n\
          \n\
          DASHBOARD\n\
+         \x20 `run` on a desktop opens the node in your browser: a page on\n\
+         \x20 127.0.0.1 only, behind a per-start token, showing what is shared and\n\
+         \x20 what is missing to become a Trusted node. `--ui terminal` prints the\n\
+         \x20 same summary in the console only; `--ui none` is plain logs (services).\n\
+         \n\
          \x20 `tui` attaches to a node already running here (systemd, Docker) and\n\
          \x20 drives it: pause and resume sharing, evict a peer's session, force a\n\
          \x20 reconnect, stop the node. With no node running it starts one itself, so\n\

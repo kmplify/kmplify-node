@@ -309,6 +309,66 @@ behind it is anything that speaks the OpenAI API.)
 
 Everything below is the detail behind those commands.
 
+## Using kmplify-node: dashboard and terminal
+
+`kmplify-node` (or `kmplify-node run`) talks to you in one of three ways:
+
+| `--ui` | What you get | Default when |
+|---|---|---|
+| `gui` | The terminal summary below, plus the dashboard in your browser | started from a terminal in a desktop session (macOS, Windows, Linux with a display) |
+| `terminal` | The terminal summary only | everywhere else: SSH logins, containers, systemd |
+| `none` | Plain log lines, for services and log collectors | never by default |
+
+`KMPLIFY_NODE_UI` sets the same, `--ui-port PORT` (`KMPLIFY_NODE_UI_PORT`) picks
+the dashboard's port (default: a free one), and `--no-ui-open` keeps the browser
+closed while still serving the page.
+
+**The startup summary.** Once the node is connected (or has tried for 30 seconds)
+it prints one block: the fabric it is connected to, the machine, what it shares
+(chat models, serverless apps, CPU and RAM, functions, vectors), its trust level
+as the fabric reports it, and the top items missing for a Trusted node with a
+one-line fix each. A node without language models says so as information: "No
+language models shared for chat; serverless apps are still offered." When the
+security check finishes later (Windows' update search can take two minutes), the
+trust part follows. `kmplify-node status` prints the same, plus every baseline
+item, at any time.
+
+**The dashboard.** Pages: Overview (connection, node, version, uptime, what is
+shared and what "no models" means), Trusted node (every baseline item with its
+state, the exact reason, how the fabric evaluated it, step-by-step fixes for this
+system and the others, and **Re-check now**), Sessions (what runs here, never
+what a consumer sends), Earnings (KMPLIFY Credits where the fabric reports them),
+Settings (the sharing settings `kmplify-node set` changes, editable; everything
+else with how to change it) and Logs (the newest lines, keys and tokens
+redacted). The fabric's view comes from the gateway's public `/fabric/nodes` list,
+where a node is named by the first 8 characters of its id; if the node cannot be
+matched there, the page says so.
+
+It is the one place the node listens, so it is locked down: it binds to
+127.0.0.1 only and refuses any other address; every request needs the random
+token in the link the node prints (32 bytes, new on every start); requests naming
+another host or coming from another site are refused and no CORS headers are
+sent; changes need the token in a header and a JSON body; page, script and style
+are compiled into the binary under a strict content security policy. The link is
+kept, owner-readable only, in `dashboard.url` in the node directory while the
+node runs, so `kmplify-node status` can show it again.
+
+**Windows: administrator rights.** Windows shows the BitLocker state of some
+drives only to administrators. A node started without them reports disk
+encryption as unknown (which counts as failing) and says exactly that; it never
+elevates itself. To see the result once, open PowerShell with "Run as
+administrator" and run `kmplify-node security check`. To have the node send it,
+start it from an elevated PowerShell, or at startup as a scheduled task with
+highest privileges:
+
+```powershell
+schtasks /Create /TN kmplify-node /SC ONSTART /RU SYSTEM /RL HIGHEST /TR "\"C:\Program Files\kmplify-node\kmplify-node.exe\" run --ui none --node-dir C:\ProgramData\kmplify-node"
+```
+
+A task running as SYSTEM uses the node directory you give it, so point
+`--node-dir` at the directory you want the node identity in. It cannot read your
+own screen lock setting; `kmplify-node security check` run as you shows it.
+
 ## The CLI
 
 One binary, seven commands. Everything an operator does to a node — preflight
@@ -322,7 +382,7 @@ so a machine with no desktop is no harder to run than one with a window.
 | `kmplify-node engines` | Scan localhost for inference engines; say which one is active. `--json`. |
 | `kmplify-node tui` | Terminal dashboard: watch **and control** the node. |
 | `kmplify-node check` | Preflight this host. Connects to nothing. `--json`, `--timeout SECS`. |
-| `kmplify-node status` | Is it serving right now, and how hard is the machine working. `--json`. |
+| `kmplify-node status` | Is it serving right now, what it shares, its trust level and the baseline checklist. `--json`. |
 | `kmplify-node set` | Change what this machine lends, durably and without a restart. |
 | `kmplify-node peers` | Who may use it — list, approve, deny, block, invite, revoke. `--json`. |
 | `kmplify-node rewards` | What this node delivered, and what an optional payout companion says. |
@@ -638,8 +698,9 @@ starts a node itself and quitting stops it. `--attach` insists on the first,
 
 The node publishes `status.json` in its node directory (owner-readable only)
 and accepts commands as files in `control/` there. That is how a dashboard in
-one process drives a node in another **without the node ever listening on a
-port** — the property this whole crate is built around. It also means the
+one process drives a node in another **without the node listening on a
+network port** — the property this whole crate is built around (the browser
+dashboard is the one, opt-in exception, on 127.0.0.1 only). It also means the
 dashboard must run as the user that owns that directory; for the systemd
 install that is `kmplify`:
 

@@ -795,6 +795,27 @@ impl Credentials {
     }
 }
 
+/// What a node with no language models says at connect, in plain words.
+pub fn no_models_line(cfg: &WorkerConfig) -> String {
+    let other = !cfg.workload_templates.is_empty()
+        || cfg.share_cpu
+        || cfg.functions.enabled
+        || cfg.vectors.enabled;
+    if other {
+        format!(
+            "info: no language models shared for chat (none found at {}); serverless apps \
+             and the other lanes are still offered",
+            cfg.ollama_base
+        )
+    } else {
+        format!(
+            "info: no language models shared for chat (none found at {}); this node is \
+             connected but has nothing to serve until the engine lists a model",
+            cfg.ollama_base
+        )
+    }
+}
+
 fn log(msg: impl std::fmt::Display) {
     let msg = msg.to_string();
     #[cfg(test)]
@@ -6153,7 +6174,10 @@ async fn session(
         (Vec::new(), std::collections::HashMap::new(), false)
     };
     if models.is_empty() && serving(cfg) {
-        log("no local models — connecting anyway; jobs will be refused by scheduler");
+        // Informational, not an error: the owner of a Windows PC read the
+        // old wording ("jobs will be refused by scheduler") as the reason
+        // the node did not work, while it was serving serverless apps.
+        log(no_models_line(cfg));
     }
     // The context window each model is SERVED with, where the engine says
     // (vLLM's max_model_len), so the fabric and its consumers can budget

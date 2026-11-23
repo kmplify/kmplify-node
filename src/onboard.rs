@@ -774,9 +774,19 @@ async fn walk(io: &Io, cfg: &WorkerConfig, dir: &std::path::Path) -> Result<i32,
         for e in &pf.errors {
             println!("   {} {e}", io.warn("problem:"));
         }
+        // Say plainly that setup STOPS here and why, so a problem line is
+        // not mistaken for a log line the wizard walked past.
+        println!();
         println!(
             "   {}",
-            io.dim("saved anyway — fix the above, then `kmplify-node check`")
+            io.warn("setup stops here: as configured, this node could not serve.")
+        );
+        println!(
+            "   {}",
+            io.dim(
+                "your answers are saved. Fix the problem above, then run `kmplify-node check`; \
+                 when it says ready, start the node with `kmplify-node`."
+            )
         );
         return Ok(1);
     }
