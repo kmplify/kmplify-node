@@ -17,8 +17,9 @@
 //! on macOS without restructuring the node, and a window that crashes
 //! takes nothing of the node with it.
 //!
-//! Beyond the contract it shows the LAN router (`crate::router`), which the
-//! web and terminal views get in the next step of the router port.
+//! The LAN router is a section of the contract like the others: the window
+//! renders `model["router"]` ([`crate::views::router_model`]) and edits the
+//! router's settings and key through [`crate::views::perform`].
 
 mod chart;
 mod icon;
@@ -49,7 +50,8 @@ pub const EXIT_NO_DISPLAY: i32 = 3;
 const REFRESH: Duration = Duration::from_millis(1000);
 const NOTICE_TTL: Duration = Duration::from_secs(8);
 
-/// The section beyond the contract.
+/// The router's section (part of the contract since the router port's
+/// phase 4; kept for callers that named it).
 pub const ROUTER_SECTION: (&str, &str) = ("router", "LAN router");
 
 /// Can a window open here at all? On Linux it needs an X11 or Wayland
@@ -100,6 +102,7 @@ pub fn run(node_dir: PathBuf, engine: String) -> i32 {
 enum Confirm {
     StopNode,
     StopSession(String),
+    NewKey,
 }
 
 /// The window's state between frames.
@@ -133,11 +136,7 @@ pub struct App {
 
 /// The ids of every section the window shows, in order.
 pub fn section_ids() -> Vec<&'static str> {
-    views::SECTIONS
-        .iter()
-        .map(|s| s.id)
-        .chain(std::iter::once(ROUTER_SECTION.0))
-        .collect()
+    views::SECTIONS.iter().map(|s| s.id).collect()
 }
 
 fn section_title(id: &str) -> &'static str {
@@ -201,6 +200,16 @@ fn os_name(os: &str) -> &str {
     }
 }
 
+/// The router modes as the views name them.
+fn mode_text(mode: &str) -> String {
+    match mode {
+        "off" => "Off".into(),
+        "local" => "This computer only".into(),
+        "lan" => "On the network".into(),
+        other => other.to_string(),
+    }
+}
+
 fn level_text(level: &str) -> String {
     match level {
         "trusted" => "Trusted".into(),
@@ -252,7 +261,17 @@ impl App {
 
     /// A window over a fixed model, for the tests.
     #[cfg(test)]
-    fn with_model(model: Value, router: Option<RouterState>) -> Self {
+    fn with_model(mut model: Value, router: Option<RouterState>) -> Self {
+        if router.is_some() {
+            model["router"] = views::router_model(
+                &views::RouterInput {
+                    state: router.clone(),
+                    key_fingerprint: String::new(),
+                },
+                &crate::settings::Settings::default(),
+                "",
+            );
+        }
         Self {
             node_dir: std::env::temp_dir(),
             engine: String::new(),
@@ -295,6 +314,7 @@ impl App {
             // model reads it from there.
             rechecking: false,
             view: shown.view.clone(),
+            router: views::RouterInput::read(&self.node_dir),
         });
         self.snap = snap;
         self.router = crate::router::read_published(&self.node_dir);
@@ -388,7 +408,7 @@ impl App {
                         "earnings" => self.earnings(ui, &m),
                         "settings" => self.settings(ui, &m),
                         "logs" => self.logs(ui, &m),
-                        _ => self.router_section(ui),
+                        _ => self.router_section(ui, &m),
                     });
             });
         self.confirm_dialog(ui.ctx());
@@ -1284,7 +1304,12 @@ impl App {
                                 egui::ComboBox::from_id_salt(("choice", key.clone()))
                                     .selected_text(v.clone())
                                     .show_ui(ui, |ui| {
-                                        for o in ["auto", "manual"] {
+                                        for o in x["options"]
+                                            .as_array()
+                                            .into_iter()
+                                            .flatten()
+                                            .filter_map(Value::as_str)
+                                        {
                                             ui.selectable_value(&mut v, o.to_string(), o);
                                         }
                                     });
@@ -1359,68 +1384,142 @@ impl App {
         }
     }
 
-    fn router_section(&mut self, ui: &mut egui::Ui) {
+    fn router_section(&mut self, ui: &mut egui::Ui, m: &Value) {
         let p = theme::palette(ui.ctx());
-        let state = self.router.clone().filter(|r| r.is_fresh());
-        let Some(r) = state.filter(|r| r.mode != crate::router::Mode::Off) else {
-            card(ui, "LAN router", |ui| {
-                ui.label("The router is off. Turned on, it shows the kmplify-nodes on your network side by side, with their hardware and live load, and gives local apps this node's report.");
-                ui.add_space(4.0);
-                ui.label(RichText::new("On this computer only").family(theme::semibold()));
-                ui.monospace("kmplify-node set router=local");
-                ui.label(RichText::new("On your network").family(theme::semibold()));
-                ui.monospace("kmplify-node set router=lan router-allow=192.168.1.0/24");
-                ui.monospace("kmplify-node router key      (on the first node)");
-                ui.monospace("kmplify-node router join     (on every other node)");
-                muted(ui, "Off until you choose. Local binds 127.0.0.1 only. LAN answers only the addresses on the allowlist, and only requests signed with the cluster key; the key never crosses the network.");
-            });
-            return;
-        };
+        let r = &m["router"];
+        let mode = txt(&r["mode"]);
+        let asked = txt(&r["asked"]);
+        let mut chosen: Option<Act> = None;
+        let allow_now = r["allow"]
+            .as_array()
+            .map(|a| a.iter().map(txt).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+        let fp = txt(&r["key_fingerprint"]);
         card(ui, "This router", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let tone = if mode == "off" {
+                    p.muted
+                } else if mode == asked {
+                    p.ok
+                } else {
+                    p.warn
+                };
+                pill(ui, &mode_text(&mode), tone);
+                ui.label(if r["running"].as_bool().unwrap_or(false) {
+                    "running"
+                } else if mode == "off" {
+                    "off until you choose"
+                } else {
+                    "not running here (the node is not running, or this build has no router)"
+                });
+            });
+            let problem = txt(&r["problem"]);
+            if !problem.is_empty() {
+                ui.label(RichText::new(problem).color(p.warn));
+            }
             kv(
                 ui,
                 "router",
                 &[
-                    (
-                        "Mode",
-                        format!("{} (asked: {})", r.mode.as_str(), r.asked.as_str()),
-                    ),
-                    ("Name", r.name.clone()),
+                    ("Asked for", mode_text(&asked)),
                     (
                         "Listening",
-                        if r.listening.is_empty() {
+                        if txt(&r["listening"]).is_empty() {
                             "no".into()
                         } else {
-                            r.listening.clone()
+                            txt(&r["listening"])
                         },
                     ),
                     (
-                        "Allowlist",
-                        if r.allow.is_empty() {
-                            "none: nothing on the network may connect".into()
+                        "Port",
+                        if mode == "off" {
+                            String::new()
                         } else {
-                            r.allow.join(", ")
+                            txt(&r["port"])
                         },
                     ),
-                    ("Cluster key", format!("fingerprint {}", r.key_fingerprint)),
-                    ("Discovery", r.discovery.clone()),
-                    ("Note", r.problem.clone()),
+                    ("Discovery", txt(&r["discovery"])),
+                    (
+                        "Cluster key",
+                        if fp.is_empty() {
+                            "none yet (made when the router is turned on)".into()
+                        } else {
+                            format!("fingerprint {fp}")
+                        },
+                    ),
                 ],
             );
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Mode").family(theme::semibold()));
+                for o in r["modes"].as_array().into_iter().flatten() {
+                    let o = txt(o);
+                    if ui.selectable_label(asked == o, mode_text(&o)).clicked() && asked != o {
+                        chosen = Some(Act::Setting {
+                            key: "router".into(),
+                            value: o,
+                        });
+                    }
+                }
+            });
+            for (key, label, now) in [
+                ("router-allow", "Allowlist", allow_now.clone()),
+                ("router-name", "Name", txt(&r["name"])),
+            ] {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(label).family(theme::semibold()));
+                    let draft = self
+                        .drafts
+                        .entry(key.to_string())
+                        .or_insert_with(|| now.clone());
+                    ui.add(egui::TextEdit::singleline(draft).desired_width(260.0));
+                    if ui.button("Save").clicked() {
+                        let value = self.drafts.remove(key).unwrap_or(now);
+                        chosen = Some(Act::Setting {
+                            key: key.into(),
+                            value,
+                        });
+                    }
+                });
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Cluster key").family(theme::semibold()));
+                let draft = self.drafts.entry("router-join".into()).or_default();
+                ui.add(
+                    egui::TextEdit::singleline(draft)
+                        .password(true)
+                        .hint_text("64 hexadecimal characters")
+                        .desired_width(260.0),
+                );
+                if ui.button("Join a cluster").clicked() {
+                    let key = self.drafts.remove("router-join").unwrap_or_default();
+                    chosen = Some(Act::RouterJoin(views::JoinKey(key.trim().to_string())));
+                }
+                if ui.button("New cluster key").clicked() {
+                    self.confirm = Some(Confirm::NewKey);
+                }
+            });
+            muted(ui, "Off until you choose. This computer only binds 127.0.0.1. On the network answers only the addresses on the allowlist (private, link-local or VPN ranges), and only requests signed with the cluster key; the key never crosses the network and is never shown here, only its fingerprint. Show it with kmplify-node router key on this computer.");
         });
         let wide = self.content_width > 860.0;
         let mut cards: Vec<NodeCard> = Vec::new();
-        if let Some(me) = &r.local {
+        let local: Option<crate::router::NodeReport> =
+            serde_json::from_value(r["local"].clone()).ok().flatten();
+        let local_meters: crate::router::Meters =
+            serde_json::from_value(r["local_meters"].clone()).unwrap_or_default();
+        if let Some(me) = local {
             cards.push((
                 format!("{} (this node)", me.name),
                 "online".into(),
                 p.ok,
-                Some(me.clone()),
-                r.local_meters.clone(),
+                Some(me),
+                local_meters,
                 String::new(),
             ));
         }
-        for peer in &r.peers {
+        let peers: Vec<crate::router::Peer> =
+            serde_json::from_value(r["peers"].clone()).unwrap_or_default();
+        for peer in &peers {
             let tone = match peer.state {
                 PeerState::Online => p.ok,
                 PeerState::Found => p.muted,
@@ -1436,18 +1535,20 @@ impl App {
                 peer.detail.clone(),
             ));
         }
-        if r.peers.is_empty() {
-            card(ui, "Other nodes", |ui| {
-                muted(
-                    ui,
-                    if r.mode == crate::router::Mode::Lan {
-                        "No other node announced itself yet. Nodes appear here when they run the router in LAN mode with this cluster key and an allowlist that includes this machine."
-                    } else {
-                        "Local mode: other nodes are not looked for. LAN mode finds them."
-                    },
-                );
-            });
-        }
+        card(ui, "Nodes on the network", |ui| {
+            muted(
+                ui,
+                if !peers.is_empty() {
+                    "The nodes this router found, with their hardware and the last minute of load."
+                } else if mode == "lan" {
+                    "No other node announced itself yet. Nodes appear here when they run the router in LAN mode with this cluster key and an allowlist that includes this machine."
+                } else if mode == "local" {
+                    "This computer only: other nodes are not looked for. On the network finds them."
+                } else {
+                    "The router is off. Turned on, it shows the kmplify-nodes on your network side by side, with their hardware and live load."
+                },
+            );
+        });
         let draw = |ui: &mut egui::Ui, c: &NodeCard| {
             node_card(ui, c);
         };
@@ -1465,10 +1566,20 @@ impl App {
             }
         }
         card(ui, "Router log", |ui| {
-            for l in r.log.iter().rev().take(20) {
-                ui.monospace(theme::glyph_safe(l));
+            let lines: Vec<String> = r["log"]
+                .as_array()
+                .map(|a| a.iter().rev().take(20).map(txt).collect())
+                .unwrap_or_default();
+            if lines.is_empty() {
+                muted(ui, "Nothing yet.");
+            }
+            for l in lines {
+                ui.monospace(theme::glyph_safe(&l));
             }
         });
+        if let Some(a) = chosen {
+            self.act(a);
+        }
     }
 
     fn confirm_dialog(&mut self, ctx: &egui::Context) {
@@ -1486,6 +1597,10 @@ impl App {
                     "Stop session {} and remove its container?",
                     &id[..12.min(id.len())]
                 ),
+            ),
+            Confirm::NewKey => (
+                "New cluster key",
+                "Make a new cluster key? Every other node must join again with it.".to_string(),
             ),
         };
         let mut answer: Option<bool> = None;
@@ -1511,6 +1626,7 @@ impl App {
                 match c {
                     Confirm::StopNode => self.act(Act::StopNode),
                     Confirm::StopSession(id) => self.act(Act::StopSession(id)),
+                    Confirm::NewKey => self.act(Act::RouterNewKey),
                 }
             }
             Some(false) => self.confirm = None,
@@ -1876,6 +1992,7 @@ pub fn empty_model() -> Value {
         logs: Vec::new(),
         rechecking: false,
         view: crate::control::ViewState::default(),
+        router: views::RouterInput::default(),
     });
     m["view"] = json!(crate::control::ViewState::default());
     m
@@ -2017,6 +2134,8 @@ mod tests {
                 "view_web" => "Act::View(\"web\"",
                 "view_app" => "Act::View(\"app\"",
                 "view_terminal" => "Act::View(\"terminal\"",
+                "router_new_key" => "Act::RouterNewKey",
+                "router_join" => "Act::RouterJoin(",
                 other => panic!("an action the window does not know: {other}"),
             };
             assert!(
@@ -2125,7 +2244,15 @@ mod tests {
     fn the_router_section_explains_how_to_turn_it_on_and_shows_peers() {
         let mut app = App::with_model(rich_model(), None);
         let texts = render(&mut app, "router", 1280.0).join("\n");
-        assert!(texts.contains("kmplify-node set router=local"), "{texts}");
+        assert!(texts.contains("The router is off"), "{texts}");
+        for control in [
+            "Off",
+            "This computer only",
+            "On the network",
+            "Join a cluster",
+        ] {
+            assert!(texts.contains(control), "{control} missing in:\n{texts}");
+        }
 
         let mut r = RouterState {
             mode: crate::router::Mode::Lan,
