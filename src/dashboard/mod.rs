@@ -379,6 +379,9 @@ pub async fn route(req: &Request, ctx: &Ctx, port: u16) -> Response {
         ("POST", "/api/report") => report(ctx),
         ("POST", "/api/shutdown") => command(ctx, crate::views::Act::StopNode),
         ("POST", "/api/view") => switch_view(ctx, &req.body),
+        ("POST", "/api/router/new-key") => act(ctx, crate::views::Act::RouterNewKey),
+        ("POST", "/api/router/join") => router_join(ctx, &req.body),
+        ("POST", "/api/link-code") => link_code(ctx, &req.body),
         (_, p) if p.starts_with("/api/") => Response::text(404, "no such call"),
         _ => Response::text(404, "not found"),
     }
@@ -393,6 +396,8 @@ fn act(ctx: &Ctx, act: crate::views::Act) -> Response {
         crate::views::Act::Report
             | crate::views::Act::Setting { .. }
             | crate::views::Act::SettingClear { .. }
+            | crate::views::Act::RouterNewKey
+            | crate::views::Act::RouterJoin(_)
     );
     let o = crate::views::perform(crate::views::Target::InProcess, &ctx.node_dir, &act);
     let mut body = json!({"ok": o.ok, "message": o.message});
@@ -439,6 +444,43 @@ fn switch_view(ctx: &Ctx, body: &[u8]) -> Response {
             &json!({"ok": false, "message": "view must be web, app or terminal"}),
         ),
     }
+}
+
+/// `/api/link-code {"nonce"?: challenge}`: a fresh link code from this
+/// node's credential ([`crate::link::for_credentials`]). The code is the
+/// answer and is never kept: it is not in `/api/state`, not in a log line.
+#[cfg(feature = "dashboard")]
+fn link_code(ctx: &Ctx, body: &[u8]) -> Response {
+    let nonce = body_str(body, "nonce");
+    let creds = crate::fabric_worker::default_creds_path(&ctx.node_dir);
+    match crate::link::for_credentials(&creds, nonce.as_deref()) {
+        Ok(c) => Response::json(
+            200,
+            &json!({
+                "ok": true,
+                "code": c.code,
+                "node_id": c.node_id,
+                "issued_at": c.issued_at,
+                "expires_at": c.expires_at,
+                "lines": crate::link::instructions(&c, nonce.is_some()),
+                "message": "link code made",
+            }),
+        ),
+        Err(e) => Response::json(409, &json!({"ok": false, "message": e})),
+    }
+}
+
+/// `/api/router/join {"key": "<64 hex>"}`. The key is handed to the action
+/// layer and stored; it is never logged nor echoed back.
+#[cfg(feature = "dashboard")]
+fn router_join(ctx: &Ctx, body: &[u8]) -> Response {
+    let Some(key) = body_str(body, "key") else {
+        return Response::json(400, &json!({"ok": false, "message": "no key"}));
+    };
+    act(
+        ctx,
+        crate::views::Act::RouterJoin(crate::views::JoinKey(key)),
+    )
 }
 
 #[cfg(feature = "dashboard")]
@@ -490,6 +532,7 @@ pub fn state(ctx: &Ctx) -> Value {
         logs: crate::status::logs(),
         rechecking: crate::security::rechecking(),
         view: crate::control::view_state(),
+        router: crate::views::RouterInput::read(&ctx.node_dir),
     })
 }
 
@@ -735,6 +778,43 @@ mod tests {
     }
 
     #[test]
+    fn a_link_code_is_made_from_the_credential_on_request() {
+        let dir = std::env::temp_dir().join(format!("kn-dash-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = Ctx {
+            token: T.into(),
+            node_dir: dir.clone(),
+            engine: String::new(),
+            gateway: String::new(),
+        };
+        // Not joined yet: said plainly, no code.
+        let r = link_code(&ctx, b"{}");
+        assert_eq!(r.status, 409);
+        let seed = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+        let node = "0b79ed9d11112222aaaabbbbcccc0000";
+        std::fs::write(
+            crate::fabric_worker::default_creds_path(&dir),
+            format!(
+                "{{\"node_id\":\"{node}\",\"token\":\"secret-token\",\"seed_hex\":\"{seed}\"}}"
+            ),
+        )
+        .unwrap();
+        let r = link_code(&ctx, br#"{"nonce":"chal_ABC-123"}"#);
+        assert_eq!(r.status, 200);
+        let v: Value = serde_json::from_slice(&r.body).unwrap();
+        let claim =
+            crate::link::decode(v["code"].as_str().unwrap(), crate::identity::now_s()).unwrap();
+        assert_eq!(claim.node_id, node);
+        assert_eq!(claim.nonce.as_deref(), Some("chal_ABC-123"));
+        // Neither the token nor the seed is in the answer.
+        let text = String::from_utf8_lossy(&r.body);
+        assert!(!text.contains("secret-token") && !text.contains(seed));
+        // And the code is never part of the state every view polls.
+        assert!(!state(&ctx).to_string().contains("kmplink1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_ui_mode_follows_the_setting_then_the_session() {
         assert_eq!(UiMode::resolve(None, true), Ok(UiMode::Gui));
         assert_eq!(UiMode::resolve(None, false), Ok(UiMode::Terminal));
@@ -772,6 +852,7 @@ mod tests {
             logs: Vec::new(),
             rechecking: false,
             view: crate::control::ViewState::default(),
+            router: crate::views::RouterInput::default(),
         });
         let setting_labels: Vec<String> = model["settings"]
             .as_array()

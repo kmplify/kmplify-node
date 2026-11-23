@@ -1,6 +1,6 @@
 [package]
 name = "kmplify-node"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2021"
 # What the dependency floor actually is, now that both lanes ship by default:
 # ratatui asks for 1.88 and wasmtime for 1.95. Claiming 1.77 while the tree
@@ -155,6 +155,7 @@ native-gui = ["dep:eframe"]
 # It enables nothing by itself: everything it names is always compiled. It
 # exists so an embedder states what it relies on, and so this crate can
 # never quietly move a piece of the provider behind another feature.
+# The surface includes `link::for_credentials` (link codes, KIP-1 `node-link`).
 provider-core = []
 
 # proc.rs: kernel settings by system call (sysctlbyname), never by starting

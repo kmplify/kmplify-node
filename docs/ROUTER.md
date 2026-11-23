@@ -6,7 +6,8 @@ router**. Its first phase is here; routing requests between the machines
 follows (see "What comes next").
 
 The **app window** is the node's native window: the same sections, figures
-and buttons as the web dashboard and the terminal view, plus the LAN router.
+and buttons as the web dashboard and the terminal view. The LAN router is one
+of those sections in all three views.
 
 ## The app window
 
@@ -58,6 +59,34 @@ The same settings exist as environment variables: `KMPLIFY_ROUTER`,
 `KMPLIFY_ROUTER_ALLOW`, `KMPLIFY_ROUTER_NAME`, and `KMPLIFY_ROUTER_PORT`
 (default 14418). A running node follows changes within a second.
 
+### In every view
+
+The **LAN router** section of the web dashboard, the terminal view (key `o`)
+and the app window shows the same three panels (This router, Nodes on the
+network, Router log) from one model (`views::router_model`) and changes the
+same things through one action layer (`views::perform`):
+
+| What | Web dashboard | Terminal view | App window |
+|---|---|---|---|
+| Mode off, local, lan | mode buttons | `M` cycles | mode buttons |
+| Allowlist | field, Save | `A` | field, Save |
+| Name | field, Save | `N` | field, Save |
+| Join a cluster | password field | `J` (typed masked) | password field |
+| New cluster key | button, asks first | `K`, asks first | button, asks first |
+
+The views show the key's **fingerprint** only. The key itself is shown by
+`kmplify-node router key` on the machine, never by a view, and a key typed
+into a view is stored and forgotten, never echoed or logged.
+
+### Embedding (kmplify-desktop)
+
+An application that embeds the router runs `router::run_with` and acts with
+`views::perform_with`, both with its own `router::KeyStore`: kmplify-desktop
+keeps the cluster key in its credentials store instead of `router.key`. Key
+format (64 hex characters) and fingerprint (the first 4 bytes of SHA-256 over
+`kmplify-router-v1/fingerprint/` and the key) are the same, so a desktop and
+a node join one cluster with the same key.
+
 ### Security model
 
 * **Off by default.** Nothing listens and nothing is announced until the
@@ -96,7 +125,6 @@ The same settings exist as environment variables: `KMPLIFY_ROUTER`,
    each request to the best placed node), over pinned-certificate mutual TLS
    after PIN pairing.
 2. Remote engine control for paired nodes.
-3. The router in the web dashboard and the terminal view, in KMPLIFY
-   Desktop, and as an installation admin view in the KMPLIFY web app.
+3. The router as an installation admin view in the KMPLIFY web app.
 
 The design adapts NVIDIA's Personal AI Router (Apache-2.0); see NOTICE.

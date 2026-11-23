@@ -184,6 +184,10 @@ enum View {
     /// The web dashboard's "Settings" tab: every setting, its value, where it
     /// comes from and how to change it. The editor is the Sharing view.
     Settings,
+    /// The LAN router: this router's mode, allowlist, name and key, the
+    /// nodes on the network, the router log. Same model as the web page and
+    /// the app window (`views::router_model`).
+    Router,
 }
 
 /// Something a spawned background call has to say: the gateway about peers,
@@ -215,6 +219,8 @@ enum Confirm {
     /// Revoking is permanent: the consumer holding this invitation loses the
     /// contract and cannot get it back.
     Revoke(String),
+    /// Every other node of the cluster has to join again.
+    NewKey,
 }
 
 impl Confirm {
@@ -231,6 +237,9 @@ impl Confirm {
                 "Revoke invitation {}? The consumer holding it loses access permanently.  [y/N]",
                 &id[..8.min(id.len())]
             ),
+            Confirm::NewKey => {
+                "Make a new cluster key? Every other node must join again with it.  [y/N]".into()
+            }
         }
     }
 }
@@ -284,6 +293,9 @@ struct App {
     /// The node's credential, for talking to the gateway as this node.
     creds_path: PathBuf,
     gateway: String,
+    /// The last link code made here (key L), shown on the earnings screen
+    /// until it expires. Never logged, never published.
+    link_code: Option<kmplify_node::link::LinkCode>,
     /// Last thing this dashboard did, shown in the footer.
     notice: String,
     notice_at: Instant,
@@ -318,6 +330,7 @@ impl App {
             } else {
                 kmplify_node::control::view_state()
             },
+            router: views::RouterInput::read(&self.node_dir),
         });
         // The running node's gateway is the authority: attached, this process
         // may have a different environment entirely, and asking the wrong
@@ -354,6 +367,20 @@ impl App {
     /// The first thing anyone is asked for when a node misbehaves is what its
     /// dashboard said; a screenshot of a terminal is a poor way to send that,
     /// and this is a file.
+    /// A fresh link code from this node's credential (the library call the
+    /// web dashboard and `kmplify-node link-code` make), shown on the
+    /// earnings screen.
+    fn make_link_code(&mut self) {
+        match kmplify_node::link::for_credentials(&self.creds_path, None) {
+            Ok(c) => {
+                self.link_code = Some(c);
+                self.view = View::Earnings;
+                self.say("link code made: valid for 10 minutes, once (earnings screen)");
+            }
+            Err(e) => self.say(e),
+        }
+    }
+
     fn write_snapshot(&mut self) {
         // The same report the web dashboard's "Save a report" writes.
         match views::write_report(&self.node_dir, &self.snap) {
@@ -386,7 +413,7 @@ impl App {
             View::Sessions => self.snap.sessions.len(),
             View::Models => self.snap.models.len(),
             // Scrolled text, not rows; the paragraph stops at its end.
-            View::Trust | View::Settings => 200,
+            View::Trust | View::Settings | View::Router => 200,
             _ => 0,
         }
     }
@@ -407,6 +434,7 @@ impl App {
                     match pending {
                         Confirm::Evict(id) => self.send(Command::StopSession(id)),
                         Confirm::Revoke(id) => self.revoke_invitation(id),
+                        Confirm::NewKey => self.router_act(views::Act::RouterNewKey),
                         // Standalone, this process IS the node and leaving
                         // the dashboard already tears it down; sending the
                         // command as well would ask the node to stop itself
@@ -441,6 +469,9 @@ impl App {
         if self.view == View::Peers && self.on_peers_key(key) {
             return;
         }
+        if self.view == View::Router && self.on_router_key(key) {
+            return;
+        }
 
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
@@ -471,9 +502,14 @@ impl App {
                 self.say("refreshed");
             }
             KeyCode::Char('w') => self.write_snapshot(),
+            KeyCode::Char('L') => self.make_link_code(),
             KeyCode::Char('8') | KeyCode::Char('n') => self.view = View::Trust,
             KeyCode::Char('9') | KeyCode::Char('$') => self.view = View::Earnings,
             KeyCode::Char('0') => self.view = View::Settings,
+            KeyCode::Char('o') => {
+                self.view = View::Router;
+                self.selected = 0;
+            }
             KeyCode::Char('R') => self.send(Command::Recheck),
             KeyCode::Char('b') => self.open_view("web"),
             KeyCode::Char('a') => self.open_view("app"),
@@ -631,6 +667,7 @@ fn new_app(
         peer_tx,
         creds_path,
         gateway,
+        link_code: None,
         snap,
         view: View::Home,
         selected: 0,
@@ -1023,6 +1060,7 @@ fn draw(f: &mut Frame, app: &App) {
         View::Trust => draw_trust(f, app, body),
         View::Earnings => draw_earnings(f, app, body),
         View::Settings => draw_settings(f, app, body),
+        View::Router => draw_router(f, app, body),
     }
     f.render_widget(footer_line(app), footer);
 
@@ -1046,6 +1084,7 @@ fn header_line(app: &App) -> Paragraph<'static> {
         View::Trust => "trusted node",
         View::Earnings => "earnings",
         View::Settings => "settings",
+        View::Router => "lan router",
     };
     Paragraph::new(Line::from(vec![
         Span::styled(" ◆ KMPLIFY", Style::new().fg(GPU_C).bold()),
@@ -1162,6 +1201,7 @@ fn view_colour(view: View) -> Color {
         View::Trust => Color::Green,
         View::Earnings => Color::Yellow,
         View::Settings => GPU_C,
+        View::Router => ACCENT,
     }
 }
 
@@ -1205,7 +1245,7 @@ fn footer_line(app: &App) -> Paragraph<'static> {
         )
     } else {
         format!(
-            " {quit}   1 overview 8 trusted 2 sessions 9 earnings 0 settings 4 log   {pause}  c reconnect  R re-check  b web  a app  x stop node  ? keys"
+            " {quit}   1 overview 8 trusted 2 sessions 9 earnings 0 settings 4 log o router   {pause}  c reconnect  R re-check  b web  a app  x stop node  ? keys"
         )
     };
     // The notice replaces the key hints for a few seconds after an action, so
@@ -1755,8 +1795,11 @@ fn help_text() -> String {
      c  reconnect now   ·   R  re-check now (security baseline)\n\
      e  stop session: the selected one (sessions view)\n\
      x  stop the node   ·   w  save a report (a text file)   ·   r refresh\n\
+     L  make a link code: links this machine to your account (earnings view)\n\
      b  web: the dashboard in the browser   ·   a  app window\n\
      5  change a setting   ·   d  use environment (in the editor)\n\
+     o  LAN router: M mode (off, local, lan)   ·   A allowlist   ·   N name\n\
+     K  new cluster key   ·   J  join a cluster (the key is typed, never shown)\n\
      q  leave: back to the console when the node runs here as a view,\n\
         otherwise stops the node only if it started here\n\
      \n\
@@ -2261,6 +2304,23 @@ impl App {
                 if k == "invite-label" {
                     self.mint_invitation(value);
                     return;
+                }
+                // The router's fields apply at once, through the action
+                // layer every view shares; the join key is handed over and
+                // dropped, never kept in a draft or shown.
+                match k {
+                    "router-allow" | "router-name" => {
+                        self.router_act(views::Act::Setting {
+                            key: k.to_string(),
+                            value,
+                        });
+                        return;
+                    }
+                    "router-join" => {
+                        self.router_act(views::Act::RouterJoin(views::JoinKey(value)));
+                        return;
+                    }
+                    _ => {}
                 }
                 match self.draft.set(k, &value) {
                     Ok(()) => self.say(format!("{k} set — s applies it")),
@@ -3598,7 +3658,38 @@ fn draw_trust(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// The link code panel of the earnings screen: the code made with L, or how
+/// to make one.
+fn draw_link_code(f: &mut Frame, app: &App, area: Rect) {
+    let now = kmplify_node::identity::now_s();
+    let lines = match app.link_code.as_ref() {
+        Some(c) if c.expires_at > now => {
+            let mut l = vec![Line::styled(c.code.clone(), Style::new().fg(Color::White).bold())];
+            l.extend(
+                kmplify_node::link::instructions(c, false)
+                    .into_iter()
+                    .map(|t| Line::styled(t, Style::new().fg(MUTED))),
+            );
+            l
+        }
+        Some(_) => vec![Line::raw("That code has expired. Press L for a new one.")],
+        None => vec![
+            Line::raw("Links this machine to your KMPLIFY account, so the marketplace shows your @alias on its card."),
+            Line::styled("Press L to make a link code (valid for 10 minutes, once; no personal data). Same as kmplify-node link-code.", Style::new().fg(MUTED)),
+            Line::styled("A code made here is not bound to an account: whoever has it within 10 minutes can redeem it. Binding is recommended: KMPLIFY Desktop, or kmplify-node link-code --nonce CHALLENGE.", Style::new().fg(MUTED)),
+        ],
+    };
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(panel("link code  (L)")),
+        area,
+    );
+}
+
 fn draw_earnings(f: &mut Frame, app: &App, area: Rect) {
+    let [area, link] = Layout::vertical([Constraint::Min(6), Constraint::Length(11)]).areas(area);
+    draw_link_code(f, app, link);
     let e = &app.model["earnings"];
     if e["enabled"].as_bool() != Some(true) {
         let d = &app.model["delivered"];
@@ -3732,6 +3823,332 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+// ------------------------------------------------------------------ router
+
+impl App {
+    /// The router screen's own keys. Capitals, so none of them shadows a
+    /// global key. `true` when the key was consumed here.
+    fn on_router_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('M') => {
+                let asked = s_of(&self.model["router"], "asked").to_string();
+                let modes = views::ROUTER_MODES;
+                let at = modes.iter().position(|m| *m == asked).unwrap_or(0);
+                let next = modes[(at + 1) % modes.len()];
+                self.router_act(views::Act::Setting {
+                    key: "router".into(),
+                    value: next.into(),
+                });
+            }
+            KeyCode::Char('A') => {
+                let now = self.model["router"]["allow"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_default();
+                self.editing = Some(Editing {
+                    key: "router-allow",
+                    label: "Allowlist: private, link-local or VPN ranges, comma separated",
+                    buffer: now,
+                    masked: false,
+                });
+            }
+            KeyCode::Char('N') => {
+                self.editing = Some(Editing {
+                    key: "router-name",
+                    label: "Router name: 1 to 40 letters, digits, - or _",
+                    buffer: s_of(&self.model["router"], "name").to_string(),
+                    masked: false,
+                });
+            }
+            KeyCode::Char('K') => self.confirm = Some(Confirm::NewKey),
+            KeyCode::Char('J') => {
+                self.editing = Some(Editing {
+                    key: "router-join",
+                    label: "Cluster key from kmplify-node router key on the other node",
+                    buffer: String::new(),
+                    masked: true,
+                });
+            }
+            KeyCode::Esc => self.view = View::Home,
+            _ => return false,
+        }
+        true
+    }
+
+    /// A router action through the action layer every view shares.
+    fn router_act(&mut self, act: views::Act) {
+        let target = if self.attached() {
+            views::Target::Attached
+        } else {
+            views::Target::InProcess
+        };
+        let o = views::perform(target, &self.node_dir, &act);
+        self.say(o.message);
+        self.refresh();
+    }
+}
+
+fn pct_bar(label: &str, pct: Option<f64>) -> Line<'static> {
+    let Some(p) = pct else {
+        return Line::from(vec![
+            Span::styled(format!("  {label:<4}"), Style::new().fg(MUTED)),
+            Span::styled("not reported", Style::new().fg(MUTED)),
+        ]);
+    };
+    let p = p.clamp(0.0, 100.0);
+    let cells = (p as usize * BAR_WIDTH / 100).min(BAR_WIDTH);
+    Line::from(vec![
+        Span::styled(format!("  {label:<4}"), Style::new().fg(MUTED)),
+        Span::styled("█".repeat(cells), Style::new().fg(ACCENT)),
+        Span::styled("·".repeat(BAR_WIDTH - cells), Style::new().fg(MUTED)),
+        Span::raw(format!(" {:>3.0}%", p)),
+    ])
+}
+
+fn node_lines(
+    title: String,
+    state: &str,
+    colour: Color,
+    report: &Value,
+    detail: &str,
+) -> Vec<Line<'static>> {
+    let mut out = vec![Line::from(vec![
+        Span::styled(title, Style::new().fg(Color::White).bold()),
+        Span::raw("  "),
+        Span::styled(state.to_string(), Style::new().fg(colour).bold()),
+    ])];
+    if !detail.is_empty() {
+        out.push(Line::styled(format!("  {detail}"), Style::new().fg(MUTED)));
+    }
+    if report.is_null() {
+        out.push(Line::styled("  no report yet", Style::new().fg(MUTED)));
+        return out;
+    }
+    let gpu = if s_of(report, "gpu_name").is_empty() {
+        s_of(report, "accelerator").to_string()
+    } else {
+        format!(
+            "{} ({} GB)",
+            s_of(report, "gpu_name"),
+            report["vram_total_mb"].as_u64().unwrap_or(0) / 1024
+        )
+    };
+    out.push(Line::from(vec![
+        Span::raw("  "),
+        field("gpu"),
+        Span::raw(gpu),
+        sep(),
+        Span::raw(format!(
+            "{} threads, {} GB RAM",
+            report["cpus"].as_f64().unwrap_or(0.0),
+            report["ram_total_mb"].as_u64().unwrap_or(0) / 1024
+        )),
+    ]));
+    let models: Vec<&str> = report["models"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    out.push(Line::from(vec![
+        Span::raw("  "),
+        field("fabric"),
+        Span::raw(s_of(report, "link").to_lowercase()),
+        sep(),
+        Span::raw(format!(
+            "{} running, {} done",
+            report["jobs_active"].as_u64().unwrap_or(0),
+            report["jobs_done"].as_u64().unwrap_or(0)
+        )),
+        sep(),
+        Span::raw(if models.is_empty() {
+            "no models".to_string()
+        } else {
+            models.join(", ")
+        }),
+    ]));
+    let ram = match (
+        report["ram_used_mb"].as_f64(),
+        report["ram_total_mb"].as_f64(),
+    ) {
+        (Some(u), Some(t)) if t > 0.0 => Some(100.0 * u / t),
+        _ => None,
+    };
+    out.push(pct_bar("cpu", report["cpu_percent"].as_f64()));
+    out.push(pct_bar("ram", ram));
+    out.push(pct_bar("gpu", report["gpu_percent"].as_f64()));
+    out
+}
+
+fn draw_router(f: &mut Frame, app: &App, area: Rect) {
+    let r = &app.model["router"];
+    let mode = s_of(r, "mode");
+    let asked = s_of(r, "asked");
+    let mut me = vec![Line::from(vec![
+        field("mode"),
+        Span::styled(
+            mode.to_string(),
+            Style::new()
+                .fg(if mode == "off" {
+                    MUTED
+                } else if mode == asked {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                })
+                .bold(),
+        ),
+        Span::styled(format!("  (asked: {asked})"), Style::new().fg(MUTED)),
+        sep(),
+        Span::raw(if r["running"].as_bool() == Some(true) {
+            "running"
+        } else if mode == "off" {
+            "off until you choose"
+        } else {
+            "not running here"
+        }),
+    ])];
+    if !s_of(r, "problem").is_empty() {
+        me.push(Line::styled(
+            format!("note      {}", s_of(r, "problem")),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
+    let allow: Vec<&str> = r["allow"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let fp = s_of(r, "key_fingerprint");
+    for (k, v) in [
+        ("name", s_of(r, "name").to_string()),
+        (
+            "allowlist",
+            if allow.is_empty() {
+                "none: nothing on the network may connect".into()
+            } else {
+                allow.join(", ")
+            },
+        ),
+        (
+            "listening",
+            if s_of(r, "listening").is_empty() {
+                "no".into()
+            } else {
+                s_of(r, "listening").to_string()
+            },
+        ),
+        ("discovery", s_of(r, "discovery").to_string()),
+        (
+            "key",
+            if fp.is_empty() {
+                "none yet (made when the router is turned on)".into()
+            } else {
+                format!("fingerprint {fp}")
+            },
+        ),
+    ] {
+        me.push(Line::from(vec![field(k), Span::raw(v)]));
+    }
+    me.push(Line::styled(
+        "M mode · A allowlist · N name · K new cluster key · J join a cluster",
+        Style::new().fg(ACCENT),
+    ));
+    let mut nodes: Vec<Line> = Vec::new();
+    if !r["local"].is_null() {
+        nodes.extend(node_lines(
+            format!("{} (this node)", s_of(&r["local"], "name")),
+            "online",
+            Color::Green,
+            &r["local"],
+            "",
+        ));
+    }
+    let peers = r["peers"].as_array().cloned().unwrap_or_default();
+    for p in &peers {
+        let colour = match s_of(p, "state") {
+            "online" => Color::Green,
+            "found" => MUTED,
+            "unreachable" => Color::Yellow,
+            _ => Color::Red,
+        };
+        nodes.push(Line::raw(""));
+        nodes.extend(node_lines(
+            format!("{} {}", s_of(p, "name"), s_of(p, "address")),
+            s_of(p, "state_label"),
+            colour,
+            &p["report"],
+            s_of(p, "detail"),
+        ));
+    }
+    if peers.is_empty() {
+        nodes.push(Line::styled(
+            match mode {
+                "lan" => "No other node announced itself yet: they appear when they run the router in LAN mode with this cluster key and an allowlist that includes this machine.",
+                "local" => "This computer only: other nodes are not looked for. LAN mode finds them.",
+                _ => "The router is off. Turned on (M), it shows the kmplify-nodes on your network side by side, with their hardware and live load.",
+            },
+            Style::new().fg(MUTED),
+        ));
+    }
+    let log: Vec<Line> = r["log"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .rev()
+                .take(12)
+                .filter_map(Value::as_str)
+                .map(|l| Line::raw(l.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let me_h = (me.len() as u16 + 2).min(area.height / 2);
+    let [top, mid, bottom] = Layout::vertical([
+        Constraint::Length(me_h),
+        Constraint::Min(6),
+        Constraint::Length(8),
+    ])
+    .areas(area);
+    f.render_widget(
+        Paragraph::new(me)
+            .wrap(Wrap { trim: true })
+            .block(panel("this router")),
+        top,
+    );
+    f.render_widget(
+        Paragraph::new(nodes)
+            .wrap(Wrap { trim: true })
+            .scroll((app.selected as u16, 0))
+            .block(panel("nodes on the network  (↑/↓ scroll)")),
+        mid,
+    );
+    let edit = app.editing.as_ref().map(|e| {
+        Line::from(vec![
+            Span::styled(format!("{}: ", e.label), Style::new().fg(MUTED)),
+            Span::styled(
+                if e.masked {
+                    "•".repeat(e.buffer.chars().count())
+                } else {
+                    e.buffer.clone()
+                },
+                Style::new().fg(Color::Yellow).bold(),
+            ),
+            Span::styled("_   enter saves · esc cancels", Style::new().fg(MUTED)),
+        ])
+    });
+    let mut bottom_lines: Vec<Line> = edit.into_iter().collect();
+    if bottom_lines.is_empty() && log.is_empty() {
+        bottom_lines.push(Line::styled("nothing yet", Style::new().fg(MUTED)));
+    }
+    bottom_lines.extend(log);
+    f.render_widget(
+        Paragraph::new(bottom_lines).block(panel("router log")),
+        bottom,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3758,6 +4175,7 @@ mod tests {
             peer_tx: tokio::sync::mpsc::unbounded_channel().0,
             creds_path: std::env::temp_dir().join("fabric_node.json"),
             gateway: "https://gw.example".into(),
+            link_code: None,
             snap: Snapshot::default(),
             view: View::Home,
             selected: 0,
@@ -3799,6 +4217,7 @@ mod tests {
             "earnings" => View::Earnings,
             "settings" => View::Settings,
             "logs" => View::Logs,
+            "router" => View::Router,
             other => panic!("section {other} has no terminal screen"),
         }
     }
@@ -3856,6 +4275,33 @@ mod tests {
                 act.id
             );
         }
+    }
+
+    #[test]
+    fn l_makes_a_link_code_and_the_earnings_screen_shows_it() {
+        let dir = std::env::temp_dir().join(format!("kn-tui-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = app();
+        a.creds_path = dir.join("fabric_node.json");
+        // No credential yet: says why, shows how.
+        press(&mut a, 'L');
+        assert!(a.link_code.is_none());
+        assert!(a.notice.contains("not joined"), "{}", a.notice);
+        std::fs::write(
+            &a.creds_path,
+            "{\"node_id\":\"0b79ed9d11112222aaaabbbbcccc0000\",\"token\":\"t\",\
+             \"seed_hex\":\"9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60\"}",
+        )
+        .unwrap();
+        press(&mut a, 'L');
+        assert!(a.view == View::Earnings);
+        let code = a.link_code.clone().unwrap().code;
+        a.refresh();
+        let text = screen(&mut a, View::Earnings);
+        // The code is long and wraps: its first characters are on screen.
+        assert!(text.contains(&code[..60].to_lowercase()), "{text}");
+        assert!(text.contains("settings > peer compute > link code"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4387,5 +4833,76 @@ mod tests {
         assert_eq!(human(Duration::from_secs(600)), "10m");
         assert_eq!(human(Duration::from_secs(7_260)), "2h 1m");
         assert_eq!(human(Duration::from_secs(180_000)), "2d 2h");
+    }
+
+    /// The router screen edits the same settings and key as the web page
+    /// and the window: M cycles the mode, A and N edit, J takes a key that
+    /// is never drawn, K asks first.
+    #[test]
+    fn the_router_screen_edits_mode_allowlist_name_and_key() {
+        let dir = std::env::temp_dir().join(format!("kn-tui-router-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = app();
+        a.node_dir = dir.clone();
+        a.refresh();
+        press(&mut a, 'o');
+        assert!(a.view == View::Router);
+        press(&mut a, 'M');
+        assert_eq!(Settings::load(&dir).router.as_deref(), Some("local"));
+        press(&mut a, 'M');
+        assert_eq!(Settings::load(&dir).router.as_deref(), Some("lan"));
+        press(&mut a, 'A');
+        assert!(a.editing.is_some());
+        for c in "192.168.1.0/24".chars() {
+            press(&mut a, c);
+        }
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            Settings::load(&dir).router_allow,
+            Some(vec!["192.168.1.0/24".to_string()])
+        );
+        press(&mut a, 'N');
+        a.editing.as_mut().unwrap().buffer = "attic".into();
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(Settings::load(&dir).router_name.as_deref(), Some("attic"));
+        // Join: typed masked, never on screen.
+        let key = "ef".repeat(32);
+        press(&mut a, 'J');
+        assert!(a.editing.as_ref().unwrap().masked);
+        for c in key.chars() {
+            press(&mut a, c);
+        }
+        let text = screen(&mut a, View::Router);
+        assert!(!text.contains(&key), "the key was drawn");
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            kmplify_node::router::KeyStore::load(&kmplify_node::router::FileKeyStore::new(&dir))
+                .unwrap()
+                .map(|k| k.reveal()),
+            Some(key.clone())
+        );
+        let text = screen(&mut a, View::Router);
+        assert!(text.contains("fingerprint"), "{text}");
+        assert!(!text.contains(&key));
+        // A new key needs a yes.
+        press(&mut a, 'K');
+        assert!(a.confirm.is_some());
+        press(&mut a, 'n');
+        assert_eq!(
+            kmplify_node::router::KeyStore::load(&kmplify_node::router::FileKeyStore::new(&dir))
+                .unwrap()
+                .map(|k| k.reveal()),
+            Some(key.clone())
+        );
+        press(&mut a, 'K');
+        press(&mut a, 'y');
+        assert_ne!(
+            kmplify_node::router::KeyStore::load(&kmplify_node::router::FileKeyStore::new(&dir))
+                .unwrap()
+                .map(|k| k.reveal()),
+            Some(key)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

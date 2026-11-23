@@ -18,8 +18,9 @@
 //!   on each side (`tests` in `dashboard` for the web page, in the binary's
 //!   `tui` for the terminal) fails when a view drops one of them.
 //!
-//! The same table is the contract for the native window that will replace
-//! the interim app window, and for the provider view of kmplify-desktop.
+//! The same table is the contract for the native window (`src/native`) and
+//! for kmplify-desktop, which embeds the router and renders the `router`
+//! section from [`router_model`] with its own key store ([`perform_with`]).
 
 use std::path::{Path, PathBuf};
 
@@ -67,6 +68,11 @@ pub const SECTIONS: &[Section] = &[
         id: "logs",
         title: "Logs",
         tui_keys: "4 l",
+    },
+    Section {
+        id: "router",
+        title: "LAN router",
+        tui_keys: "o",
     },
 ];
 
@@ -169,6 +175,11 @@ pub const METRICS: &[Metric] = &[
         terminal_form: "",
     },
     Metric {
+        section: "earnings",
+        label: "Link code",
+        terminal_form: "",
+    },
+    Metric {
         section: "settings",
         label: "Settings",
         terminal_form: "",
@@ -181,6 +192,21 @@ pub const METRICS: &[Metric] = &[
     Metric {
         section: "logs",
         label: "Last log lines",
+        terminal_form: "",
+    },
+    Metric {
+        section: "router",
+        label: "This router",
+        terminal_form: "",
+    },
+    Metric {
+        section: "router",
+        label: "Nodes on the network",
+        terminal_form: "a text bar per meter instead of the one-minute charts",
+    },
+    Metric {
+        section: "router",
+        label: "Router log",
         terminal_form: "",
     },
 ];
@@ -240,6 +266,12 @@ pub const ACTIONS: &[Action] = &[
         tui_key: "e",
     },
     Action {
+        id: "link_code",
+        label: "Make a link code",
+        web: "/api/link-code",
+        tui_key: "L",
+    },
+    Action {
         id: "report",
         label: "Save a report",
         web: "/api/report",
@@ -269,7 +301,26 @@ pub const ACTIONS: &[Action] = &[
         web: "/api/view",
         tui_key: "(this view)",
     },
+    Action {
+        id: "router_new_key",
+        label: "New cluster key",
+        web: "/api/router/new-key",
+        tui_key: "K",
+    },
+    Action {
+        id: "router_join",
+        label: "Join a cluster",
+        web: "/api/router/join",
+        tui_key: "J",
+    },
 ];
+
+/// The router settings every view edits in its `router` section (mode,
+/// allowlist, name), through the same [`Act::Setting`] as the rest.
+pub const ROUTER_SETTINGS: &[&str] = &["router", "router-allow", "router-name"];
+
+/// The modes a view offers for the `router` setting, in this order.
+pub const ROUTER_MODES: &[&str] = &["off", "local", "lan"];
 
 /// What the terminal view has beyond this table, and the web page does not
 /// yet: listed so nobody mistakes them for parity.
@@ -339,6 +390,33 @@ pub struct Source<'a> {
     /// A security check runs now.
     pub rechecking: bool,
     pub view: crate::control::ViewState,
+    /// What the views know of the LAN router.
+    pub router: RouterInput,
+}
+
+/// What a view knows of the LAN router: what a running router last
+/// published (`router.json`, only while fresh) and the fingerprint of the
+/// cluster key from wherever this node keeps it.
+#[derive(Clone, Debug, Default)]
+pub struct RouterInput {
+    pub state: Option<crate::router::RouterState>,
+    pub key_fingerprint: String,
+}
+
+impl RouterInput {
+    /// For a node: `router.json` and `router.key` in `node_dir`.
+    pub fn read(node_dir: &Path) -> Self {
+        Self::read_with(node_dir, &crate::router::FileKeyStore::new(node_dir))
+    }
+
+    /// For an application that keeps the key elsewhere (kmplify-desktop).
+    pub fn read_with(node_dir: &Path, keys: &dyn crate::router::KeyStore) -> Self {
+        Self {
+            state: crate::router::read_published(node_dir)
+                .filter(crate::router::RouterState::is_fresh),
+            key_fingerprint: crate::router::key::fingerprint_of(keys),
+        }
+    }
 }
 
 /// The settings the views may change. Each is one the node already applies
@@ -354,6 +432,9 @@ pub const EDITABLE: &[&str] = &[
     "max-vram-mb",
     "max-ram-mb",
     "max-disk-gb",
+    "router",
+    "router-allow",
+    "router-name",
 ];
 
 fn env_value(key: &str) -> Option<String> {
@@ -409,6 +490,11 @@ pub fn model(src: &Source) -> Value {
         v["how"] = json!(how);
         v
     };
+    // A choice carries its options, so no view hard-codes them.
+    let with_options = |mut v: Value, options: &[&str]| {
+        v["options"] = json!(options);
+        v
+    };
     let settings: Vec<Value> = vec![
         setting(
             "share-inference",
@@ -437,14 +523,17 @@ pub fn model(src: &Source) -> Value {
             "text",
             "PROVIDER_WORKLOADS",
         ),
-        setting(
-            "approval-mode",
-            "Admission of new consumers",
-            json!(snap.approval_mode),
-            json!(b.approval_mode),
-            stored.approval_mode.is_some(),
-            "choice",
-            "PROVIDER_APPROVAL_MODE",
+        with_options(
+            setting(
+                "approval-mode",
+                "Admission of new consumers",
+                json!(snap.approval_mode),
+                json!(b.approval_mode),
+                stored.approval_mode.is_some(),
+                "choice",
+                "PROVIDER_APPROVAL_MODE",
+            ),
+            &["auto", "manual"],
         ),
         setting(
             "country",
@@ -539,22 +628,25 @@ pub fn model(src: &Source) -> Value {
             ),
             "kmplify-node set share-vectors=true",
         ),
-        with_how(
-            setting(
-                "router",
-                "LAN router (off, local or lan)",
-                json!(stored
-                    .router
-                    .clone()
-                    .or_else(|| env_value("KMPLIFY_ROUTER"))
-                    .unwrap_or_else(|| "off".into())),
-                Value::Null,
-                stored.router.is_some(),
-                "text",
-                "KMPLIFY_ROUTER",
+        with_options(
+            with_how(
+                setting(
+                    "router",
+                    "LAN router (off, local or lan)",
+                    json!(stored
+                        .router
+                        .clone()
+                        .or_else(|| env_value("KMPLIFY_ROUTER"))
+                        .unwrap_or_else(|| "off".into())),
+                    Value::Null,
+                    stored.router.is_some(),
+                    "choice",
+                    "KMPLIFY_ROUTER",
+                ),
+                "kmplify-node set router=local (this computer only) or router=lan (the network: \
+                 needs router-allow and the cluster key, see kmplify-node router)",
             ),
-            "kmplify-node set router=local (this computer only) or router=lan (the network: \
-             needs router-allow and the cluster key, see kmplify-node router)",
+            ROUTER_MODES,
         ),
         with_how(
             setting(
@@ -572,6 +664,23 @@ pub fn model(src: &Source) -> Value {
                 "KMPLIFY_ROUTER_ALLOW",
             ),
             "kmplify-node set router-allow=192.168.1.0/24 (private, link-local or VPN ranges only)",
+        ),
+        with_how(
+            setting(
+                "router-name",
+                "LAN router name",
+                json!(stored
+                    .router_name
+                    .clone()
+                    .or_else(|| env_value("KMPLIFY_ROUTER_NAME"))
+                    .unwrap_or_default()),
+                Value::Null,
+                stored.router_name.is_some(),
+                "text",
+                "KMPLIFY_ROUTER_NAME",
+            ),
+            "kmplify-node set router-name=studio (1 to 40 letters, digits, - or _; by default \
+             node- and the start of the node id, never the computer's name)",
         ),
         with_how(
             setting(
@@ -679,7 +788,67 @@ pub fn model(src: &Source) -> Value {
         "settings": settings,
         "view": src.view,
         "logs": logs,
+        "router": router_model(&src.router, stored, &snap.node_id),
     })
+}
+
+/// The `router` block every view renders: the router's state as it runs,
+/// or, while none runs, as its settings would start it. No secret: the
+/// key's fingerprint, never the key; log lines redacted like the node's.
+pub fn router_model(input: &RouterInput, stored: &Settings, node_id: &str) -> Value {
+    let has_key = !input.key_fingerprint.is_empty();
+    let cfg = crate::router::Config::resolve(stored, node_id, has_key);
+    let built = cfg!(feature = "router");
+    let modes = ROUTER_MODES;
+    match &input.state {
+        Some(r) => {
+            let peers: Vec<Value> = r
+                .peers
+                .iter()
+                .map(|p| {
+                    let mut v = json!(p);
+                    v["state_label"] = json!(p.state.label());
+                    v
+                })
+                .collect();
+            json!({
+                "built": built,
+                "running": true,
+                "asked": r.asked.as_str(),
+                "mode": r.mode.as_str(),
+                "problem": r.problem,
+                "port": r.port,
+                "listening": r.listening,
+                "allow": r.allow,
+                "name": r.name,
+                "key_fingerprint": if r.key_fingerprint.is_empty() { &input.key_fingerprint } else { &r.key_fingerprint },
+                "discovery": r.discovery,
+                "local": r.local,
+                "local_meters": r.local_meters,
+                "peers": peers,
+                "log": r.log.iter().map(|l| crate::trust::redact(l)).collect::<Vec<_>>(),
+                "modes": modes,
+            })
+        }
+        None => json!({
+            "built": built,
+            "running": false,
+            "asked": cfg.asked.as_str(),
+            "mode": cfg.mode.as_str(),
+            "problem": cfg.problem,
+            "port": cfg.port,
+            "listening": "",
+            "allow": cfg.allow_text,
+            "name": cfg.name,
+            "key_fingerprint": input.key_fingerprint,
+            "discovery": if cfg.mode == crate::router::Mode::Lan { "starting" } else { "off (LAN mode only)" },
+            "local": Value::Null,
+            "local_meters": crate::router::Meters::default(),
+            "peers": [],
+            "log": [],
+            "modes": modes,
+        }),
+    }
 }
 
 /// Apply the fields an editor changed (`draft` against the `saved` it
@@ -747,6 +916,28 @@ pub enum Act {
     StopNode,
     /// `web`, `app` or `terminal`.
     View(String),
+    /// Replace the cluster key with a new one (every other node joins
+    /// again).
+    RouterNewKey,
+    /// Take the cluster key another node shows (`kmplify-node router key`).
+    RouterJoin(JoinKey),
+    /// A fresh link code from this node's credential, bound to an account
+    /// when `nonce` carries that account's challenge. The code is in the
+    /// outcome's message only; it is never stored or logged.
+    LinkCode {
+        nonce: Option<String>,
+    },
+}
+
+/// A cluster key typed into a view. Never printed: its `Debug` says only
+/// that it is there.
+#[derive(Clone, PartialEq, Eq)]
+pub struct JoinKey(pub String);
+
+impl std::fmt::Debug for JoinKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("JoinKey(..)")
+    }
 }
 
 impl Act {
@@ -767,6 +958,9 @@ impl Act {
                 "app" => "view_app",
                 _ => "view_terminal",
             },
+            Act::RouterNewKey => "router_new_key",
+            Act::RouterJoin(_) => "router_join",
+            Act::LinkCode { .. } => "link_code",
         }
     }
 }
@@ -821,6 +1015,22 @@ fn command(target: Target, node_dir: &Path, cmd: crate::control::Command) -> Out
 /// Carry out `act` on the node `target` names, whose directory is
 /// `node_dir`. The one implementation behind every view's controls.
 pub fn perform(target: Target, node_dir: &Path, act: &Act) -> Outcome {
+    perform_with(
+        target,
+        node_dir,
+        act,
+        &crate::router::FileKeyStore::new(node_dir),
+    )
+}
+
+/// [`perform`], with the cluster key in `keys` instead of `router.key`
+/// (kmplify-desktop keeps it in its own credentials store).
+pub fn perform_with(
+    target: Target,
+    node_dir: &Path,
+    act: &Act,
+    keys: &dyn crate::router::KeyStore,
+) -> Outcome {
     use crate::control::Command;
     let snapshot = || match target {
         Target::InProcess => crate::status::snapshot(),
@@ -855,6 +1065,54 @@ pub fn perform(target: Target, node_dir: &Path, act: &Act) -> Outcome {
         },
         Act::Setting { key, value } => change_setting(target, node_dir, key, Some(value)),
         Act::SettingClear { key } => change_setting(target, node_dir, key, None),
+        Act::RouterNewKey => {
+            let key = crate::router::ClusterKey::generate();
+            match keys.save(&key) {
+                Ok(()) => Outcome::ok(
+                    200,
+                    format!(
+                        "new cluster key, fingerprint {}. Every other node must join again \
+                         with it (kmplify-node router key shows it).",
+                        key.fingerprint()
+                    ),
+                ),
+                Err(e) => Outcome::fail(500, e),
+            }
+        }
+        Act::LinkCode { nonce } => {
+            let creds = crate::fabric_worker::default_creds_path(node_dir);
+            match crate::link::for_credentials(&creds, nonce.as_deref()) {
+                Ok(c) => {
+                    let mut lines = crate::link::instructions(&c, nonce.is_some());
+                    lines.push(c.code);
+                    Outcome::ok(200, lines.join("\n"))
+                }
+                Err(e) => Outcome::fail(409, e),
+            }
+        }
+        Act::RouterJoin(JoinKey(text)) => {
+            let key = match crate::router::ClusterKey::parse(text) {
+                Ok(k) => k,
+                Err(e) => return Outcome::fail(400, e),
+            };
+            if keys.load().ok().flatten().as_ref() == Some(&key) {
+                return Outcome::ok(
+                    200,
+                    format!("this node already holds that key ({})", key.fingerprint()),
+                );
+            }
+            match keys.save(&key) {
+                Ok(()) => Outcome::ok(
+                    200,
+                    format!(
+                        "joined: this node now holds the cluster key with fingerprint {}. \
+                         A running router picks it up within a second.",
+                        key.fingerprint()
+                    ),
+                ),
+                Err(e) => Outcome::fail(500, e),
+            }
+        }
     }
 }
 
@@ -958,6 +1216,7 @@ pub fn write_report(node_dir: &Path, s: &Snapshot) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::router::KeyStore as _;
 
     #[test]
     fn the_chooser_reads_a_digit_and_an_optional_remember() {
@@ -1060,6 +1319,7 @@ mod tests {
             logs: vec!["12:00:00 token=abcdef0123456789abcdef0123456789 x".into()],
             rechecking: false,
             view: crate::control::ViewState::default(),
+            router: RouterInput::default(),
         });
         let labels: Vec<&str> = m["settings"]
             .as_array()
@@ -1142,6 +1402,8 @@ mod tests {
                 vec![Command::Reload],
             ),
             (Act::Report, vec![]),
+            (Act::RouterNewKey, vec![]),
+            (Act::RouterJoin(JoinKey("ab".repeat(32))), vec![]),
         ];
         let mut ids: Vec<&str> = Vec::new();
         for (act, want) in cases {
@@ -1156,9 +1418,28 @@ mod tests {
                     assert_eq!(Settings::load(&dir).max_cpus, Some(4.0))
                 }
                 Act::SettingClear { .. } => assert_eq!(Settings::load(&dir).max_cpus, None),
+                Act::RouterNewKey => {
+                    assert!(crate::router::FileKeyStore::new(&dir)
+                        .load()
+                        .unwrap()
+                        .is_some())
+                }
+                Act::RouterJoin(JoinKey(k)) => assert_eq!(
+                    crate::router::FileKeyStore::new(&dir)
+                        .load()
+                        .unwrap()
+                        .map(|k| k.reveal()),
+                    Some(k.clone())
+                ),
                 _ => {}
             }
         }
+        // A link code needs the node's credential; without one it is refused
+        // with a reason, never a code.
+        let o = perform(Target::Attached, &dir, &Act::LinkCode { nonce: None });
+        assert!(!o.ok && o.status == 409, "{}", o.message);
+        assert!(drained().is_empty());
+        ids.push("link_code");
         // Every contract action was exercised.
         for a in ACTIONS {
             assert!(ids.contains(&a.id), "{} not exercised", a.id);
@@ -1186,6 +1467,114 @@ mod tests {
             403
         );
         assert!(drained().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The router settings are edited in every view through the same
+    /// setting action; a bad mode, allowlist or name is refused there.
+    #[test]
+    fn router_settings_are_editable_and_checked() {
+        let dir = std::env::temp_dir().join(format!("kn-views-router-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for k in ROUTER_SETTINGS {
+            assert!(EDITABLE.contains(k), "{k}");
+        }
+        let set = |key: &str, value: &str| {
+            perform(
+                Target::Attached,
+                &dir,
+                &Act::Setting {
+                    key: key.into(),
+                    value: value.into(),
+                },
+            )
+        };
+        assert!(set("router", "lan").ok);
+        assert!(set("router-allow", "192.168.1.0/24, 10.0.0.5").ok);
+        assert!(set("router-name", "studio").ok);
+        let s = Settings::load(&dir);
+        assert_eq!(s.router.as_deref(), Some("lan"));
+        assert_eq!(s.router_name.as_deref(), Some("studio"));
+        assert_eq!(set("router", "wan").status, 400);
+        assert_eq!(set("router-allow", "0.0.0.0/0").status, 400);
+        assert_eq!(set("router-allow", "8.8.8.8").status, 400);
+        // The model offers the modes and shows the configured state while no
+        // router runs.
+        let m = router_model(&RouterInput::read(&dir), &Settings::load(&dir), "abc");
+        assert_eq!(m["modes"], json!(["off", "local", "lan"]));
+        assert_eq!(m["running"], false);
+        assert_eq!(m["asked"], "lan");
+        assert_eq!(m["name"], "studio");
+        // No key yet: LAN waits for one and says so.
+        assert_eq!(m["mode"], "local");
+        assert!(m["problem"].as_str().unwrap().contains("cluster key"));
+        // A join with a malformed key is refused and stores nothing.
+        let bad = perform(
+            Target::Attached,
+            &dir,
+            &Act::RouterJoin(JoinKey("nothex".into())),
+        );
+        assert_eq!(bad.status, 400);
+        assert!(crate::router::FileKeyStore::new(&dir)
+            .load()
+            .unwrap()
+            .is_none());
+        let ok = perform(Target::Attached, &dir, &Act::RouterNewKey);
+        assert!(ok.ok, "{}", ok.message);
+        let m = router_model(&RouterInput::read(&dir), &Settings::load(&dir), "abc");
+        assert_eq!(m["mode"], "lan");
+        let fp = m["key_fingerprint"].as_str().unwrap();
+        assert_eq!(fp.len(), 8);
+        // The key itself is nowhere in what a view gets.
+        let key = crate::router::FileKeyStore::new(&dir)
+            .load()
+            .unwrap()
+            .unwrap()
+            .reveal();
+        assert!(!m.to_string().contains(&key));
+        assert!(!ok.message.contains(&key));
+        assert!(!format!("{:?}", Act::RouterJoin(JoinKey(key.clone()))).contains(&key));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An embedding application's key store is used, never `router.key`.
+    #[test]
+    fn the_key_actions_use_the_store_they_are_given() {
+        use std::sync::Mutex;
+        #[derive(Default)]
+        struct Mem(Mutex<Option<crate::router::ClusterKey>>);
+        impl crate::router::KeyStore for Mem {
+            fn load(&self) -> Result<Option<crate::router::ClusterKey>, String> {
+                Ok(self.0.lock().unwrap().clone())
+            }
+            fn save(&self, k: &crate::router::ClusterKey) -> Result<(), String> {
+                *self.0.lock().unwrap() = Some(k.clone());
+                Ok(())
+            }
+            fn place(&self) -> String {
+                "memory".into()
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("kn-views-mem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mem = Mem::default();
+        let key = "cd".repeat(32);
+        let o = perform_with(
+            Target::InProcess,
+            &dir,
+            &Act::RouterJoin(JoinKey(key.clone())),
+            &mem,
+        );
+        assert!(o.ok, "{}", o.message);
+        assert_eq!(
+            mem.0.lock().unwrap().as_ref().map(|k| k.reveal()),
+            Some(key)
+        );
+        assert!(!dir.join(crate::router::key::KEY_FILE).exists());
+        let input = RouterInput::read_with(&dir, &mem);
+        assert_eq!(input.key_fingerprint.len(), 8);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
