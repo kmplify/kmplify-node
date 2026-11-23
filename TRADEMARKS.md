@@ -20,7 +20,12 @@ This file is about names and logos only.
 Used by KMPLIFY, whether or not registered in a given jurisdiction:
 
 - **KMPLIFY**, as a word
-- the KMPLIFY logo and wordmark
+- the KMPLIFY logo and wordmark, including where this repository ships them:
+  the mark and tab icon of the local dashboard (`src/dashboard/assets`) and the
+  program icon of the Windows build (`packaging/windows/kmplify-node.ico`).
+  They are in the repository so official builds carry them; the Apache License
+  does not cover them (its section 6 grants no trademark rights). A fork
+  replaces them.
 - **kmplify-node**, as the name of this project
 - **KMPLIFY Compute Fabric** and **KMPLIFY GPU Fabric**, as names for the
   network this agent connects to

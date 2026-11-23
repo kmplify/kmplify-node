@@ -27,6 +27,7 @@ pub mod fabric_worker;
 pub mod flow;
 pub mod functions;
 pub mod gpu;
+pub mod host;
 pub mod hostcpu;
 pub mod identity;
 pub mod operator_session;
@@ -40,6 +41,8 @@ pub mod status;
 pub mod summary;
 pub mod trust;
 pub mod vectors;
+#[cfg(any(feature = "dashboard", feature = "tui"))]
+pub mod views;
 pub mod vllm_managed;
 pub mod wire;
 

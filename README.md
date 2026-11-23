@@ -311,17 +311,82 @@ Everything below is the detail behind those commands.
 
 ## Using kmplify-node: dashboard and terminal
 
-`kmplify-node` (or `kmplify-node run`) talks to you in one of three ways:
+`kmplify-node` (or `kmplify-node run`) has three views of a running node, and
+you can switch between them while it runs, without a restart:
 
-| `--ui` | What you get | Default when |
+| View | What you get | Start with |
 |---|---|---|
-| `gui` | The terminal summary below, plus the dashboard in your browser | started from a terminal in a desktop session (macOS, Windows, Linux with a display) |
-| `terminal` | The terminal summary only | everywhere else: SSH logins, containers, systemd |
-| `none` | Plain log lines, for services and log collectors | never by default |
+| Terminal view | The terminal dashboard in the console the node runs in (the same screens as `kmplify-node tui`) | `--ui tui`, or `1` in the chooser |
+| Web view | The dashboard in your browser | `--ui gui`, or `2` in the chooser |
+| App window | The same dashboard in a window of its own | `--ui app`, or `3` in the chooser |
 
-`KMPLIFY_NODE_UI` sets the same, `--ui-port PORT` (`KMPLIFY_NODE_UI_PORT`) picks
-the dashboard's port (default: a free one), and `--no-ui-open` keeps the browser
-closed while still serving the page.
+**The chooser.** Started by hand in a console (a terminal, or a double-click on
+`kmplify-node.exe`), with no `--ui` and nothing remembered, the node asks which
+view to start with. Type `1`, `2` or `3` and Enter; add `r` (for example `2r`) to
+remember the choice in the node's settings file (`kmplify-node set --clear ui`
+asks again; the file holds no credentials). Without an answer within 15 seconds
+it starts the default: the web view in a desktop session, the terminal summary
+elsewhere. A service, a systemd unit, a container without a TTY, a redirected or
+piped start is never asked and behaves as before.
+
+**Switching.** `--ui` is only the starting view. In an interactive start the
+local dashboard runs in every view, so:
+
+- in the console, type `t` (terminal view), `w` (web view) or `a` (app window),
+  then Enter;
+- in the terminal view, `b` opens the web view and `a` the app window; `q`
+  returns to the console and the node keeps running;
+- on the dashboard, the **View** buttons at the top (Web, App window, Terminal)
+  do the same; Terminal brings the terminal view up in the console window the
+  node runs in.
+
+The app window is an **interim step**: until the native window (the router GUI
+port) exists, it is the dashboard in a Chromium-family browser in app mode (no
+tabs, no address bar): Edge on Windows, Chrome, Edge, Chromium or Brave on macOS
+and Linux, else your normal browser with a note. The link goes to the browser as
+a program argument, never through a shell, so the per-start token is visible in
+your own process list, exactly as it is when the node opens your browser.
+
+The other starts keep their meaning: `--ui terminal` is the startup summary in
+the console (plus the view keys when you are at it), `--ui none` plain log lines
+for services and log collectors. `KMPLIFY_NODE_UI` sets the same as `--ui`,
+`--ui-port PORT` (`KMPLIFY_NODE_UI_PORT`) picks the dashboard's port (default: a
+free one), and `--no-ui-open` keeps the browser closed while still serving the
+page.
+
+**One feature set in every view.** The terminal view, the web dashboard and the
+app window show the same sections, metrics and actions, from one data layer
+(`views::model` over the node's status snapshot) and one set of handlers (the
+node's control commands and settings file). A parity test on each side fails
+when a view drops one. This table is also the contract for the native window and
+for the provider view of the KMPLIFY desktop app:
+
+| Section | Web tab | Terminal key | Shows |
+|---|---|---|---|
+| Overview | Overview | `1` `h` | Trusted node with trust readiness, what this node shares, connection, this machine (CPU, RAM, GPU) |
+| Trusted node | Trusted node | `8` `n` | where this node stands, trust readiness, what is missing, what Trusted means, the security baseline with fixes |
+| Sessions | Sessions | `2` `s` | running now, since this start |
+| Earnings | Earnings | `9` `$` | this month, in total, account and rate |
+| Settings | Settings | `0` (editor `5` `g`) | every setting, its value, where it comes from, how to change it; the starting view |
+| Logs | Logs | `4` `l` | the last log lines, keys and tokens redacted |
+
+| Action | Web | Terminal key |
+|---|---|---|
+| Pause sharing / Resume sharing | Overview, Connection | `p` |
+| Reconnect now | Overview, Connection | `c` |
+| Re-check now (security baseline) | Trusted node | `R` |
+| Change a setting / Use environment | Settings | `5`, then `d` hands one back |
+| Stop session | Sessions | `e` |
+| Save a report (a text file in the node directory) | Overview, Connection | `w` |
+| Stop the node | Overview, Connection | `x` |
+| Switch view: Web / App window / Terminal | View buttons | `b` / `a` / (this view) |
+
+Where the web page draws a chart, the terminal says it in text: the readiness
+ring is the bar `[##--##] 4/6 checks`, the machine bars are block bars with a
+one-minute sparkline. The terminal view has three screens beyond the table that
+the web page does not have yet: Models (`3`), Peers (`6`: approve, deny, block,
+invite, hold and revoke consumers) and Activity (`7`: five minutes of history and
+a bar per core).
 
 **The startup summary.** Once the node is connected (or has tried for 30 seconds)
 it prints one block: the fabric it is connected to, the machine, what it shares
@@ -372,7 +437,8 @@ It is the one place the node listens, so it is locked down: it binds to
 token in the link the node prints (32 bytes, new on every start); requests naming
 another host or coming from another site are refused and no CORS headers are
 sent; changes need the token in a header and a JSON body; page, script and style
-are compiled into the binary under a strict content security policy. The link is
+are compiled into the binary under a strict content security policy (the Inter
+font and the KMPLIFY logo too; nothing loads from another site). The link is
 kept, owner-readable only, in `dashboard.url` in the node directory while the
 node runs, so `kmplify-node status` can show it again.
 
@@ -731,8 +797,11 @@ starts a node itself and quitting stops it. `--attach` insists on the first,
 
 | Screen | What it shows |
 |---|---|
-| `1` home | link state, four live meters, what is advertised, jobs, sessions, log |
-| `2` sessions | peers' containers running here |
+| `1` overview | link state, four live meters, what this node shares, the trusted node and its readiness, the connection, models, sessions, log |
+| `8` trusted node | where this node stands, trust readiness, what is missing, the security baseline with fixes (the web page's Trusted node tab) |
+| `2` sessions | peers' containers running here, and what this start delivered |
+| `9` earnings | KMPLIFY Credits this month and in total, account and rate |
+| `0` settings | every setting with its value, its source and how to change it |
 | `3` models · `4` log | what consumers can ask for; the worker's log |
 | `5` sharing | what this machine lends, and how much of it |
 | `6` peers | who may use it: waiting consumers, active ones, invitations |
@@ -743,8 +812,10 @@ starts a node itself and quitting stops it. `--attach` insists on the first,
 | `p` | Pause or resume sharing. The connection and hosted sessions stay up; the node advertises nothing until resumed. |
 | `c` | Reconnect to the gateway now, without waiting out the backoff. |
 | `e` | Evict the selected session — the peer's container is stopped and removed. |
+| `R` | Re-check now: run the security baseline check, the result goes to the fabric with the next heartbeat. |
 | `x` | Stop the node, tearing down hosted sessions first. |
-| `w` | Write a plain-text snapshot of the dashboard, for a bug report. |
+| `w` | Write a plain-text snapshot of the dashboard, for a bug report (the web page's "Save a report"). |
+| `b` / `a` | Open the web view / the app window of the node serving in this console. |
 | `?` | Every key, including the ones each screen adds. |
 
 The node publishes `status.json` in its node directory (owner-readable only)
@@ -1001,7 +1072,33 @@ marketplace are the business. The agent on your hardware is something you are
 entitled to audit, and that is worth more to us as source than as a secret.
 
 The same worker powers the KMPLIFY desktop app's provider mode. This repository
-is the headless build of it.
+is the headless build of it, and the desktop app links this crate rather than
+keeping a copy, so the two cannot drift apart.
+
+## Embedding the provider in an application
+
+The provider is a library as well as a binary. An application that lends its
+machine to a fabric links the crate without the terminal UI and the dashboard:
+
+```toml
+kmplify-node = { git = "https://github.com/kmplify/kmplify-node", tag = "<a release with provider-core>", default-features = false, features = ["provider-core"] }
+```
+
+Add `wasm` to the features to host signed functions. It then runs
+`fabric_worker::run(WorkerConfig, stop)` and, optionally, installs a
+`host::ProviderHost` for what differs per host: the operator's current
+choices before every connection, the log, session start and end, the
+hardware a connection advertises, and a `JobObserver` per job (counts only:
+the provider terms forbid keeping request or reply content, and that covers
+what a host does with these callbacks). `fabric_worker::link_state()` and
+`status::snapshot()` say what the worker is doing, `security::check()` and
+`trust::readiness()` give the trusted node checklist, and
+`operator_session::set()` reports a signed-in operator. Whatever the host,
+the frames are the same: `tests/protocol_golden.rs` holds every `hello` and
+`pong` key against the reference in [PROTOCOL.md](PROTOCOL.md).
+
+An application that redistributes the crate carries its NOTICE
+(`kmplify_node::NOTICE`, Apache-2.0 section 4(d)).
 
 ## Learn more
 
@@ -1021,8 +1118,11 @@ Yes, please, especially hardware coverage and the trust rules. See
 
 Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-The licence covers the code, not the name: KMPLIFY and kmplify-node are
-trademarks, and modified versions need their own name. What that means in
+The licence covers the code, not the name: KMPLIFY and kmplify-node, and the
+KMPLIFY logo (the dashboard mark, its tab icon and the program icon of
+`kmplify-node.exe`), are trademarks and are not licensed under Apache-2.0
+(section 6 grants no trademark rights); modified versions need their own name
+and their own logo. What that means in
 practice, including everything you may do without asking, is spelled out in
 [TRADEMARKS.md](TRADEMARKS.md).
 

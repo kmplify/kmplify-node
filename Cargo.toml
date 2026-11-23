@@ -1,6 +1,6 @@
 [package]
 name = "kmplify-node"
-version = "0.8.3"
+version = "0.9.0"
 edition = "2021"
 # What the dependency floor actually is, now that both lanes ship by default:
 # ratatui asks for 1.88 and wasmtime for 1.95. Claiming 1.77 while the tree
@@ -87,13 +87,19 @@ codegen-units = 16
 lto = "thin"
 strip = true
 
+# The program icon of kmplify-node.exe (the KMPLIFY app icon,
+# packaging/windows/kmplify-node.ico). Built on a Windows host only; see
+# build.rs. MIT.
+[target.'cfg(windows)'.build-dependencies]
+winresource = { version = "0.1", default-features = false }
+
 [features]
 # Both lanes ship in the released binaries. The functions lane was optional
 # for a year and the result was a fabric where the gateway could sign and
 # schedule a function and NOT ONE node could run it: the runtime was absent
 # from every build anyone actually installed. A capability that ships turned
 # off in every artifact is a capability that does not exist.
-default = ["tui", "wasm"]
+default = ["tui", "wasm", "dashboard"]
 # `kmplify-node tui`: watch and control the node from a terminal.
 tui = ["dep:ratatui"]
 # Host signed Wasm functions in an in-process sandbox (wasmtime, WASI p1).
@@ -101,6 +107,20 @@ tui = ["dep:ratatui"]
 # (PROVIDER_FUNCTIONS, plus a catalog key to trust), so what this decides is
 # only whether an operator who opts in has an engine to do it with.
 wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
+# The local web dashboard (`--ui gui`, src/dashboard): the one place the node
+# listens, on loopback with a per-start token. Without it `--ui gui` falls
+# back to the terminal summary.
+dashboard = []
+# The provider as a library, for an application that embeds it (the KMPLIFY
+# desktop app): the fabric worker, host facts, the security self-check, the
+# operator session, the node identity and the `host::ProviderHost` hooks.
+# Pulls in no terminal UI and no dashboard; add `wasm` for the functions
+# lane. Use it as
+#   kmplify-node = { ..., default-features = false, features = ["provider-core"] }
+# It enables nothing by itself: everything it names is always compiled. It
+# exists so an embedder states what it relies on, and so this crate can
+# never quietly move a piece of the provider behind another feature.
+provider-core = []
 
 # proc.rs: kernel settings by system call (sysctlbyname), never by starting
 # `sysctl`. Already in the tree through tokio; no new crate is downloaded.

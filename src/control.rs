@@ -48,7 +48,18 @@ pub enum Command {
     StopSession(String),
     /// Graceful shutdown: tear down hosted sessions, then exit.
     Shutdown,
+    /// Run the trusted node security self-check now. The result goes to the
+    /// fabric, signed, with the next heartbeat.
+    Recheck,
+    /// Bring up one of the views of this node: `web` (the dashboard in the
+    /// browser), `app` (the dashboard in an app window) or `terminal` (the
+    /// terminal dashboard in the node's console). Carried out by the
+    /// process that serves the node (`main::serve`), never by the worker.
+    View(String),
 }
+
+/// The views a person can switch between while the node runs.
+pub const VIEWS: [&str; 3] = ["web", "app", "terminal"];
 
 impl Command {
     pub fn as_frame(&self) -> Value {
@@ -59,6 +70,8 @@ impl Command {
             Command::Reload => json!({"type": "node_reload"}),
             Command::StopSession(id) => json!({"type": "workload_stop", "session": id}),
             Command::Shutdown => json!({"type": "node_shutdown"}),
+            Command::Recheck => json!({"type": "node_recheck"}),
+            Command::View(v) => json!({"type": "node_view", "view": v}),
         }
     }
 
@@ -69,6 +82,11 @@ impl Command {
             "node_reconnect" => Some(Command::Reconnect),
             "node_reload" => Some(Command::Reload),
             "node_shutdown" => Some(Command::Shutdown),
+            "node_recheck" => Some(Command::Recheck),
+            "node_view" => {
+                let v = v["view"].as_str()?;
+                VIEWS.contains(&v).then(|| Command::View(v.to_string()))
+            }
             "workload_stop" => Some(Command::StopSession(
                 v["session"].as_str().unwrap_or_default().to_string(),
             )),
@@ -85,6 +103,16 @@ impl Command {
             Command::Reload => "settings saved — re-advertising".into(),
             Command::StopSession(id) => format!("stopping session {}…", short(id)),
             Command::Shutdown => "shutting down…".into(),
+            Command::Recheck => {
+                "checking now; the result goes to the fabric with the next heartbeat".into()
+            }
+            Command::View(v) => match v.as_str() {
+                "web" => "opening the web view in your browser".into(),
+                "app" => "opening the app window".into(),
+                _ => "the terminal view is up in the console window kmplify-node runs in \
+                      (where you started it); press q there to leave it, the node keeps running"
+                    .into(),
+            },
         }
     }
 }
@@ -97,6 +125,78 @@ pub fn control_dir(node_dir: &Path) -> PathBuf {
     node_dir.join(CONTROL_DIR)
 }
 
+// ------------------------------------------------------------------ views
+
+static VIEW_SWITCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static VIEW_CONSOLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static VIEW_TERMINAL_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static VIEW_START: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Where the views of this process stand, for the dashboard and the
+/// terminal view alike.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ViewState {
+    /// Views can be switched: a person started this node interactively.
+    /// A service, a container or a redirected run never switches.
+    pub switchable: bool,
+    /// The node has a console the terminal view can come up in.
+    pub console: bool,
+    /// The terminal view is on screen now.
+    pub terminal_up: bool,
+    /// The view this start began with (`--ui`, the chooser, or the default).
+    pub start: String,
+}
+
+/// Declared by the process serving the node, once, at start.
+pub fn set_view_host(switchable: bool, console: bool, start: &str) {
+    use std::sync::atomic::Ordering;
+    VIEW_SWITCH.store(switchable, Ordering::Relaxed);
+    VIEW_CONSOLE.store(console, Ordering::Relaxed);
+    if let Ok(mut s) = VIEW_START.lock() {
+        *s = start.to_string();
+    }
+}
+
+/// The terminal view came up or went away.
+pub fn set_terminal_up(up: bool) {
+    VIEW_TERMINAL_UP.store(up, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn terminal_up() -> bool {
+    VIEW_TERMINAL_UP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn view_state() -> ViewState {
+    use std::sync::atomic::Ordering;
+    ViewState {
+        switchable: VIEW_SWITCH.load(Ordering::Relaxed),
+        console: VIEW_CONSOLE.load(Ordering::Relaxed),
+        terminal_up: terminal_up(),
+        start: VIEW_START.lock().map(|s| s.clone()).unwrap_or_default(),
+    }
+}
+
+/// Start the security self-check in this process, unless one runs.
+fn start_recheck() -> Result<(), String> {
+    if crate::security::rechecking() {
+        return Err("a check is already running".into());
+    }
+    let rt = tokio::runtime::Handle::try_current()
+        .map_err(|_| "the node is not running, so there is nothing to check".to_string())?;
+    rt.spawn(async {
+        if crate::security::recheck().await.is_some() {
+            crate::status::push_log(
+                "security baseline re-checked on request; the next heartbeat sends it",
+            );
+            // The gateway receives it with the next pong (pings are seconds
+            // apart), then evaluates it; read its view after that.
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            crate::trust::refresh_now();
+        }
+    });
+    Ok(())
+}
+
 /// Hand a command to the worker running in THIS process.
 pub fn submit(cmd: &Command) -> Result<(), String> {
     // Pause is STATE, not a message. Applied here it holds whether or not a
@@ -105,6 +205,21 @@ pub fn submit(cmd: &Command) -> Result<(), String> {
     match cmd {
         Command::Pause => crate::status::set_paused(true),
         Command::Resume => crate::status::set_paused(false),
+        Command::Recheck => return start_recheck(),
+        Command::View(v) => {
+            let st = view_state();
+            if !st.switchable {
+                return Err(
+                    "this node runs without a person at its console (a service or a \
+                            redirected start), so it opens no views; open the dashboard link \
+                            yourself"
+                        .into(),
+                );
+            }
+            if v == "terminal" && !st.console {
+                return Err("this node has no console to show the terminal view in".into());
+            }
+        }
         _ => {}
     }
     let delivered = crate::fabric_worker::send_control(cmd.as_frame());
@@ -211,6 +326,10 @@ mod tests {
             Command::Reload,
             Command::Shutdown,
             Command::StopSession("s-1".into()),
+            Command::Recheck,
+            Command::View("web".into()),
+            Command::View("app".into()),
+            Command::View("terminal".into()),
         ] {
             assert_eq!(Command::from_frame(&cmd.as_frame()), Some(cmd));
         }
@@ -229,6 +348,22 @@ mod tests {
     fn unknown_frames_are_not_commands() {
         assert_eq!(Command::from_frame(&json!({"type": "ping"})), None);
         assert_eq!(Command::from_frame(&json!({})), None);
+        // A view nobody can show is not a command.
+        assert_eq!(
+            Command::from_frame(&json!({"type": "node_view", "view": "calc.exe"})),
+            None
+        );
+        assert_eq!(Command::from_frame(&json!({"type": "node_view"})), None);
+    }
+
+    #[test]
+    fn a_view_switch_needs_a_person_at_the_console() {
+        // Never declared interactive (a service): no switch, no frame sent.
+        set_view_host(false, false, "none");
+        assert!(submit(&Command::View("web".into())).is_err());
+        set_view_host(true, false, "web");
+        assert!(submit(&Command::View("terminal".into())).is_err());
+        set_view_host(false, false, "");
     }
 
     #[test]
