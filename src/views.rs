@@ -1071,4 +1071,121 @@ mod tests {
         assert_eq!(m["view"]["switchable"], false);
         assert!(m["trust"]["readiness"].is_object());
     }
+
+    /// Every action of the contract, from a view attached to a node in
+    /// another process (the native window), ends as that node's own control
+    /// command, settings file or report: the same handlers the web page and
+    /// the terminal reach in-process.
+    #[test]
+    fn every_action_reaches_the_node_through_its_control_commands() {
+        use crate::control::Command;
+        let dir = std::env::temp_dir().join(format!("kn-views-acts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A published snapshot with one hosted session, as a running node
+        // writes it.
+        let snap = Snapshot {
+            sessions: vec![crate::status::Session {
+                session_id: "sess-1".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        std::fs::write(
+            crate::status::status_path(&dir),
+            serde_json::to_vec(&snap).unwrap(),
+        )
+        .unwrap();
+        let drained = || -> Vec<Value> {
+            let ctl = crate::control::control_dir(&dir);
+            let mut files: Vec<_> = std::fs::read_dir(&ctl)
+                .map(|r| r.filter_map(Result::ok).map(|e| e.path()).collect())
+                .unwrap_or_default();
+            files.retain(|p| p.extension().is_some_and(|x| x == "json"));
+            files.sort();
+            let out = files
+                .iter()
+                .map(|p| serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap())
+                .collect();
+            for p in files {
+                let _ = std::fs::remove_file(p);
+            }
+            out
+        };
+        let cases: Vec<(Act, Vec<Command>)> = vec![
+            (Act::Pause, vec![Command::Pause]),
+            (Act::Resume, vec![Command::Resume]),
+            (Act::Reconnect, vec![Command::Reconnect]),
+            (Act::Recheck, vec![Command::Recheck]),
+            (Act::StopNode, vec![Command::Shutdown]),
+            (Act::View("web".into()), vec![Command::View("web".into())]),
+            (Act::View("app".into()), vec![Command::View("app".into())]),
+            (
+                Act::View("terminal".into()),
+                vec![Command::View("terminal".into())],
+            ),
+            (
+                Act::StopSession("sess-1".into()),
+                vec![Command::StopSession("sess-1".into())],
+            ),
+            (
+                Act::Setting {
+                    key: "max-cpus".into(),
+                    value: "4".into(),
+                },
+                vec![Command::Reload],
+            ),
+            (
+                Act::SettingClear {
+                    key: "max-cpus".into(),
+                },
+                vec![Command::Reload],
+            ),
+            (Act::Report, vec![]),
+        ];
+        let mut ids: Vec<&str> = Vec::new();
+        for (act, want) in cases {
+            let o = perform(Target::Attached, &dir, &act);
+            assert!(o.ok, "{act:?}: {}", o.message);
+            let frames = drained();
+            let want: Vec<Value> = want.iter().map(Command::as_frame).collect();
+            assert_eq!(frames, want, "{act:?}");
+            ids.push(act.id());
+            match &act {
+                Act::Setting { .. } => {
+                    assert_eq!(Settings::load(&dir).max_cpus, Some(4.0))
+                }
+                Act::SettingClear { .. } => assert_eq!(Settings::load(&dir).max_cpus, None),
+                _ => {}
+            }
+        }
+        // Every contract action was exercised.
+        for a in ACTIONS {
+            assert!(ids.contains(&a.id), "{} not exercised", a.id);
+        }
+        // A report file was written.
+        assert!(std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().starts_with("snapshot-")));
+        // Refusals stay refusals: an unknown session, a setting no view edits.
+        assert_eq!(
+            perform(Target::Attached, &dir, &Act::StopSession("nope".into())).status,
+            404
+        );
+        assert_eq!(
+            perform(
+                Target::Attached,
+                &dir,
+                &Act::Setting {
+                    key: "engine".into(),
+                    value: "x".into()
+                }
+            )
+            .status,
+            403
+        );
+        assert!(drained().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

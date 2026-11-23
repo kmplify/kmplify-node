@@ -120,6 +120,9 @@ pub struct App {
     confirm: Option<Confirm>,
     log_filter: String,
     closing: bool,
+    /// When a re-check was asked for here, and the checked_at of the
+    /// report on screen at that moment.
+    recheck_asked: Option<(Instant, Option<u64>)>,
     /// The width of the content area this frame, read before the scroll
     /// area (whose inner width can grow with what was drawn last frame).
     content_width: f32,
@@ -224,6 +227,7 @@ impl App {
             confirm: None,
             log_filter: String::new(),
             closing: false,
+            recheck_asked: None,
             content_width: 0.0,
         };
         app.refresh();
@@ -260,6 +264,7 @@ impl App {
             confirm: None,
             log_filter: String::new(),
             closing: false,
+            recheck_asked: None,
             content_width: 0.0,
         }
     }
@@ -288,6 +293,9 @@ impl App {
         });
         self.snap = snap;
         self.router = crate::router::read_published(&self.node_dir);
+        if !self.recheck_busy(Instant::now()) {
+            self.recheck_asked = None;
+        }
     }
 
     /// The node stopped while this window watched it: the window goes too.
@@ -299,9 +307,31 @@ impl App {
             }
     }
 
+    /// The checked_at of the report on screen (epoch seconds), if any.
+    fn checked_at(&self) -> Option<u64> {
+        self.model["trust"]["checked_at"].as_u64()
+    }
+
+    /// A re-check runs, or was asked for and has not produced a new report
+    /// yet. Between the click and the node picking the command up (up to
+    /// half a second, plus a publish tick) the model does not show it
+    /// running; without this the button came back at once and the old
+    /// report stayed on screen as if it were the answer.
+    fn recheck_busy(&self, now: Instant) -> bool {
+        recheck_busy(
+            self.recheck_asked,
+            self.model["trust"]["rechecking"].as_bool().unwrap_or(false),
+            self.checked_at(),
+            now,
+        )
+    }
+
     /// Carry out one action through the layer every view shares.
     fn act(&mut self, a: Act) {
         let o = views::perform(Target::Attached, &self.node_dir, &a);
+        if a == Act::Recheck && o.ok {
+            self.recheck_asked = Some((Instant::now(), self.checked_at()));
+        }
         self.notice = Some((o.message, o.ok, Instant::now()));
         if a == Act::StopNode && o.ok {
             self.closing = true;
@@ -833,7 +863,7 @@ impl App {
         let t = &m["trust"];
         let st = &t["standing"];
         let f = &t["fabric"];
-        let rechecking = t["rechecking"].as_bool().unwrap_or(false);
+        let rechecking = self.recheck_busy(Instant::now());
         let mut recheck = false;
         let now = num(&m["now_ms"]).unwrap_or(0.0);
         card(ui, "Where this node stands", |ui| {
@@ -1481,6 +1511,29 @@ impl eframe::App for App {
     }
 }
 
+/// How long a re-check asked for here may take before the button comes
+/// back anyway (the Windows update search alone can take two minutes).
+const RECHECK_PATIENCE: Duration = Duration::from_secs(240);
+
+/// Is a re-check busy? Running (the node says so), or asked for and no newer
+/// report has arrived yet, within [`RECHECK_PATIENCE`].
+fn recheck_busy(
+    asked: Option<(Instant, Option<u64>)>,
+    running: bool,
+    checked_at: Option<u64>,
+    now: Instant,
+) -> bool {
+    if running {
+        return true;
+    }
+    match asked {
+        Some((at, before)) => {
+            now.saturating_duration_since(at) < RECHECK_PATIENCE && checked_at == before
+        }
+        None => false,
+    }
+}
+
 // ------------------------------------------------------------- widgets
 
 /// Two columns of equal width, each held to its width (egui's `columns`
@@ -1959,6 +2012,77 @@ mod tests {
         let mut app = App::with_model(m, None);
         let texts = render(&mut app, "settings", 1280.0);
         assert!(texts.iter().any(|t| t == "Use environment"));
+    }
+
+    #[test]
+    fn a_recheck_stays_busy_until_a_newer_report_arrives() {
+        let t0 = Instant::now();
+        // Nothing asked, nothing running.
+        assert!(!recheck_busy(None, false, Some(100), t0));
+        // The node reports a running check.
+        assert!(recheck_busy(None, true, Some(100), t0));
+        // Asked here; the node has not picked it up yet: still busy.
+        let asked = Some((t0, Some(100)));
+        assert!(recheck_busy(
+            asked,
+            false,
+            Some(100),
+            t0 + Duration::from_secs(1)
+        ));
+        // Running, then a newer report: done.
+        assert!(recheck_busy(
+            asked,
+            true,
+            Some(100),
+            t0 + Duration::from_secs(5)
+        ));
+        assert!(!recheck_busy(
+            asked,
+            false,
+            Some(160),
+            t0 + Duration::from_secs(20)
+        ));
+        // A first report where there was none counts as newer.
+        assert!(!recheck_busy(Some((t0, None)), false, Some(1), t0));
+        // A node that never answers does not lock the button forever.
+        assert!(!recheck_busy(
+            asked,
+            false,
+            Some(100),
+            t0 + RECHECK_PATIENCE
+        ));
+    }
+
+    /// Clicking Re-check now in the window drops the node's own recheck
+    /// command into its control directory, and the button shows the check
+    /// as busy until a newer report is published.
+    #[test]
+    fn the_recheck_button_sends_the_command_and_waits_for_the_report() {
+        let dir = std::env::temp_dir().join(format!("kn-native-recheck-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut m = rich_model();
+        m["trust"]["checked_at"] = json!(100);
+        let mut app = App::with_model(m, None);
+        app.node_dir = dir.clone();
+        app.act(Act::Recheck);
+        let frames: Vec<Value> = std::fs::read_dir(crate::control::control_dir(&dir))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .map(|e| serde_json::from_slice(&std::fs::read(e.path()).unwrap()).unwrap())
+            .collect();
+        assert_eq!(frames, vec![crate::control::Command::Recheck.as_frame()]);
+        assert!(app.recheck_busy(Instant::now()));
+        let texts = render(&mut app, "trust", 1280.0);
+        assert!(texts.iter().any(|t| t == "Checking..."), "{texts:?}");
+        assert!(!texts.iter().any(|t| t == "Re-check now"));
+        // The newer report arrives.
+        app.model["trust"]["checked_at"] = json!(170);
+        assert!(!app.recheck_busy(Instant::now()));
+        let texts = render(&mut app, "trust", 1280.0);
+        assert!(texts.iter().any(|t| t == "Re-check now"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
