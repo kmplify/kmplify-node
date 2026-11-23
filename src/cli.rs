@@ -37,6 +37,9 @@ pub enum Cmd {
     Status,
     /// Print this install's node id, the handle consumers pin and invite.
     Id,
+    /// Print a fresh link code: a short-lived proof, signed by this node's
+    /// identity key, for linking the machine to a KMPLIFY account.
+    LinkCode,
     /// Change what this machine lends, durably — the dashboard's sharing
     /// screen for scripts and shells with no terminal.
     Set,
@@ -83,6 +86,9 @@ pub struct Cli {
     pub list: bool,
     /// `peers`: the verb and its argument, e.g. `["approve", "node-9"]`.
     pub args: Vec<String>,
+    /// `link-code --nonce X`: bind the code to the challenge an account
+    /// handed out.
+    pub nonce: Option<String>,
 }
 
 impl Default for Cli {
@@ -99,6 +105,7 @@ impl Default for Cli {
             clear_all: false,
             list: false,
             args: Vec::new(),
+            nonce: None,
         }
     }
 }
@@ -234,6 +241,7 @@ pub fn usage() -> String {
          \x20 kmplify-node check [options]     preflight this host, then exit\n\
          \x20 kmplify-node status [--json]     the running node: shared, trust, checklist\n\
          \x20 kmplify-node id                  print this install's node id\n\
+         \x20 kmplify-node link-code [--nonce X]  a 10-minute code to link this machine to your account\n\
          \x20 kmplify-node set KEY=VALUE …     change what this machine lends, durably\n\
          \x20 kmplify-node init                first-run wizard: engine, sharing, preflight\n\
          \x20 kmplify-node engines             scan localhost for inference engines\n\
@@ -278,6 +286,7 @@ pub fn usage() -> String {
          \x20 --timeout SECS         per-probe ceiling in check (default 5)\n\
          \x20 --attach               tui: require a running node, never start one\n\
          \x20 --standalone           tui: run the node in this process\n\
+         \x20 --nonce X              link-code: the challenge your account showed (optional)\n\
          \x20 -h, --help             this text\n\
          \x20 -V, --version          version and build stamp\n\
          \n\
@@ -361,6 +370,7 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
                 "check" | "doctor" | "preflight" => Cmd::Check,
                 "status" => Cmd::Status,
                 "id" | "node-id" => Cmd::Id,
+                "link-code" | "link" => Cmd::LinkCode,
                 "set" | "config" => Cmd::Set,
                 "peers" | "consumers" => Cmd::Peers,
                 "init" | "onboard" | "setup" => Cmd::Init,
@@ -401,6 +411,17 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
             "--list" => cli.list = true,
             "--attach" => cli.attach = true,
             "--standalone" => cli.standalone = true,
+            "--nonce" => {
+                let raw = take(&name, inline, argv, &mut i)?;
+                if !kmplify_node::link::valid_nonce(raw.trim()) {
+                    return Err(format!(
+                        "--nonce wants the challenge your account showed ({} to {} letters, digits, - or _)",
+                        kmplify_node::link::NONCE_MIN,
+                        kmplify_node::link::NONCE_MAX
+                    ));
+                }
+                cli.nonce = Some(raw.trim().to_string());
+            }
             "--timeout" => {
                 let raw = take(&name, inline, argv, &mut i)?;
                 let secs: u64 = raw
@@ -440,12 +461,16 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
     if cli.json
         && !matches!(
             cli.cmd,
-            Cmd::Check | Cmd::Status | Cmd::Peers | Cmd::Engines | Cmd::Security
+            Cmd::Check | Cmd::Status | Cmd::Peers | Cmd::Engines | Cmd::Security | Cmd::LinkCode
         )
     {
         return Err(
-            "--json applies to `check`, `status`, `peers`, `engines` and `security`".into(),
+            "--json applies to `check`, `status`, `peers`, `engines`, `security` and `link-code`"
+                .into(),
         );
+    }
+    if cli.nonce.is_some() && cli.cmd != Cmd::LinkCode {
+        return Err("--nonce applies to `link-code`".into());
     }
     if (cli.attach || cli.standalone) && cli.cmd != Cmd::Tui {
         return Err("--attach and --standalone apply to `tui`".into());
@@ -579,6 +604,18 @@ mod tests {
     }
 
     #[test]
+    fn link_code_takes_an_optional_nonce_and_json() {
+        let c = parse(&args(&["link-code"])).unwrap();
+        assert_eq!((c.cmd, c.nonce), (Cmd::LinkCode, None));
+        let c = parse(&args(&["link-code", "--nonce", "chal_ABC-123", "--json"])).unwrap();
+        assert_eq!(c.nonce.as_deref(), Some("chal_ABC-123"));
+        assert!(c.json);
+        assert!(parse(&args(&["link-code", "--nonce=short"])).is_err());
+        assert!(parse(&args(&["run", "--nonce", "chal_ABC-123"])).is_err());
+        assert!(parse(&args(&["link-code", "extra"])).is_err());
+    }
+
+    #[test]
     fn no_arguments_runs_the_node() {
         assert_eq!(parse(&[]).unwrap().cmd, Cmd::Run);
     }
@@ -591,6 +628,8 @@ mod tests {
             ("check", Cmd::Check),
             ("status", Cmd::Status),
             ("id", Cmd::Id),
+            ("link-code", Cmd::LinkCode),
+            ("link", Cmd::LinkCode),
             ("version", Cmd::Version),
             ("help", Cmd::Help),
         ] {

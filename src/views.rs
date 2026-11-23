@@ -169,6 +169,11 @@ pub const METRICS: &[Metric] = &[
         terminal_form: "",
     },
     Metric {
+        section: "earnings",
+        label: "Link code",
+        terminal_form: "",
+    },
+    Metric {
         section: "settings",
         label: "Settings",
         terminal_form: "",
@@ -238,6 +243,12 @@ pub const ACTIONS: &[Action] = &[
         label: "Stop session",
         web: "/api/session/stop",
         tui_key: "e",
+    },
+    Action {
+        id: "link_code",
+        label: "Make a link code",
+        web: "/api/link-code",
+        tui_key: "L",
     },
     Action {
         id: "report",

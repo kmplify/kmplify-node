@@ -30,6 +30,7 @@ pub mod gpu;
 pub mod host;
 pub mod hostcpu;
 pub mod identity;
+pub mod link;
 pub mod operator_session;
 pub mod peers;
 pub mod proc;

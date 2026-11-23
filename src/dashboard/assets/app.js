@@ -383,18 +383,57 @@ function sessionsTab(s) {
       ])));
 }
 
+// -------------------------------------------------------------- link code
+// Made on request only and kept on this page, never in /api/state: a code is
+// a one-time proof for linking this machine to an account, not a fact about
+// the node. The same code as `kmplify-node link-code` and the terminal view.
+let linkCode = null;
+
+async function makeLinkCode() {
+  try {
+    const r = await api("/api/link-code", {});
+    if (r.ok) linkCode = r; else toast(r.message || "No link code was made.");
+  } catch (e) {
+    toast("The node did not answer: " + e.message);
+  }
+  render();
+}
+
+async function copyLinkCode() {
+  try {
+    await navigator.clipboard.writeText(linkCode.code);
+    toast("Link code copied.");
+  } catch (_) {
+    toast("Copying was refused by the browser; select the code and copy it.");
+  }
+}
+
+function linkCard() {
+  const live = linkCode && linkCode.expires_at > Date.now() / 1000;
+  return card("Link code",
+    el("p", { class: "small", text: "Links this machine to your KMPLIFY account, so the marketplace shows your @alias on its card. Enter the code in the KMPLIFY marketplace: Settings > Peer Compute > Link code." }),
+    live ? el("p", {}, el("code", { text: linkCode.code })) : null,
+    live
+      ? el("p", { class: "muted small", text: "Valid until " + new Date(linkCode.expires_at * 1000).toLocaleTimeString() + ", once. Signed by this node's identity key; it carries no personal data." })
+      : el("p", { class: "muted small", text: linkCode ? "That code has expired. Make a new one." : "A code is valid for 10 minutes and can be used once." }),
+    el("div", { class: "actions" },
+      el("button", { class: "btn", onclick: makeLinkCode }, "Make a link code"),
+      live ? el("button", { class: "btn ghost", onclick: copyLinkCode }, "Copy") : null));
+}
+
 // --------------------------------------------------------------- earnings
 
 function earningsTab(s) {
   const e = s.earnings;
   if (!e || !e.enabled) {
-    return el("div", { class: "grid" }, card("Earnings",
+    return el("div", { class: "grid" }, linkCard(), card("Earnings",
       el("p", { text: "This fabric does not report KMPLIFY Credits for this node (the credit system is off here, or the node has not been answered yet)." }),
       el("p", {}, "How earning works: ", el("a", { href: "https://kmplify.io/docs", target: "_blank", rel: "noopener noreferrer", text: "kmplify.io/docs" })),
       kv([["Delivered since start", s.delivered.jobs + s.delivered.functions + s.delivered.vector_ops + " calls"]]),
       el("p", { class: "muted small", text: "This month, In total and Account and rate appear once the fabric reports credits." })));
   }
   return el("div", { class: "grid" },
+    linkCard(),
     card("This month", el("div", { class: "big", text: String(e.earned_this_month) }), el("div", { class: "muted", text: "credits, after the platform fee" })),
     card("In total", el("div", { class: "big", text: String(e.earned_total) }), el("div", { class: "muted", text: "credits" })),
     card("Account and rate",

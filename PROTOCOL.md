@@ -900,6 +900,54 @@ reported it with `operator_session::set`, and the node has an identity key:
   the service that issued it to decide. The headless binary has no login and never
   sends one.
 
+## Link codes: proof of running a node (KIP-1 `node-link`)
+
+A provider links a machine to their KMPLIFY account so the marketplace can show
+their @alias on its card. The node id is public (the gateway publishes all 32
+characters), so knowing it proves nothing. A **link code** proves possession of
+the node's identity key, which the gateway bound to the node id at the first
+signed hello (v3.7).
+
+```text
+kmplink1.<base64url(payload)>.<base64url(signature)>      (no padding)
+```
+
+`payload` is canonical JSON (sorted keys, no whitespace, ASCII only):
+
+| key | value |
+|---|---|
+| `exp` | unix seconds after which the code is refused; `exp - iat` is at most 900 |
+| `iat` | unix seconds the code was made |
+| `jti` | 32 random hex characters; a verifier accepts a code once |
+| `node_id` | the public node id, 32 lowercase hex characters |
+| `nonce` | optional: a challenge the account service handed out, binding the code to that account (`--nonce`) |
+| `pubkey` | the node's Ed25519 identity key, 64 lowercase hex |
+| `purpose` | `"link"` |
+| `v` | `1` |
+
+The signature is Ed25519 over `"KMPLIFY-ID-v1/node-link\n" + payload`. The
+purpose is this statement's alone: a hello, register, receipt, security or
+encryption-key signature never verifies as a link code, and a link code is good
+for nothing else. It carries no personal data.
+
+A verifier (the account service) checks, in this order: the form and canonical
+spelling, the signature under `pubkey`, the times (300 s clock skew either
+way), that `jti` was not used before, the nonce when present, and finally asks
+the gateway whether `pubkey` is the key bound to `node_id`:
+
+```text
+POST /v1/nodes/key-check   Authorization: Bearer <FABRIC_API_KEY or FABRIC_ADMIN_KEY>
+{"node": "<32 hex>", "pubkey": "<64 hex>"}   ->   {"bound": true | false}
+```
+
+The answer is yes or no for a pair the caller already holds: the gateway never
+hands out a node's key or address. A node token does not open it.
+
+Made by `kmplify-node link-code [--nonce X] [--json]`, the dashboard's Earnings
+tab ("Make a link code", `POST /api/link-code`), the terminal view (key `L`),
+and by embedders through `kmplify_node::link::for_credentials` (part of the
+`provider-core` surface). Each reads the credential file and nothing else.
+
 ## Reference: every key of `hello` and `pong`
 
 What this crate sends, key by key, for the headless binary and for every

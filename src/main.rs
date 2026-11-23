@@ -1522,6 +1522,30 @@ fn print_peers_json(p: &kmplify_node::peers::Peers, cfg: &WorkerConfig) {
 
 /// `id`: the handle consumers pin and invite. Registers if this install has
 /// never had one, because a node id that does not exist yet cannot be pinned.
+/// `kmplify-node link-code`: a fresh link code from the credential in the
+/// node directory. Reads that one file; no network, nothing written. The
+/// same library call makes the code in the dashboards and in KMPLIFY Desktop.
+fn run_link_code(dir: &std::path::Path, nonce: Option<&str>, json: bool) -> i32 {
+    match kmplify_node::link::for_credentials(&fabric_worker::default_creds_path(dir), nonce) {
+        Ok(c) => {
+            if json {
+                println!("{}", serde_json::json!(c));
+            } else {
+                // The code alone on the first line, for scripts and copying.
+                println!("{}", c.code);
+                for line in kmplify_node::link::instructions(&c, nonce.is_some()) {
+                    eprintln!("{line}");
+                }
+            }
+            EXIT_OK
+        }
+        Err(e) => {
+            eprintln!("kmplify-node: {e}");
+            EXIT_UNUSABLE
+        }
+    }
+}
+
 async fn run_id(cfg: &WorkerConfig) -> i32 {
     match fabric_worker::ensure_identity(&cfg.gateway_url, &cfg.creds_path).await {
         Ok(c) => {
@@ -2129,8 +2153,11 @@ async fn main() {
     }
 
     let dir = node_dir();
-    // `status` only reads; creating the directory for it would invent a node
-    // that never ran.
+    // `status` and `link-code` only read; creating the directory for them
+    // would invent a node that never ran.
+    if cli.cmd == cli::Cmd::LinkCode {
+        std::process::exit(run_link_code(&dir, cli.nonce.as_deref(), cli.json));
+    }
     if cli.cmd != cli::Cmd::Status {
         if let Err(e) = tokio::fs::create_dir_all(&dir).await {
             eprintln!("cannot create node dir {}: {e}", dir.display());
@@ -2228,7 +2255,11 @@ async fn main() {
         cli::Cmd::Set => unreachable!("handled above"),
         cli::Cmd::Run => serve(cfg, dir).await,
         cli::Cmd::Tui => run_tui(cfg, dir, &cli).await,
-        cli::Cmd::Status | cli::Cmd::Help | cli::Cmd::Version | cli::Cmd::Security => {
+        cli::Cmd::Status
+        | cli::Cmd::Help
+        | cli::Cmd::Version
+        | cli::Cmd::Security
+        | cli::Cmd::LinkCode => {
             unreachable!("handled above")
         }
     };
