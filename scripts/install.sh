@@ -55,7 +55,10 @@ case "$OS/$ARCH" in
   Darwin/x86_64)         TARGET="x86_64-apple-darwin" ;;
   *) fail "unsupported platform: $OS/$ARCH. Build from source instead: cargo build --release (see README.md)" ;;
 esac
-ASSET="kmplify-node-${TARGET}"
+# The binary's file name. Releases from v0.8.2 on carry the version
+# (kmplify-node-0.8.2-<target>), older ones do not (kmplify-node-<target>).
+# It is read from SHA256SUMS below, so both work and a mirror needs no version.
+ASSET=""
 
 # ---- where do assets come from -------------------------------------------
 if [ -n "${KMPLIFY_INSTALL_BASE:-}" ]; then
@@ -93,11 +96,16 @@ fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+curl -fsSL -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS" \
+  || fail "download failed: $BASE/SHA256SUMS (refusing to install an unverifiable binary)"
+# Versioned name first, then the pre-v0.8.2 name. Only names of the exact
+# expected shape are taken from the manifest, never a path.
+ASSET="$(sed -n "s/^[0-9a-f]\{64\}  \(kmplify-node-[0-9][0-9A-Za-z.+-]*-${TARGET}\)\$/\1/p" "$TMP/SHA256SUMS" | head -1)"
+[ -n "$ASSET" ] || ASSET="$(sed -n "s/^[0-9a-f]\{64\}  \(kmplify-node-${TARGET}\)\$/\1/p" "$TMP/SHA256SUMS" | head -1)"
+[ -n "$ASSET" ] || fail "SHA256SUMS lists no kmplify-node binary for $TARGET"
 say "fetching $ASSET ${VERSION:+($VERSION) }..."
 curl -fsSL -o "$TMP/$ASSET" "$BASE/$ASSET" \
   || fail "download failed: $BASE/$ASSET"
-curl -fsSL -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS" \
-  || fail "download failed: $BASE/SHA256SUMS (refusing to install an unverifiable binary)"
 
 # sha256sum on Linux, shasum on macOS.
 if command -v sha256sum >/dev/null 2>&1; then SHA="sha256sum";
