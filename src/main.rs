@@ -958,15 +958,31 @@ fn run_status(dir: &std::path::Path, json: bool) -> i32 {
     );
     let color = color_out();
     let now = kmplify_node::identity::now_s();
+    let progress = snap.security_progress.clone().unwrap_or_default();
     match &snap.security {
         Some(r) => {
-            for line in
-                kmplify_node::summary::trust_lines(Some(r), snap.fabric_trust.as_ref(), now, color)
-            {
+            for line in kmplify_node::summary::trust_lines(
+                Some(r),
+                snap.fabric_trust.as_ref(),
+                &progress,
+                now,
+                color,
+            ) {
                 println!("{line}");
             }
             for line in kmplify_node::summary::checklist_lines(r, snap.fabric_trust.as_ref(), color)
             {
+                println!("{line}");
+            }
+        }
+        None if progress.running => {
+            for line in kmplify_node::summary::readiness_lines(
+                None,
+                snap.fabric_trust.as_ref(),
+                &progress,
+                now,
+                color,
+            ) {
                 println!("{line}");
             }
         }
@@ -1645,6 +1661,7 @@ async fn startup_summary(engine: String, dashboard_url: Option<String>) {
             snap: &snap,
             report: report.as_ref(),
             fabric: fabric.as_ref(),
+            progress: &kmplify_node::security::progress(),
             engine: &engine,
             dashboard_url: dashboard_url.as_deref(),
             now_s: kmplify_node::identity::now_s(),
@@ -1665,6 +1682,7 @@ async fn startup_summary(engine: String, dashboard_url: Option<String>) {
         for line in kmplify_node::summary::trust_lines(
             Some(&r),
             kmplify_node::trust::latest().as_ref(),
+            &kmplify_node::security::progress(),
             kmplify_node::identity::now_s(),
             color_out(),
         ) {

@@ -15,6 +15,8 @@ pub struct Facts<'a> {
     pub snap: &'a Snapshot,
     pub report: Option<&'a Report>,
     pub fabric: Option<&'a FabricView>,
+    /// Where a running security check is.
+    pub progress: &'a crate::security::Progress,
     /// The engine the node lends (`OLLAMA_BASE`), or "" when not known here.
     pub engine: &'a str,
     /// The local dashboard's URL, when it runs.
@@ -88,10 +90,49 @@ fn onoff(v: bool) -> &'static str {
     }
 }
 
+/// The readiness meter in a terminal: the bar with its verdict, then the
+/// three conditions for Trusted as steps. The same words as the dashboard.
+pub fn readiness_lines(
+    report: Option<&Report>,
+    fabric: Option<&FabricView>,
+    progress: &crate::security::Progress,
+    now_s: u64,
+    color: bool,
+) -> Vec<String> {
+    let r = trust::readiness(report, fabric, progress, now_s);
+    let code = match r.band {
+        "green" => "32",
+        "amber" => "33",
+        "red" => "31",
+        _ => "2",
+    };
+    let mut out = vec![format!(
+        "  Readiness   {}  {}",
+        paint(color, code, &trust::readiness_bar(&r)),
+        r.verdict
+    )];
+    for (n, step) in r.steps.iter().enumerate() {
+        let mark = match step.state {
+            "done" => paint(color, "32", "[done]"),
+            "missing" => paint(color, "31", "[todo]"),
+            "checking" => paint(color, "2", "[ .. ]"),
+            _ => paint(color, "33", "[open]"),
+        };
+        out.push(format!(
+            "    Step {}  {mark} {}: {}",
+            n + 1,
+            step.label,
+            step.text
+        ));
+    }
+    out
+}
+
 /// The trust part, shared by the startup summary and `status`.
 pub fn trust_lines(
     report: Option<&Report>,
     fabric: Option<&FabricView>,
+    progress: &crate::security::Progress,
     now_s: u64,
     color: bool,
 ) -> Vec<String> {
@@ -108,6 +149,7 @@ pub fn trust_lines(
             out.push(format!("              fabric: {}", trust::fabric_line(f)));
         }
     }
+    out.extend(readiness_lines(report, fabric, progress, now_s, color));
     let mut bad = Vec::new();
     if let Some(r) = report {
         for item in trust::checklist(r, fabric) {
@@ -258,7 +300,9 @@ pub fn render(f: &Facts) -> String {
     out.push(format!("    CPU and RAM   {}", onoff(s.share_cpu)));
     out.push(format!("    Functions     {}", onoff(s.functions_enabled)));
     out.push(format!("    Vectors       {}", onoff(s.vectors_enabled)));
-    out.extend(trust_lines(f.report, f.fabric, f.now_s, f.color));
+    out.extend(trust_lines(
+        f.report, f.fabric, f.progress, f.now_s, f.color,
+    ));
     out.push("  Details     `kmplify-node security check`  every item with how to fix it".into());
     out.push("              `kmplify-node status`          this summary again".into());
     if let Some(url) = f.dashboard_url {
@@ -275,6 +319,7 @@ pub fn render(f: &Facts) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::Progress;
     use crate::trust::Match;
 
     fn snap() -> Snapshot {
@@ -341,6 +386,7 @@ mod tests {
             snap: &snap(),
             report: Some(&r),
             fabric: Some(&fabric),
+            progress: &Progress::default(),
             engine: "http://127.0.0.1:11434",
             dashboard_url: Some("http://127.0.0.1:5000/?t=x"),
             now_s: 1_800_000_000,
@@ -354,6 +400,11 @@ mod tests {
             "[ ?? ] Disk encryption",
             "Fix: Turn on BitLocker",
             "[FAIL] Screen lock: off",
+            "Readiness   [-##-##] 4/6  Ready for Trusted: 4 of 6 checks passed; missing: disk \
+             encryption, screen lock.",
+            "Step 1  [todo] Security baseline (this machine): 4 of 6 passed",
+            "Step 2  [open] Identity check (provider account): your KMPLIFY provider account",
+            "Step 3  [open] Trust grant (KMPLIFY): KMPLIFY grants Trusted",
             "without administrator rights",
             "kmplify-node security check",
             "Dashboard   http://127.0.0.1:5000/?t=x",
@@ -372,7 +423,8 @@ mod tests {
             pending_security_updates: Some(4),
             ..report()
         };
-        let lines = trust_lines(Some(&r), None, 1_800_000_000, false).join("\n");
+        let lines =
+            trust_lines(Some(&r), None, &Progress::default(), 1_800_000_000, false).join("\n");
         assert!(lines.contains("and 1 more"), "{lines}");
         assert!(lines.contains("NOT KNOWN YET"), "{lines}");
     }
@@ -412,7 +464,14 @@ mod tests {
             baseline_ok: Some(true),
             ..FabricView::default()
         };
-        let lines = trust_lines(Some(&r), Some(&trusted), 1_800_000_000, false).join("\n");
+        let lines = trust_lines(
+            Some(&r),
+            Some(&trusted),
+            &Progress::default(),
+            1_800_000_000,
+            false,
+        )
+        .join("\n");
         assert!(lines.contains("TRUSTED"), "{lines}");
         assert!(lines.contains("every item passes"), "{lines}");
         assert!(!lines.contains("Missing"), "{lines}");
