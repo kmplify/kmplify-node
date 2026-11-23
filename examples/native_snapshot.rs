@@ -18,7 +18,7 @@ mod snapshot {
     use std::path::{Path, PathBuf};
 
     use eframe::egui;
-    use kmplify_node::native::{section_ids, theme, App};
+    use kmplify_node::native::{section_ids, theme, window_icon, App};
 
     struct Snap {
         app: App,
@@ -126,6 +126,7 @@ mod snapshot {
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_title("KMPLIFY Node")
+                .with_icon(window_icon(256))
                 .with_inner_size(size)
                 .with_min_inner_size([300.0, 300.0]),
             ..Default::default()

@@ -22,6 +22,7 @@
 
 mod chart;
 mod icon;
+pub use icon::window_icon;
 pub mod theme;
 
 use std::collections::HashMap;
@@ -72,7 +73,7 @@ pub fn run(node_dir: PathBuf, engine: String) -> i32 {
         viewport: egui::ViewportBuilder::default()
             .with_title("KMPLIFY Node")
             .with_app_id("io.kmplify.node")
-            .with_icon(icon::window_icon(64))
+            .with_icon(icon::window_icon(256))
             .with_inner_size([1180.0, 780.0])
             .with_min_inner_size([760.0, 520.0]),
         ..Default::default()
@@ -123,6 +124,8 @@ pub struct App {
     /// When a re-check was asked for here, and the checked_at of the
     /// report on screen at that moment.
     recheck_asked: Option<(Instant, Option<u64>)>,
+    /// The KMPLIFY mark, uploaded once.
+    mark: Option<egui::TextureHandle>,
     /// The width of the content area this frame, read before the scroll
     /// area (whose inner width can grow with what was drawn last frame).
     content_width: f32,
@@ -228,6 +231,7 @@ impl App {
             log_filter: String::new(),
             closing: false,
             recheck_asked: None,
+            mark: None,
             content_width: 0.0,
         };
         app.refresh();
@@ -265,6 +269,7 @@ impl App {
             log_filter: String::new(),
             closing: false,
             recheck_asked: None,
+            mark: None,
             content_width: 0.0,
         }
     }
@@ -391,13 +396,35 @@ impl App {
 
     fn nav(&mut self, ui: &mut egui::Ui, m: &Value) {
         let p = theme::palette(ui.ctx());
-        ui.label(
-            RichText::new("KMPLIFY")
-                .family(theme::semibold())
-                .size(18.0)
-                .color(p.head),
-        );
-        ui.label(RichText::new("Node").size(13.0).color(p.muted));
+        let mark = self
+            .mark
+            .get_or_insert_with(|| {
+                ui.ctx().load_texture(
+                    "kmplify-mark",
+                    icon::mark_image(),
+                    egui::TextureOptions::LINEAR,
+                )
+            })
+            .clone();
+        ui.horizontal(|ui| {
+            // The KMPLIFY mark in the scheme's logo colour, as on the web
+            // dashboard's rail.
+            ui.add(
+                egui::Image::new(&mark)
+                    .fit_to_exact_size(egui::vec2(34.0, 34.0))
+                    .tint(p.logo),
+            );
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(
+                    RichText::new("KMPLIFY")
+                        .family(theme::semibold())
+                        .size(17.0)
+                        .color(p.logo),
+                );
+                ui.label(RichText::new("Node").size(12.5).color(p.muted));
+            });
+        });
         ui.add_space(18.0);
         let failing = m["trust"]["checklist"]
             .as_array()

@@ -62,6 +62,8 @@ pub struct Palette {
     pub warn: Color32,
     pub track: Color32,
     pub code_bg: Color32,
+    /// The KMPLIFY mark (`--logo`).
+    pub logo: Color32,
 }
 
 const fn rgb(hex: u32) -> Color32 {
@@ -84,6 +86,7 @@ pub const LIGHT: Palette = Palette {
     warn: rgb(0xa35200),
     track: rgb(0xe2e8f0),
     code_bg: rgb(0xf1f5f9),
+    logo: rgb(0x0f172a),
 };
 
 pub const DARK: Palette = Palette {
@@ -102,6 +105,7 @@ pub const DARK: Palette = Palette {
     warn: rgb(0xffba42),
     track: rgb(0x242f38),
     code_bg: rgb(0x111b22),
+    logo: rgb(0xffffff),
 };
 
 /// The palette of the scheme on screen now.

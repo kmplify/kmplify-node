@@ -55,6 +55,6 @@ overview of every node on the network), not a copy of its Go or TypeScript
 source. NVIDIA, Personal AI Router and PAIR are trademarks of NVIDIA
 Corporation and are not used to name or endorse this software.
 
-The KMPLIFY name and logo (the dashboard mark, its tab icon and the Windows
-program icon) are trademarks of KMPLIFY and are not licensed under the Apache
-License; see TRADEMARKS.md.
+The KMPLIFY name and logo (the dashboard mark, its tab icon, the app window's
+mark and window icon, and the Windows program icon) are trademarks of KMPLIFY
+and are not licensed under the Apache License; see TRADEMARKS.md.
