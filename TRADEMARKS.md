@@ -21,8 +21,10 @@ Used by KMPLIFY, whether or not registered in a given jurisdiction:
 
 - **KMPLIFY**, as a word
 - the KMPLIFY logo and wordmark, including where this repository ships them:
-  the mark and tab icon of the local dashboard (`src/dashboard/assets`) and the
-  program icon of the Windows build (`packaging/windows/kmplify-node.ico`).
+  the mark and tab icon of the local dashboard (`src/dashboard/assets`), the
+  same mark in the native app window's side rail and as its window icon
+  (`src/native/assets/kmplify-mark-256.alpha`, drawn by `src/native/icon.rs`)
+  and the program icon of the Windows build (`packaging/windows/kmplify-node.ico`).
   They are in the repository so official builds carry them; the Apache License
   does not cover them (its section 6 grants no trademark rights). A fork
   replaces them.

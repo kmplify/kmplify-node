@@ -42,6 +42,7 @@ RUN case "$TARGETARCH" in \
  && export KMPLIFY_BUILD="${KMPLIFY_BUILD:-$(git rev-parse --short HEAD)}" \
  && echo "build stamp: $KMPLIFY_BUILD" \
  && cargo build --release --target "$MUSL_TARGET" \
+      --no-default-features --features tui,wasm,dashboard,router \
  && cp "target/$MUSL_TARGET/release/kmplify-node" /kmplify-node.out
 
 FROM scratch AS export

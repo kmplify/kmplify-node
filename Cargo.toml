@@ -78,6 +78,26 @@ ratatui = { version = "0.30", optional = true }
 # trap path was broken.
 wasmtime = { version = "48", optional = true, default-features = false, features = ["cranelift", "runtime", "wat"] }
 wasmtime-wasi = { version = "48", optional = true, default-features = false, features = ["p1"] }
+# The LAN router (src/router, feature `router`): finding the other
+# kmplify-nodes on this network. Its own mDNS responder rather than the
+# system's, because Windows ships none; shares UDP 5353 with Bonjour and
+# Avahi where they exist. Apache-2.0 OR MIT.
+mdns-sd = { version = "0.21", optional = true }
+# The router's request signatures (src/router/auth.rs): HMAC-SHA256 with the
+# cluster key, so the key itself never crosses the network. RustCrypto, the
+# same family as the sha2 above. Apache-2.0 OR MIT.
+hmac = { version = "0.12", optional = true }
+# The native app window (src/native, feature `native-gui`): the node's views
+# drawn with egui. The OpenGL backend only (the smaller tree; enough for a
+# dashboard), and WITHOUT egui's bundled default fonts: those carry the
+# Ubuntu Font Licence, which this repository does not ship. The window uses
+# Inter, the KMPLIFY brand face, compiled in from src/native/fonts (OFL 1.1).
+# eframe and egui are Apache-2.0 OR MIT.
+eframe = { version = "0.36", optional = true, default-features = false, features = [
+    "glow",
+    "wayland",
+    "x11",
+] }
 hpke = { version = "0.13", default-features = false, features = ["x25519", "alloc"] }
 aes-gcm = "0.10"
 base64 = "0.22"
@@ -99,7 +119,7 @@ winresource = { version = "0.1", default-features = false }
 # schedule a function and NOT ONE node could run it: the runtime was absent
 # from every build anyone actually installed. A capability that ships turned
 # off in every artifact is a capability that does not exist.
-default = ["tui", "wasm", "dashboard"]
+default = ["tui", "wasm", "dashboard", "router", "native-gui"]
 # `kmplify-node tui`: watch and control the node from a terminal.
 tui = ["dep:ratatui"]
 # Host signed Wasm functions in an in-process sandbox (wasmtime, WASI p1).
@@ -111,6 +131,21 @@ wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
 # listens, on loopback with a per-start token. Without it `--ui gui` falls
 # back to the terminal summary.
 dashboard = []
+# The LAN router (`kmplify-node router`, src/router): this node's report for
+# the other kmplify-nodes on the local network, and theirs for it. Compiled
+# in by default, OFF at runtime until the operator turns it on
+# (`kmplify-node set router=local|lan`). Loopback only unless LAN mode is
+# chosen, and then only for an allowlist and with the cluster key; see
+# src/router/mod.rs and docs/ROUTER.md.
+router = ["dep:mdns-sd", "dep:hmac"]
+# The native app window (`--ui app`, `--ui native`, `kmplify-node window`):
+# the node's views in an egui window with the same sections, metrics and
+# actions as the web dashboard and the terminal view (src/views.rs). Without
+# it, or where no display is available, `--ui app` falls back to the interim
+# browser app window. Linux needs the display libraries at runtime only
+# (libGL/EGL, libxkbcommon, X11 or Wayland); the static musl release builds
+# leave it out, see .github/workflows/release.yml.
+native-gui = ["dep:eframe"]
 # The provider as a library, for an application that embeds it (the KMPLIFY
 # desktop app): the fabric worker, host facts, the security self-check, the
 # operator session, the node identity and the `host::ProviderHost` hooks.

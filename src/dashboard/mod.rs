@@ -23,7 +23,9 @@
 //! * **No secrets on screen.** The credential, the colibri key and the
 //!   dashboard token are never in an answer; log lines are redacted.
 
-#[cfg(feature = "dashboard")]
+/// The tiny HTTP/1.1 reader and writer the dashboard serves with; the LAN
+/// router's node-info surface uses it too.
+#[cfg(any(feature = "dashboard", feature = "router"))]
 pub mod http;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -74,8 +76,9 @@ pub enum UiMode {
     None,
     /// The terminal dashboard in this console (the terminal view).
     Tui,
-    /// The dashboard in a chromeless app window. Interim: replaced by the
-    /// native window (router GUI port) once that exists.
+    /// The app window: the native window (`native-gui`), or where that is
+    /// not built in or cannot start (no display), the interim browser app
+    /// window. `native` is accepted as another name for it.
     App,
 }
 
@@ -86,9 +89,9 @@ impl UiMode {
             "terminal" | "console" | "tty" => Ok(UiMode::Terminal),
             "none" | "off" | "service" => Ok(UiMode::None),
             "tui" | "dashboard" => Ok(UiMode::Tui),
-            "app" => Ok(UiMode::App),
+            "app" | "native" => Ok(UiMode::App),
             other => Err(format!(
-                "KMPLIFY_NODE_UI (--ui) must be tui, gui, app, terminal or none, not {other:?}"
+                "KMPLIFY_NODE_UI (--ui) must be tui, gui, app, native, terminal or none, not {other:?}"
             )),
         }
     }
@@ -366,36 +369,42 @@ pub async fn route(req: &Request, ctx: &Ctx, port: u16) -> Response {
         ("GET", "/favicon.svg") => Response::new(200, "image/svg+xml", FAVICON_SVG),
         ("GET", "/inter.woff2") => Response::new(200, "font/woff2", INTER_WOFF2),
         ("GET", "/api/state") => Response::json(200, &state(ctx)),
-        ("POST", "/api/recheck") => command(crate::control::Command::Recheck),
-        ("POST", "/api/pause") => command(crate::control::Command::Pause),
-        ("POST", "/api/resume") => command(crate::control::Command::Resume),
-        ("POST", "/api/reconnect") => command(crate::control::Command::Reconnect),
+        ("POST", "/api/recheck") => command(ctx, crate::views::Act::Recheck),
+        ("POST", "/api/pause") => command(ctx, crate::views::Act::Pause),
+        ("POST", "/api/resume") => command(ctx, crate::views::Act::Resume),
+        ("POST", "/api/reconnect") => command(ctx, crate::views::Act::Reconnect),
         ("POST", "/api/settings") => set_setting(ctx, &req.body, false),
         ("POST", "/api/settings/clear") => set_setting(ctx, &req.body, true),
-        ("POST", "/api/session/stop") => stop_session(&req.body),
+        ("POST", "/api/session/stop") => stop_session(ctx, &req.body),
         ("POST", "/api/report") => report(ctx),
-        ("POST", "/api/shutdown") => command(crate::control::Command::Shutdown),
-        ("POST", "/api/view") => switch_view(&req.body),
+        ("POST", "/api/shutdown") => command(ctx, crate::views::Act::StopNode),
+        ("POST", "/api/view") => switch_view(ctx, &req.body),
         (_, p) if p.starts_with("/api/") => Response::text(404, "no such call"),
         _ => Response::text(404, "not found"),
     }
 }
 
+/// Carry out one action through the action layer every view shares
+/// ([`crate::views::perform`]), and answer with its outcome.
 #[cfg(feature = "dashboard")]
-fn command(cmd: crate::control::Command) -> Response {
-    let message = cmd.confirmation();
-    let ok = if matches!(cmd, crate::control::Command::Recheck) {
-        202
-    } else {
-        200
-    };
-    match crate::control::submit(&cmd) {
-        Ok(()) => Response::json(
-            ok,
-            &json!({"ok": true, "started": true, "message": message}),
-        ),
-        Err(e) => Response::json(409, &json!({"ok": false, "started": false, "message": e})),
+fn act(ctx: &Ctx, act: crate::views::Act) -> Response {
+    let commanded = !matches!(
+        act,
+        crate::views::Act::Report
+            | crate::views::Act::Setting { .. }
+            | crate::views::Act::SettingClear { .. }
+    );
+    let o = crate::views::perform(crate::views::Target::InProcess, &ctx.node_dir, &act);
+    let mut body = json!({"ok": o.ok, "message": o.message});
+    if commanded {
+        body["started"] = json!(o.ok);
     }
+    Response::json(o.status, &body)
+}
+
+#[cfg(feature = "dashboard")]
+fn command(ctx: &Ctx, a: crate::views::Act) -> Response {
+    act(ctx, a)
 }
 
 /// The settings the views may change; one table for all of them.
@@ -411,29 +420,19 @@ fn body_str(body: &[u8], key: &str) -> Option<String> {
 /// `/api/session/stop {"id": session}`: the session must be one this node
 /// hosts now; anything else is refused before a command is sent.
 #[cfg(feature = "dashboard")]
-fn stop_session(body: &[u8]) -> Response {
+fn stop_session(ctx: &Ctx, body: &[u8]) -> Response {
     let Some(id) = body_str(body, "id") else {
         return Response::json(400, &json!({"ok": false, "message": "no session id"}));
     };
-    if !crate::status::snapshot()
-        .sessions
-        .iter()
-        .any(|s| s.session_id == id)
-    {
-        return Response::json(
-            404,
-            &json!({"ok": false, "message": "no such session on this machine"}),
-        );
-    }
-    command(crate::control::Command::StopSession(id))
+    act(ctx, crate::views::Act::StopSession(id))
 }
 
 /// `/api/view {"view": "web" | "app" | "terminal"}`.
 #[cfg(feature = "dashboard")]
-fn switch_view(body: &[u8]) -> Response {
+fn switch_view(ctx: &Ctx, body: &[u8]) -> Response {
     match body_str(body, "view") {
         Some(v) if crate::control::VIEWS.contains(&v.as_str()) => {
-            command(crate::control::Command::View(v))
+            act(ctx, crate::views::Act::View(v))
         }
         _ => Response::json(
             400,
@@ -444,13 +443,7 @@ fn switch_view(body: &[u8]) -> Response {
 
 #[cfg(feature = "dashboard")]
 fn report(ctx: &Ctx) -> Response {
-    match crate::views::write_report(&ctx.node_dir, &crate::status::snapshot()) {
-        Ok(p) => Response::json(
-            200,
-            &json!({"ok": true, "message": format!("wrote {}", p.display())}),
-        ),
-        Err(e) => Response::json(500, &json!({"ok": false, "message": e})),
-    }
+    act(ctx, crate::views::Act::Report)
 }
 
 #[cfg(feature = "dashboard")]
@@ -461,40 +454,27 @@ fn set_setting(ctx: &Ctx, body: &[u8], clear: bool) -> Response {
     let Some(key) = v["key"].as_str() else {
         return Response::json(400, &json!({"ok": false, "message": "no key"}));
     };
-    if !EDITABLE.contains(&key) {
-        return Response::json(
-            403,
-            &json!({"ok": false, "message": format!("{key} is not changed from the dashboard; use kmplify-node set")}),
+    let key = key.to_string();
+    if clear {
+        return act(ctx, crate::views::Act::SettingClear { key });
+    }
+    if !EDITABLE.contains(&key.as_str()) {
+        // Refused before the value is even looked at, as it always was.
+        return act(
+            ctx,
+            crate::views::Act::Setting {
+                key,
+                value: String::new(),
+            },
         );
     }
-    let mut stored = crate::settings::Settings::load(&ctx.node_dir);
-    let result = if clear {
-        stored.clear(key)
-    } else {
-        let value = match &v["value"] {
-            Value::String(s) => s.clone(),
-            Value::Bool(b) => b.to_string(),
-            Value::Number(n) => n.to_string(),
-            _ => return Response::json(400, &json!({"ok": false, "message": "no value"})),
-        };
-        stored.set(key, &value)
+    let value = match &v["value"] {
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        _ => return Response::json(400, &json!({"ok": false, "message": "no value"})),
     };
-    if let Err(e) = result {
-        return Response::json(400, &json!({"ok": false, "message": e}));
-    }
-    if let Err(e) = stored.save(&ctx.node_dir) {
-        return Response::json(
-            500,
-            &json!({"ok": false, "message": format!("cannot save: {e}")}),
-        );
-    }
-    // No live gateway session is fine: the worker re-reads the file before
-    // it dials again.
-    let _ = crate::control::submit(&crate::control::Command::Reload);
-    Response::json(
-        200,
-        &json!({"ok": true, "message": "saved; the node re-advertises within seconds"}),
-    )
+    act(ctx, crate::views::Act::Setting { key, value })
 }
 
 /// Everything the page shows, in one answer: [`crate::views::model`] of this
@@ -621,8 +601,9 @@ fn app_browsers() -> Vec<std::path::PathBuf> {
 
 /// Open the dashboard in an app window of its own.
 ///
-/// INTERIM: a Chromium-family browser in app mode (`--app=URL`) stands in
-/// until the native window (the router GUI port) exists, which replaces it.
+/// The FALLBACK of the app view: the native window (`crate::native`) is
+/// tried first, and this is used where it is not built in or cannot start.
+/// A Chromium-family browser in app mode (`--app=URL`).
 /// The URL goes over as one argument, never through a shell; it carries the
 /// per-start token, which is therefore visible in this user's process list,
 /// exactly as it is when the default browser is started with it. Without
@@ -761,6 +742,9 @@ mod tests {
         assert_eq!(UiMode::resolve(Some("none"), true), Ok(UiMode::None));
         assert_eq!(UiMode::resolve(Some("GUI"), false), Ok(UiMode::Gui));
         assert!(UiMode::resolve(Some("window"), true).is_err());
+        // The native window is the app view; `native` names it too.
+        assert_eq!(UiMode::resolve(Some("native"), false), Ok(UiMode::App));
+        assert_eq!(UiMode::resolve(Some("app"), false), Ok(UiMode::App));
         assert_eq!(parse_port(None), Ok(0));
         assert_eq!(parse_port(Some("8765")), Ok(8765));
         assert!(parse_port(Some("http")).is_err());
