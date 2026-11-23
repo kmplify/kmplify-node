@@ -175,6 +175,11 @@ pub const METRICS: &[Metric] = &[
         terminal_form: "",
     },
     Metric {
+        section: "earnings",
+        label: "Link code",
+        terminal_form: "",
+    },
+    Metric {
         section: "settings",
         label: "Settings",
         terminal_form: "",
@@ -264,6 +269,12 @@ pub const ACTIONS: &[Action] = &[
         label: "Stop session",
         web: "/api/session/stop",
         tui_key: "e",
+    },
+    Action {
+        id: "link_code",
+        label: "Make a link code",
+        web: "/api/link-code",
+        tui_key: "L",
     },
     Action {
         id: "report",
@@ -956,6 +967,12 @@ pub enum Act {
     /// Get the cluster key from the device showing a PIN (`kmplify-node
     /// router join --pin`).
     RouterJoinPin(PinJoin),
+    /// A fresh link code from this node's credential, bound to an account
+    /// when `nonce` carries that account's challenge. The code is in the
+    /// outcome's message only; it is never stored or logged.
+    LinkCode {
+        nonce: Option<String>,
+    },
 }
 
 /// A PIN typed into a view, with the address the other device shows. The
@@ -1026,6 +1043,7 @@ impl Act {
             Act::RouterPair => "router_pair",
             Act::RouterPairClose => "router_pair_close",
             Act::RouterJoinPin(_) => "router_join_pin",
+            Act::LinkCode { .. } => "link_code",
         }
     }
 }
@@ -1142,6 +1160,17 @@ pub fn perform_with(
                     ),
                 ),
                 Err(e) => Outcome::fail(500, e),
+            }
+        }
+        Act::LinkCode { nonce } => {
+            let creds = crate::fabric_worker::default_creds_path(node_dir);
+            match crate::link::for_credentials(&creds, nonce.as_deref()) {
+                Ok(c) => {
+                    let mut lines = crate::link::instructions(&c, nonce.is_some());
+                    lines.push(c.code);
+                    Outcome::ok(200, lines.join("\n"))
+                }
+                Err(e) => Outcome::fail(409, e),
             }
         }
         Act::RouterJoin(JoinKey(text)) => {
@@ -1609,6 +1638,12 @@ mod tests {
         }
         #[cfg(not(feature = "router"))]
         ids.extend(["router_pair", "router_pair_close", "router_join_pin"]);
+        // A link code needs the node's credential; without one it is refused
+        // with a reason, never a code.
+        let o = perform(Target::Attached, &dir, &Act::LinkCode { nonce: None });
+        assert!(!o.ok && o.status == 409, "{}", o.message);
+        assert!(drained().is_empty());
+        ids.push("link_code");
         // Every contract action was exercised.
         for a in ACTIONS {
             assert!(ids.contains(&a.id), "{} not exercised", a.id);

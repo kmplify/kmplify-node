@@ -401,3 +401,4 @@ th:last-child { border-radius: 0 6px 6px 0; }
   .rrow { grid-template-columns: minmax(0, 1fr); }
   .nodes { grid-template-columns: minmax(0, 1fr); }
 }
+#link-nonce { width: 100%; max-width: 28rem; margin: 4px 0 8px; font-family: inherit; }
