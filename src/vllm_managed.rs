@@ -171,19 +171,25 @@ pub fn base_url() -> String {
     format!("http://127.0.0.1:{PORT}")
 }
 
+/// How long the clean-up `docker rm -f` may take. It runs before the node's
+/// first output on every start, so it is short.
+const REMOVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// `docker inspect` / `docker logs` while vLLM starts.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub async fn remove() {
     // A Docker that is not running, still starting or wedged can leave the
     // CLI waiting for minutes; this clean-up must never hold the node's start.
-    let mut cmd = crate::proc::command("docker");
-    cmd.args(["rm", "-f", CONTAINER]).kill_on_drop(true);
-    if tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
-        .await
-        .is_err()
+    if let Err(e) =
+        crate::fabric_worker::docker_bounded(&["rm", "-f", CONTAINER], REMOVE_TIMEOUT).await
     {
-        eprintln!(
-            "[kmplify-node] docker did not answer within 10 s (is Docker running?); \
-             skipped removing an old vLLM container"
-        );
+        // Not installed is the normal case on most machines and says nothing;
+        // a docker that does not answer is worth one line.
+        if !e.contains("unavailable") {
+            eprintln!(
+                "[kmplify-node] {e} (is Docker running?); skipped removing an old vLLM container"
+            );
+        }
     }
 }
 
@@ -198,11 +204,17 @@ pub async fn start(
     let args = run_args(backend, model, max_model_len, tuning)?;
     // Never two: a container left by a killed node holds the GPU and port.
     remove().await;
-    let out = crate::proc::command("docker")
-        .args(&args)
-        .output()
-        .await
-        .map_err(|e| format!("docker is not usable: {e}"))?;
+    // `docker run -d` pulls the engine image on a first start (many GB), so
+    // the same ceiling as the whole start; the CLI is killed at the limit.
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = match crate::fabric_worker::docker_bounded(&argv, START_TIMEOUT).await {
+        Ok(o) => o,
+        Err(e) => {
+            // It may exist by now; nothing half-started may hold the GPU.
+            remove().await;
+            return Err(format!("docker is not usable: {e}"));
+        }
+    };
     if !out.status.success() {
         let tail = String::from_utf8_lossy(&out.stderr)
             .lines()
@@ -224,17 +236,21 @@ pub async fn start(
             }
         }
         // Died (bad model id, out of memory): say so now, not in 30 minutes.
-        let running = crate::proc::command("docker")
-            .args(["inspect", "-f", "{{.State.Running}}", CONTAINER])
-            .output()
-            .await
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
-            .unwrap_or(false);
+        // No answer counts as not running, as before for a docker that is
+        // gone: vLLM is reported as not started and the container removed.
+        let running = crate::fabric_worker::docker_bounded(
+            &["inspect", "-f", "{{.State.Running}}", CONTAINER],
+            CONTROL_TIMEOUT,
+        )
+        .await
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
+        .unwrap_or(false);
         if !running {
-            let logs = crate::proc::command("docker")
-                .args(["logs", "--tail", "3", CONTAINER])
-                .output()
-                .await;
+            let logs = crate::fabric_worker::docker_bounded(
+                &["logs", "--tail", "3", CONTAINER],
+                CONTROL_TIMEOUT,
+            )
+            .await;
             let tail = logs
                 .map(|o| {
                     String::from_utf8_lossy(&o.stderr)
