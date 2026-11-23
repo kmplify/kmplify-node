@@ -673,7 +673,8 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
 // ------------------------------------------------------------------ render
 
 fn draw(f: &mut Frame, app: &App) {
-    let [header, sub, body, footer] = Layout::vertical([
+    let [header, sub, trust, body, footer] = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(6),
@@ -683,6 +684,7 @@ fn draw(f: &mut Frame, app: &App) {
 
     f.render_widget(header_line(app), header);
     f.render_widget(sub_line(app), sub);
+    f.render_widget(trust_line(&app.snap), trust);
     match app.view {
         View::Home => draw_home(f, app, body),
         View::Sessions => draw_sessions(f, app, body),
@@ -721,6 +723,39 @@ fn header_line(app: &App) -> Paragraph<'static> {
         ),
         Span::raw("   "),
         Span::styled(title, Style::new().fg(view_colour(app.view)).bold()),
+    ]))
+}
+
+/// The trust readiness meter in one line: the bar, coloured by band, and
+/// the verdict in the same words as the dashboard and `status`.
+fn trust_line(s: &Snapshot) -> Paragraph<'static> {
+    let progress = s.security_progress.clone().unwrap_or_default();
+    if s.security.is_none() && !progress.running {
+        return Paragraph::new(Line::from(Span::styled(
+            " trust     security check not published yet",
+            Style::new().fg(MUTED),
+        )));
+    }
+    let r = kmplify_node::trust::readiness(
+        s.security.as_ref(),
+        s.fabric_trust.as_ref(),
+        &progress,
+        kmplify_node::identity::now_s(),
+    );
+    let colour = match r.band {
+        "green" => Color::Green,
+        "amber" => Color::Yellow,
+        "red" => Color::Red,
+        _ => MUTED,
+    };
+    Paragraph::new(Line::from(vec![
+        Span::styled(" trust     ", Style::new().fg(MUTED)),
+        Span::styled(
+            kmplify_node::trust::readiness_bar(&r),
+            Style::new().fg(colour).bold(),
+        ),
+        Span::raw("  "),
+        Span::styled(r.verdict, Style::new().fg(Color::White)),
     ]))
 }
 

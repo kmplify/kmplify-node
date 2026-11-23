@@ -289,6 +289,9 @@ pub struct Snapshot {
     /// level, site, baseline as the fabric evaluated it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fabric_trust: Option<crate::trust::FabricView>,
+    /// Where a running security check is, while one runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_progress: Option<crate::security::Progress>,
     /// Port of the local web dashboard, when it runs. The URL with its
     /// token is in its own owner-only file (`dashboard::URL_FILE`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -420,6 +423,7 @@ pub fn snapshot() -> Snapshot {
     s.reconnects = RECONNECTS.load(Ordering::Relaxed);
     s.security = crate::security::latest();
     s.fabric_trust = crate::trust::latest();
+    s.security_progress = Some(crate::security::progress()).filter(|p| p.running);
     s.paused = paused();
     s.published_at_ms = now_ms();
     s

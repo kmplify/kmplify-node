@@ -170,6 +170,7 @@ async fn collect_os() -> Found {
         f.hints
             .push("FileVault status could not be read (fdesetup status).".into());
     }
+    super::progress_mark(&[Item::DiskEncrypted]);
 
     f.last_update = match run(
         "/usr/sbin/system_profiler",
@@ -194,6 +195,7 @@ async fn collect_os() -> Found {
                 .into(),
         );
     }
+    super::progress_mark(&[Item::PatchAge]);
 
     f.firewall_on = match run(
         "/usr/libexec/ApplicationFirewall/socketfilterfw",
@@ -210,6 +212,7 @@ async fn collect_os() -> Found {
             "The Application Firewall is off (pf rules are not read).".into(),
         ));
     }
+    super::progress_mark(&[Item::Firewall]);
 
     // Screen lock is a per-user setting: read for the account the node runs
     // as. Under launchd as root there is no person's setting to read.
@@ -235,6 +238,7 @@ async fn collect_os() -> Found {
                 .into(),
         );
     }
+    super::progress_mark(&[Item::ScreenLock]);
 
     // Remote Login is launchd's com.openssh.sshd: loaded only while it is on.
     let remote_login = run("/bin/launchctl", &["print", "system/com.openssh.sshd"])
@@ -327,6 +331,8 @@ async fn collect_os() -> Found {
             .push("Windows PowerShell did not answer; no Windows check could run.".into());
         return f;
     };
+    // One PowerShell run has read these; the update search follows.
+    super::progress_mark(&[Item::DiskEncrypted, Item::Firewall, Item::ScreenLock]);
 
     let (disk, plain) = w.bitlocker();
     f.disk_encrypted = disk;
@@ -370,6 +376,7 @@ async fn collect_os() -> Found {
                 .into(),
         );
     }
+    super::progress_mark(&[Item::PatchAge]);
 
     let (fw, off) = w.firewall_on();
     f.firewall_on = fw;
@@ -489,6 +496,7 @@ async fn collect_os() -> Found {
             .hints
             .push("lsblk is missing or failed; disk encryption could not be read.".into()),
     }
+    super::progress_mark(&[Item::DiskEncrypted]);
 
     // Last security update, best effort: apt, dnf, pacman.
     let mut stamps: Vec<i64> = Vec::new();
@@ -564,6 +572,7 @@ async fn collect_os() -> Found {
                 .into(),
         );
     }
+    super::progress_mark(&[Item::PatchAge]);
 
     // Firewall: ufw or firewalld switched on, or an nftables input filter.
     let ufw_conf = std::fs::read_to_string("/etc/ufw/ufw.conf")
@@ -593,6 +602,7 @@ async fn collect_os() -> Found {
         );
         None
     };
+    super::progress_mark(&[Item::Firewall]);
 
     // Screen lock: only where someone sits at a desktop.
     let own_desktop =
@@ -668,6 +678,7 @@ async fn collect_os() -> Found {
             );
         }
     }
+    super::progress_mark(&[Item::ScreenLock]);
 
     // sshd: running (a process, a socket-activated unit, or port 22).
     let sshd_process = std::fs::read_dir("/proc")

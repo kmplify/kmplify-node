@@ -429,6 +429,12 @@ pub fn state(ctx: &Ctx) -> Value {
     let now_s = crate::identity::now_s();
     let stored = crate::settings::Settings::load(&ctx.node_dir);
     let standing = crate::trust::standing(report.as_ref(), fabric.as_ref(), now_s);
+    let readiness = crate::trust::readiness(
+        report.as_ref(),
+        fabric.as_ref(),
+        &crate::security::progress(),
+        now_s,
+    );
     let checklist = report
         .as_ref()
         .map(|r| crate::trust::checklist(r, fabric.as_ref()))
@@ -662,6 +668,7 @@ pub fn state(ctx: &Ctx) -> Value {
         },
         "trust": {
             "standing": standing,
+            "readiness": readiness,
             "checklist": checklist,
             "checked_at": report.as_ref().map(|r| r.checked_at),
             "checker_version": report.as_ref().map(|r| r.checker_version.clone()),
