@@ -88,6 +88,14 @@ pub struct Cli {
     pub list: bool,
     /// `peers`: the verb and its argument, e.g. `["approve", "node-9"]`.
     pub args: Vec<String>,
+    /// `router join --pin [PIN]`: join by PIN pairing. `Some("")` = ask for
+    /// the PIN on standard input.
+    pub pin: Option<String>,
+    /// `router join --pin --at ADDRESS[:PORT]`: the device showing the PIN.
+    pub at: Option<String>,
+    /// `router pair --lan`: pairing mode on the network (allowlist only) for
+    /// the PIN's two minutes, even when the router is not in LAN mode.
+    pub lan: bool,
 }
 
 impl Default for Cli {
@@ -104,6 +112,9 @@ impl Default for Cli {
             clear_all: false,
             list: false,
             args: Vec::new(),
+            pin: None,
+            at: None,
+            lan: false,
         }
     }
 }
@@ -246,7 +257,7 @@ pub fn usage() -> String {
          \x20 kmplify-node rewards             delivered work, and an optional payout companion\n\
          \x20 kmplify-node security check      trusted node baseline: what passes, how to fix\n\
          \x20 kmplify-node window              the app window of the node running here\n\
-         \x20 kmplify-node router [VERB]       the LAN router: state, key, join, new-key\n\
+         \x20 kmplify-node router [VERB]       the LAN router: state, pair, join, key\n\
          \x20 kmplify-node version | help\n\
          \n\
          DASHBOARD\n\
@@ -409,6 +420,22 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
             "--clear-all" => cli.clear_all = true,
             "--list" => cli.list = true,
             "--attach" => cli.attach = true,
+            "--lan" => cli.lan = true,
+            "--at" => cli.at = Some(take(&name, inline, argv, &mut i)?),
+            "--pin" => {
+                // A value is optional: `--pin=123456`, `--pin 123456`, or
+                // `--pin` alone to type it at a prompt (no shell history).
+                cli.pin = Some(match inline {
+                    Some(v) => v,
+                    None => match argv.get(i) {
+                        Some(v) if !v.starts_with('-') && v.chars().any(|c| c.is_ascii_digit()) => {
+                            i += 1;
+                            v.clone()
+                        }
+                        _ => String::new(),
+                    },
+                });
+            }
             "--standalone" => cli.standalone = true,
             "--timeout" => {
                 let raw = take(&name, inline, argv, &mut i)?;
@@ -481,6 +508,18 @@ pub fn parse(argv: &[String]) -> Result<Cli, String> {
         }
         cli.args.clear();
     }
+    if cli.pin.is_some() || cli.at.is_some() {
+        if !(cli.cmd == Cmd::Router && cli.args.first().map(String::as_str) == Some("join")) {
+            return Err("`--pin` and `--at` belong to `kmplify-node router join`".into());
+        }
+        if cli.pin.is_none() {
+            return Err("`--at` goes with `--pin` (router join --pin --at ADDRESS)".into());
+        }
+    }
+    if cli.lan && !(cli.cmd == Cmd::Router && cli.args.first().map(String::as_str) == Some("pair"))
+    {
+        return Err("`--lan` belongs to `kmplify-node router pair`".into());
+    }
     if cli.cmd == Cmd::Router {
         match cli.args.as_slice() {
             [] => {}
@@ -514,7 +553,13 @@ pub const ROUTER_VERBS: &[(&str, &str)] = &[
     ),
     (
         "join",
-        "read a cluster key from standard input and use it here",
+        "read a cluster key from standard input and use it here; with --pin [PIN] --at \
+         ADDRESS[:PORT], get it by PIN pairing instead",
+    ),
+    (
+        "pair",
+        "show a six-digit PIN for two minutes so another device can join (--lan: on the \
+         network for the allowlist)",
     ),
     (
         "new-key",
@@ -784,5 +829,32 @@ mod tests {
             assert!(text.contains(name), "{flag} missing from usage");
             assert!(text.contains(key), "{key} missing from usage");
         }
+    }
+
+    #[test]
+    fn router_pairing_flags_parse_and_belong_to_their_verbs() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let c = p(&["router", "pair"]).unwrap();
+        assert_eq!(c.args, vec!["pair"]);
+        assert!(!c.lan);
+        assert!(p(&["router", "pair", "--lan"]).unwrap().lan);
+        let c = p(&[
+            "router",
+            "join",
+            "--pin",
+            "123456",
+            "--at",
+            "127.0.0.1:14419",
+        ])
+        .unwrap();
+        assert_eq!(c.pin.as_deref(), Some("123456"));
+        assert_eq!(c.at.as_deref(), Some("127.0.0.1:14419"));
+        // --pin alone: asked for at a prompt.
+        let c = p(&["router", "join", "--pin", "--at", "127.0.0.1"]).unwrap();
+        assert_eq!(c.pin.as_deref(), Some(""));
+        assert!(p(&["router", "pair", "--pin", "1"]).is_err());
+        assert!(p(&["router", "join", "--at", "127.0.0.1"]).is_err());
+        assert!(p(&["router", "join", "--lan"]).is_err());
+        assert!(p(&["status", "--lan"]).is_err());
     }
 }

@@ -1010,3 +1010,20 @@ Authorization: Bearer <node token>
 
 Credits are a prepaid balance for KMPLIFY services. The node cannot spend,
 move or pay them out, and nothing in scheduling or admission reads them.
+
+## LAN router: protocol v1 and v2 (node to node, not the gateway)
+
+The LAN router (docs/ROUTER.md) is separate from the gateway protocol above.
+v2 (2026-11-23) is **additive**; v1 stays served:
+
+| | v1 | v2 |
+|---|---|---|
+| mDNS TXT | `v=1`, `kf` | `v=2`, `kf` |
+| Node-info `:14418` | signed plain HTTP (`x-kmplify-router-auth: v1.…`, `x-kmplify-router-sig`) | the same request and answer inside TLS 1.3 with client certificates bound to the cluster key |
+| Joining a cluster | type the 64-hex key (`router join`) | PIN pairing on `:14419` (`/v2/pair/start`, `/v2/pair/finish`), SPAKE2 + HKDF + AES-256-GCM |
+| `router.json` | `schema: 1` | `schema: 2`: `cert_fingerprint`; peers `proto`, `secure` |
+
+The node-info port tells the two apart by the first byte (0x16 = TLS
+handshake). A v2 node asks a `v=2` peer over TLS only. Key format and
+fingerprint are unchanged, so v1 and v2 nodes with the same key form one
+cluster. Wire details: docs/ROUTER.md, "Pairing" and "Mutual TLS".

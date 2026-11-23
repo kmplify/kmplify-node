@@ -63,8 +63,49 @@ pub fn answer(
     resp.with_header(auth::SIG_HEADER, sig)
 }
 
+/// Read one request from `stream`, answer it, write the answer.
+async fn exchange<S>(
+    stream: &mut S,
+    shared: &Shared,
+    verifier: &std::sync::Mutex<Verifier>,
+    key: &ClusterKey,
+    peer: SocketAddr,
+) where
+    S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin,
+{
+    let resp = match tokio::time::timeout(http::READ_DEADLINE, http::read_request(stream)).await {
+        Ok(Ok(req)) => {
+            let report = lock(shared).local.clone();
+            let mut v = verifier.lock().unwrap_or_else(|p| p.into_inner());
+            let resp = answer(&req, key, &mut v, report.as_ref(), crate::status::now_ms());
+            if resp.status == 401 {
+                drop(v);
+                lock(shared).push_log(format!(
+                    "refused an unsigned or foreign request from {}",
+                    peer.ip()
+                ));
+            }
+            resp
+        }
+        Ok(Err(code)) => Response::text(code, "bad request"),
+        Err(_) => return,
+    };
+    http::write_response(stream, &resp).await;
+}
+
 /// Bind for `config` and serve until aborted.
-pub async fn serve(shared: Shared, config: Config, key: ClusterKey) {
+///
+/// One port, two protocols: a connection that opens with a TLS handshake
+/// record is protocol v2 (mutual TLS, both certificates bound to the
+/// cluster key, see [`super::tls`]); anything else is v1, signed plain HTTP,
+/// kept for nodes before v2 and for apps on this computer. The same signed
+/// request and signed answer travel inside the TLS session.
+pub async fn serve(
+    shared: Shared,
+    config: Config,
+    key: ClusterKey,
+    identity: Option<super::tls::BoundIdentity>,
+) {
     let Some(addr) = policy::bind_addr(config.mode, config.port) else {
         return;
     };
@@ -98,6 +139,12 @@ pub async fn serve(shared: Shared, config: Config, key: ClusterKey) {
             }
         ));
     }
+    let acceptor = identity.as_ref().and_then(|id| {
+        super::tls::server_config(id, &key)
+            .map(tokio_rustls::TlsAcceptor::from)
+            .map_err(|e| lock(&shared).push_log(format!("TLS unavailable: {e}")))
+            .ok()
+    });
     let verifier = Arc::new(std::sync::Mutex::new(Verifier::default()));
     let limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     let key = Arc::new(key);
@@ -116,33 +163,46 @@ pub async fn serve(shared: Shared, config: Config, key: ClusterKey) {
         let Ok(permit) = limit.clone().try_acquire_owned() else {
             continue;
         };
-        let (shared, verifier, key) = (shared.clone(), verifier.clone(), key.clone());
+        let (shared, verifier, key, acceptor) = (
+            shared.clone(),
+            verifier.clone(),
+            key.clone(),
+            acceptor.clone(),
+        );
         tokio::spawn(async move {
             let _permit = permit;
-            let resp =
-                match tokio::time::timeout(http::READ_DEADLINE, http::read_request(&mut stream))
-                    .await
-                {
-                    Ok(Ok(req)) => {
-                        let report = lock(&shared).local.clone();
-                        let mut v = verifier.lock().unwrap_or_else(|p| p.into_inner());
-                        let resp =
-                            answer(&req, &key, &mut v, report.as_ref(), crate::status::now_ms());
-                        if resp.status == 401 {
-                            drop(v);
-                            lock(&shared).push_log(format!(
-                                "refused an unsigned or foreign request from {}",
-                                peer.ip()
-                            ));
-                        }
-                        resp
-                    }
-                    Ok(Err(code)) => Response::text(code, "bad request"),
-                    Err(_) => return,
-                };
-            http::write_response(&mut stream, &resp).await;
+            let mut first = [0u8; 1];
+            let peeked = tokio::time::timeout(http::READ_DEADLINE, stream.peek(&mut first)).await;
+            if !matches!(peeked, Ok(Ok(1))) {
+                return;
+            }
+            if first[0] == super::tls::TLS_HANDSHAKE_BYTE {
+                let Some(acceptor) = acceptor else { return };
+                match tokio::time::timeout(http::READ_DEADLINE, acceptor.accept(stream)).await {
+                    Ok(Ok(mut tls)) => exchange(&mut tls, &shared, &verifier, &key, peer).await,
+                    Ok(Err(_)) => note_tls_refusal(&shared, peer),
+                    Err(_) => {}
+                }
+            } else {
+                exchange(&mut stream, &shared, &verifier, &key, peer).await;
+            }
         });
     }
+}
+
+/// Log a refused TLS handshake once a minute at most.
+fn note_tls_refusal(shared: &Shared, peer: SocketAddr) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::status::now_ms();
+    if now.saturating_sub(LAST.load(Ordering::Relaxed)) < 60_000 {
+        return;
+    }
+    LAST.store(now, Ordering::Relaxed);
+    lock(shared).push_log(format!(
+        "refused a TLS connection from {} (no certificate bound to this cluster's key)",
+        peer.ip()
+    ));
 }
 
 /// Log a refused address once a minute at most, so a scanner cannot fill
@@ -324,7 +384,7 @@ mod tests {
             name: "studio".into(),
             problem: String::new(),
         };
-        let task = tokio::spawn(serve(shared.clone(), config, key.clone()));
+        let task = tokio::spawn(serve(shared.clone(), config, key.clone(), None));
         let mut listening = String::new();
         for _ in 0..100 {
             listening = lock(&shared).listening.clone();
@@ -356,6 +416,90 @@ mod tests {
             .to_string();
         let body = signed.bytes().await.unwrap();
         assert!(auth::verify_response(&key, &nonce, &body, &s));
+        task.abort();
+    }
+
+    async fn listening(shared: &Shared) -> SocketAddr {
+        for _ in 0..100 {
+            let l = lock(shared).listening.clone();
+            if !l.is_empty() {
+                return l.parse().unwrap();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("not listening");
+    }
+
+    /// Protocol v2 on loopback: a member with a certificate bound to the
+    /// cluster key gets the signed report over mutual TLS; a certificate
+    /// bound to another key, or none, is refused in the handshake; v1 plain
+    /// still answers on the same port.
+    #[tokio::test]
+    async fn mutual_tls_admits_bound_certificates_only() {
+        use super::super::tls::{client_config, BoundIdentity};
+        let shared = super::super::shared_for_tests();
+        lock(&shared).local = Some(report());
+        let key = ClusterKey::generate();
+        let server_id = BoundIdentity::mint(&key).unwrap();
+        let config = Config {
+            asked: Mode::Local,
+            mode: Mode::Local,
+            port: 0,
+            allow: policy::Allowlist::default(),
+            allow_text: Vec::new(),
+            name: "studio".into(),
+            problem: String::new(),
+        };
+        let task = tokio::spawn(serve(shared.clone(), config, key.clone(), Some(server_id)));
+        let addr = listening(&shared).await;
+        assert!(addr.ip().is_loopback());
+
+        // A member: bound certificate, signed request.
+        let member = BoundIdentity::mint(&key).unwrap();
+        let client = super::super::peers::tls_client(&member, &key).unwrap();
+        let report = super::super::peers::fetch(&client, &key, "127.0.0.1", addr.port(), true)
+            .await
+            .expect("member gets the report");
+        assert_eq!(report.name, "studio");
+
+        // A stranger with a certificate bound to another cluster's key, who
+        // even trusts our server: refused in the handshake.
+        let other = ClusterKey::generate();
+        let stranger = BoundIdentity::mint(&other).unwrap();
+        let cfg = client_config(&stranger, &other).unwrap();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(cfg));
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+        let refused = match connector.connect(name.clone(), tcp).await {
+            Err(_) => true,
+            // TLS 1.3: the server's verdict on the client certificate can
+            // arrive after the client considers the handshake done; it must
+            // then fail on the first exchange.
+            Ok(mut s) => {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let _ = s
+                    .write_all(b"GET /v1/node-info HTTP/1.1\r\nHost: x\r\n\r\n")
+                    .await;
+                let mut buf = Vec::new();
+                s.read_to_end(&mut buf).await.is_err() || buf.is_empty()
+            }
+        };
+        assert!(refused, "a certificate of another cluster must be refused");
+
+        // The other direction: a client whose own certificate the server
+        // accepts, but which checks the server against another cluster's
+        // key, refuses the server (a node never reports to a stranger).
+        let cfg = client_config(&member, &other).unwrap();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(cfg));
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        assert!(connector.connect(name, tcp).await.is_err());
+
+        // v1, signed plain HTTP, still answers on the same port.
+        let plain = reqwest::Client::new();
+        let v1 = super::super::peers::fetch(&plain, &key, "127.0.0.1", addr.port(), false)
+            .await
+            .expect("v1 still answers");
+        assert_eq!(v1.name, "studio");
         task.abort();
     }
 }

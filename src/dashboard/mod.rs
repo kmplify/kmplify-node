@@ -381,6 +381,9 @@ pub async fn route(req: &Request, ctx: &Ctx, port: u16) -> Response {
         ("POST", "/api/view") => switch_view(ctx, &req.body),
         ("POST", "/api/router/new-key") => act(ctx, crate::views::Act::RouterNewKey),
         ("POST", "/api/router/join") => router_join(ctx, &req.body),
+        ("POST", "/api/router/pair") => act(ctx, crate::views::Act::RouterPair),
+        ("POST", "/api/router/pair/close") => act(ctx, crate::views::Act::RouterPairClose),
+        ("POST", "/api/router/join-pin") => router_join_pin(ctx, &req.body).await,
         (_, p) if p.starts_with("/api/") => Response::text(404, "no such call"),
         _ => Response::text(404, "not found"),
     }
@@ -397,6 +400,9 @@ fn act(ctx: &Ctx, act: crate::views::Act) -> Response {
             | crate::views::Act::SettingClear { .. }
             | crate::views::Act::RouterNewKey
             | crate::views::Act::RouterJoin(_)
+            | crate::views::Act::RouterPair
+            | crate::views::Act::RouterPairClose
+            | crate::views::Act::RouterJoinPin(_)
     );
     let o = crate::views::perform(crate::views::Target::InProcess, &ctx.node_dir, &act);
     let mut body = json!({"ok": o.ok, "message": o.message});
@@ -456,6 +462,30 @@ fn router_join(ctx: &Ctx, body: &[u8]) -> Response {
         ctx,
         crate::views::Act::RouterJoin(crate::views::JoinKey(key)),
     )
+}
+
+/// `/api/router/join-pin {"at": "192.168.1.20:14419", "pin": "123456"}`.
+/// The PIN is used once, never logged nor echoed back. The pairing takes
+/// up to a few seconds of network, so it runs off the dashboard's threads.
+#[cfg(feature = "dashboard")]
+async fn router_join_pin(ctx: &Ctx, body: &[u8]) -> Response {
+    let (Some(at), Some(pin)) = (body_str(body, "at"), body_str(body, "pin")) else {
+        return Response::json(
+            400,
+            &json!({"ok": false, "message": "the address and the PIN the other device shows"}),
+        );
+    };
+    let dir = ctx.node_dir.clone();
+    let act = crate::views::Act::RouterJoinPin(crate::views::PinJoin { at, pin });
+    let o = match tokio::task::spawn_blocking(move || {
+        crate::views::perform(crate::views::Target::InProcess, &dir, &act)
+    })
+    .await
+    {
+        Ok(o) => o,
+        Err(_) => return Response::json(500, &json!({"ok": false, "message": "pairing stopped"})),
+    };
+    Response::json(o.status, &json!({"ok": o.ok, "message": o.message}))
 }
 
 #[cfg(feature = "dashboard")]

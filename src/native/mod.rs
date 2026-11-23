@@ -132,6 +132,9 @@ pub struct App {
     /// The width of the content area this frame, read before the scroll
     /// area (whose inner width can grow with what was drawn last frame).
     content_width: f32,
+    /// A Join with PIN in flight (a few seconds of network): its outcome
+    /// arrives here, so the window keeps drawing meanwhile.
+    joining: Option<std::sync::mpsc::Receiver<views::Outcome>>,
 }
 
 /// The ids of every section the window shows, in order.
@@ -240,6 +243,7 @@ impl App {
             log_filter: String::new(),
             closing: false,
             recheck_asked: None,
+            joining: None,
             mark: None,
             content_width: 0.0,
         };
@@ -288,6 +292,7 @@ impl App {
             log_filter: String::new(),
             closing: false,
             recheck_asked: None,
+            joining: None,
             mark: None,
             content_width: 0.0,
         }
@@ -353,6 +358,16 @@ impl App {
 
     /// Carry out one action through the layer every view shares.
     fn act(&mut self, a: Act) {
+        if matches!(a, Act::RouterJoinPin(_)) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let dir = self.node_dir.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(views::perform(Target::Attached, &dir, &a));
+            });
+            self.joining = Some(rx);
+            self.notice = Some(("pairing…".into(), true, Instant::now()));
+            return;
+        }
         let o = views::perform(Target::Attached, &self.node_dir, &a);
         if a == Act::Recheck && o.ok {
             self.recheck_asked = Some((Instant::now(), self.checked_at()));
@@ -368,6 +383,17 @@ impl App {
 
     /// Everything inside the window, for one frame.
     pub fn draw(&mut self, ui: &mut egui::Ui) {
+        if let Some(rx) = &self.joining {
+            match rx.try_recv() {
+                Ok(o) => {
+                    self.notice = Some((o.message, o.ok, Instant::now()));
+                    self.joining = None;
+                    self.last_refresh = Some(Instant::now() - REFRESH);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.joining = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => ui.ctx().request_repaint(),
+            }
+        }
         let m = self.model.clone();
         let p = theme::palette(ui.ctx());
         egui::Panel::left("kn-nav")
@@ -1501,6 +1527,110 @@ impl App {
             });
             muted(ui, "Off until you choose. This computer only binds 127.0.0.1. On the network answers only the addresses on the allowlist (private, link-local or VPN ranges), and only requests signed with the cluster key; the key never crosses the network and is never shown here, only its fingerprint. Show it with kmplify-node router key on this computer.");
         });
+        // Pairing: this side shows a PIN, the other enters it; the cluster
+        // key itself is never shown or typed (owner decision "Show key: no").
+        let pg = &r["pairing"];
+        let waiting = txt(&pg["state"]) == "waiting";
+        let joining = self.joining.is_some();
+        card(ui, "Pairing", |ui| {
+            if waiting {
+                let pin = txt(&pg["pin"]);
+                let left = pg["seconds_left"].as_u64().unwrap_or(0);
+                ui.horizontal_wrapped(|ui| {
+                    pill(ui, "Pairing open", p.ok);
+                    ui.label(format!("{}:{:02} left", left / 60, left % 60));
+                });
+                let (a, b) = pin.split_at(pin.len().min(3));
+                ui.label(
+                    RichText::new(format!("{a} {b}"))
+                        .size(34.0)
+                        .family(theme::semibold())
+                        .color(p.head),
+                );
+                let addrs = pg["addresses"]
+                    .as_array()
+                    .map(|a| a.iter().map(txt).collect::<Vec<_>>().join(", "))
+                    .unwrap_or_default();
+                kv(
+                    ui,
+                    "pairing",
+                    &[
+                        ("Address", addrs),
+                        ("Reachable from", txt(&pg["scope"])),
+                        ("Wrong PINs left", txt(&pg["attempts_left"])),
+                        (
+                            "Fingerprint",
+                            format!(
+                                "{} (the other device must show the same)",
+                                txt(&pg["fingerprint"])
+                            ),
+                        ),
+                    ],
+                );
+                ui.request_repaint_after(Duration::from_millis(500));
+            } else {
+                match txt(&pg["state"]).as_str() {
+                    "" | "none" => {}
+                    "paired" => {
+                        ui.label(format!(
+                            "Paired: {} joined the cluster {}.",
+                            txt(&pg["joined"]),
+                            txt(&pg["fingerprint"])
+                        ));
+                    }
+                    _ => {
+                        ui.label(
+                            RichText::new(format!("Pairing {}.", txt(&pg["state_label"])))
+                                .color(p.warn),
+                        );
+                    }
+                }
+            }
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Pair a device").clicked() {
+                    chosen = Some(Act::RouterPair);
+                }
+                if ui
+                    .add_enabled(waiting, egui::Button::new("Close pairing"))
+                    .clicked()
+                {
+                    chosen = Some(Act::RouterPairClose);
+                }
+            });
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Join with PIN").family(theme::semibold()));
+                let at = self.drafts.entry("router-pin-at".into()).or_default();
+                ui.add(
+                    egui::TextEdit::singleline(at)
+                        .hint_text(format!("192.168.1.20:{}", txt(&r["pair_port"])))
+                        .desired_width(200.0),
+                );
+                let pin = self.drafts.entry("router-pin".into()).or_default();
+                ui.add(
+                    egui::TextEdit::singleline(pin)
+                        .hint_text("123456")
+                        .char_limit(7)
+                        .desired_width(90.0),
+                );
+                if ui
+                    .add_enabled(!joining, egui::Button::new("Join with PIN"))
+                    .clicked()
+                {
+                    let at = self
+                        .drafts
+                        .get("router-pin-at")
+                        .cloned()
+                        .unwrap_or_default();
+                    let pin = self.drafts.remove("router-pin").unwrap_or_default();
+                    chosen = Some(Act::RouterJoinPin(views::PinJoin {
+                        at: at.trim().to_string(),
+                        pin: pin.trim().to_string(),
+                    }));
+                }
+            });
+            muted(ui, "Pair a device shows a six-digit PIN for two minutes; enter it on the other device with Join with PIN. The two devices agree on a key from the PIN (SPAKE2) and the cluster key crosses encrypted; three wrong PINs void it. Without LAN mode and an allowlist only a device on this computer can join.");
+        });
         let wide = self.content_width > 860.0;
         let mut cards: Vec<NodeCard> = Vec::new();
         let local: Option<crate::router::NodeReport> =
@@ -2136,6 +2266,9 @@ mod tests {
                 "view_terminal" => "Act::View(\"terminal\"",
                 "router_new_key" => "Act::RouterNewKey",
                 "router_join" => "Act::RouterJoin(",
+                "router_pair" => "Act::RouterPair)",
+                "router_pair_close" => "Act::RouterPairClose)",
+                "router_join_pin" => "Act::RouterJoinPin(",
                 other => panic!("an action the window does not know: {other}"),
             };
             assert!(
