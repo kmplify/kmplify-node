@@ -900,6 +900,74 @@ reported it with `operator_session::set`, and the node has an identity key:
   the service that issued it to decide. The headless binary has no login and never
   sends one.
 
+## Reference: every key of `hello` and `pong`
+
+What this crate sends, key by key, for the headless binary and for every
+application that embeds the crate as a library (the KMPLIFY desktop app since
+it runs this worker, so both send exactly this). `tests/protocol_golden.rs`
+connects the real worker to a local gateway and fails when a frame carries a
+key this table does not list, or misses one it lists as always sent: a new
+field lands here in the same change, or the build fails.
+
+Gateways ignore keys they do not know, so every key below beyond `type`,
+`node_id` and `token` is optional for a gateway to understand. An empty
+"Since" is a key that predates the versioned sections of this document or
+was added without a protocol bump.
+
+### `hello` (protocol 4)
+
+| Key | Sent | Since | What |
+|---|---|---|---|
+| `type` | always | v1 | `"hello"` |
+| `node_id` | always | v1 | The node's anonymous id from `POST /fabric/register` |
+| `token` | always | v1 | Its token |
+| `pubkey` | always (null without an identity key) | v3.7 | Ed25519 identity public key, hex |
+| `ts` | always (null without an identity key) | v3.7 | Unix seconds the signature was made |
+| `sig` | always (null without an identity key) | v3.7 | Signature over `node-hello` (see v3.7) |
+| `models` | always | v1 | Models lent, `[]` when inference sharing is off or paused |
+| `engines` | always | v2.5 | Per-model upstream overrides, `{model: "colibri"}` |
+| `contexts` | always | | Served context window per model where the engine says (vLLM `max_model_len`), `{}` otherwise |
+| `gpu` | always | v1, v2.8 | `backend`, `name`, `vram_mb` of the first accelerator |
+| `gpus` | always | v3.8 | Every accelerator |
+| `gpu_count` | always | v3.8 | How many |
+| `inference_slots` | always | v3.8 | Parallel inference jobs this node accepts |
+| `workloads` | always | v2 | Container session capability (templates, accelerator, runtimes, disk, images) |
+| `version` | always | | The build, or the embedding application's own release |
+| `worker_version` | always | v2.7 | The build of this crate |
+| `protocol` | always | v4 | Node-link level, `4` |
+| `envelope` | always (null without an identity key) | v5 | Encryption key attested by the identity key |
+| `catalog_version` | always | | Highest signed workload catalog held, `0` when none is trusted |
+| `binary_frames` | always | v4 | Bulk frames may arrive as binary messages |
+| `os` | always | | `macos`, `linux`, `windows` (from the compiler) |
+| `arch` | always | | `aarch64`, `x86_64` (from the compiler) |
+| `country` | always | v1 | ISO alpha-2, `""` when undeclared |
+| `approval` | always | v2.4 | `auto` or `manual` consumer admission |
+| `functions` | always (null when not offered) | v3.0 | Functions lane capability |
+| `vectors` | always (null when not offered) | v3.0 | Vector lane capability |
+| `collections` | always | v3.0 | Vector collections stored here |
+| `sessions` | always | v4 | Sessions still running from before this connection |
+| `cpu` | always | v2.4 | CPU model, cores, threads, total RAM |
+| `marketplace` | always | v5.1 | `true` only when the operator listed the node |
+| `document_terms` | always (null without an acceptance) | v5.3 | Provider terms version and time accepted |
+| `operator_session` | always (null when nobody is signed in) | v5.5 | Signed public session id and expiry |
+| `cpu_share` | always (null when CPU lending is off) | v2.3 | Threads and RAM lent |
+| `security` | once the first check finished | v5.5 | Signed trusted node baseline |
+
+### `pong` (protocol 4)
+
+| Key | Sent | Since | What |
+|---|---|---|---|
+| `type` | always | v1 | `"pong"` |
+| `loaded_models` | always, `[]` included | v2.2 | Models resident in the engine |
+| `gpu_used_mb` | when measurable | v2.2 | Accelerator memory in use |
+| `gpus_used_mb` | when measurable | v3.8 | The same per accelerator |
+| `vectors_used_mb` | when the vector lane is on | v3.0 | Storage held by collections |
+| `receipts` | while sessions run | v4.1 | Signed cumulative work receipts |
+| `security` | once the first check finished | v5.5 | Signed trusted node baseline |
+| `operator_session` | while an operator is signed in | v5.5 | Signed public session id and expiry |
+| `cpu_percent` | once the CPU sampler ran | v2.4 | Live CPU load |
+| `ram_used_mb` | when RAM is known | v2.4 | Live RAM in use |
+
 ## Credits: what a node earned (read-only)
 
 Optional, and outside the node link: one HTTP read with the node token. A

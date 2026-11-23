@@ -210,6 +210,11 @@ pub struct Snapshot {
     pub link: Link,
     /// Why the link is where it is: the last connect error, or "".
     pub link_detail: String,
+    /// Why the last connection attempt ended, kept across the retries and
+    /// the reconnect that follow it until the gateway welcomes this node
+    /// again. "" while connected. `link_detail` moves on to "connecting to
+    /// …" while retrying; this keeps the reason an operator needs to see.
+    pub last_error: String,
     pub started_at_ms: u64,
     pub connected_at_ms: u64,
     pub published_at_ms: u64,
@@ -438,6 +443,11 @@ pub fn set_link(link: Link, detail: impl Into<String>) {
         }
         if link == Link::Retrying && s.link == Link::Online {
             RECONNECTS.fetch_add(1, Ordering::Relaxed);
+        }
+        match link {
+            Link::Online | Link::Stopped => s.last_error.clear(),
+            Link::Retrying => s.last_error = detail.clone(),
+            _ => {}
         }
         s.link = link;
         s.link_detail = detail;

@@ -23,15 +23,20 @@
 //! * **No secrets on screen.** The credential, the colibri key and the
 //!   dashboard token are never in an answer; log lines are redacted.
 
+#[cfg(feature = "dashboard")]
 pub mod http;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+#[cfg(feature = "dashboard")]
 use std::sync::Arc;
+#[cfg(feature = "dashboard")]
 use std::time::Duration;
 
+#[cfg(feature = "dashboard")]
 use serde_json::{json, Value};
 
+#[cfg(feature = "dashboard")]
 use http::{Request, Response};
 
 /// File in the node directory holding the dashboard URL with its token,
@@ -39,11 +44,15 @@ use http::{Request, Response};
 pub const URL_FILE: &str = "dashboard.url";
 /// The header the page sends the token in.
 pub const TOKEN_HEADER: &str = "x-kmplify-node-token";
+#[cfg(feature = "dashboard")]
 /// At most this many requests are handled at once.
 const MAX_CONNECTIONS: usize = 16;
 
+#[cfg(feature = "dashboard")]
 const INDEX_HTML: &str = include_str!("assets/index.html");
+#[cfg(feature = "dashboard")]
 const APP_JS: &str = include_str!("assets/app.js");
+#[cfg(feature = "dashboard")]
 const APP_CSS: &str = include_str!("assets/app.css");
 
 /// How the node talks to the person at the machine.
@@ -183,6 +192,19 @@ impl Dashboard {
     }
 }
 
+/// Built without the `dashboard` feature: there is no server to start, and
+/// the caller carries on without one (the binary falls back to the terminal
+/// summary). An embedder of `provider-core` never listens on any port.
+#[cfg(not(feature = "dashboard"))]
+pub async fn start(
+    _addr: SocketAddr,
+    _ctx: Ctx,
+    _stop: tokio::sync::watch::Receiver<bool>,
+) -> Result<Dashboard, String> {
+    Err("this build has no local dashboard (built without the `dashboard` feature)".into())
+}
+
+#[cfg(feature = "dashboard")]
 /// Bind on `addr` (loopback only) and serve until `stop` turns true.
 pub async fn start(
     addr: SocketAddr,
@@ -244,6 +266,7 @@ pub async fn start(
     Ok(Dashboard { addr, token, task })
 }
 
+#[cfg(feature = "dashboard")]
 fn allowed_hosts(port: u16) -> [String; 3] {
     [
         format!("127.0.0.1:{port}"),
@@ -252,6 +275,7 @@ fn allowed_hosts(port: u16) -> [String; 3] {
     ]
 }
 
+#[cfg(feature = "dashboard")]
 /// The guards, in order; `Some` is the refusal.
 pub fn guard(req: &Request, token: &str, port: u16) -> Option<Response> {
     let hosts = allowed_hosts(port);
@@ -302,6 +326,7 @@ pub fn guard(req: &Request, token: &str, port: u16) -> Option<Response> {
     None
 }
 
+#[cfg(feature = "dashboard")]
 /// Answer one request.
 pub async fn route(req: &Request, ctx: &Ctx, port: u16) -> Response {
     if let Some(refused) = guard(req, &ctx.token, port) {
@@ -327,6 +352,7 @@ pub async fn route(req: &Request, ctx: &Ctx, port: u16) -> Response {
     }
 }
 
+#[cfg(feature = "dashboard")]
 fn recheck() -> Response {
     if crate::security::rechecking() {
         return Response::json(
@@ -351,6 +377,7 @@ fn recheck() -> Response {
     )
 }
 
+#[cfg(feature = "dashboard")]
 fn command(cmd: crate::control::Command) -> Response {
     let message = cmd.confirmation();
     match crate::control::submit(&cmd) {
@@ -359,6 +386,7 @@ fn command(cmd: crate::control::Command) -> Response {
     }
 }
 
+#[cfg(feature = "dashboard")]
 /// The settings the dashboard may change. Each is one the node already
 /// applies at runtime (`kmplify-node set` writes the same file and the
 /// running node re-advertises). Everything else is shown with how to change it.
@@ -374,6 +402,7 @@ pub const EDITABLE: &[&str] = &[
     "max-disk-gb",
 ];
 
+#[cfg(feature = "dashboard")]
 fn set_setting(ctx: &Ctx, body: &[u8], clear: bool) -> Response {
     let Ok(v) = serde_json::from_slice::<Value>(body) else {
         return Response::json(400, &json!({"ok": false, "message": "not JSON"}));
@@ -417,10 +446,12 @@ fn set_setting(ctx: &Ctx, body: &[u8], clear: bool) -> Response {
     )
 }
 
+#[cfg(feature = "dashboard")]
 fn opt<T: serde::Serialize>(v: Option<T>) -> Value {
     v.map(|v| json!(v)).unwrap_or(Value::Null)
 }
 
+#[cfg(feature = "dashboard")]
 /// Everything the page shows, in one answer.
 pub fn state(ctx: &Ctx) -> Value {
     let snap = crate::status::snapshot();
@@ -751,6 +782,7 @@ pub fn open_browser(url: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+#[cfg(feature = "dashboard")]
 #[cfg(test)]
 mod tests {
     use super::*;
