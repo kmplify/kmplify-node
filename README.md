@@ -1118,8 +1118,11 @@ Yes, please, especially hardware coverage and the trust rules. See
 
 Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-The licence covers the code, not the name: KMPLIFY and kmplify-node are
-trademarks, and modified versions need their own name. What that means in
+The licence covers the code, not the name: KMPLIFY and kmplify-node, and the
+KMPLIFY logo (the dashboard mark, its tab icon and the program icon of
+`kmplify-node.exe`), are trademarks and are not licensed under Apache-2.0
+(section 6 grants no trademark rights); modified versions need their own name
+and their own logo. What that means in
 practice, including everything you may do without asking, is spelled out in
 [TRADEMARKS.md](TRADEMARKS.md).
 
