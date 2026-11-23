@@ -59,6 +59,21 @@ jobs:
             if ($LASTEXITCODE -ne 0) { $rc = 1 }
           }
           exit $rc
+      # Diagnostic only: the released v0.9.0 on the same runner, to tell
+      # "every Windows" from "that one machine". Its first line predates the
+      # node-dir wording, so that check fails by design; what matters is
+      # whether it is alive at 20 s, and its exit code if not.
+      - name: released v0.9.0 for comparison (Windows, diagnostic)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v0.9.0 --repo ${{ github.repository }} --pattern 'kmplify-node-0.9.0-x86_64-pc-windows-msvc.exe' --dir old
+          foreach ($v in 'plain', 'down') {
+            powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-start.ps1 -Bin old\kmplify-node-0.9.0-x86_64-pc-windows-msvc.exe -Variant $v
+          }
 
   lint:
     runs-on: ubuntu-latest
