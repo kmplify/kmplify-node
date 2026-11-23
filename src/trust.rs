@@ -6,7 +6,8 @@
 //!   ([`crate::security`]), with the exact reason per item and how to fix it;
 //! * **the fabric's**: the trust level, site and baseline as the gateway
 //!   evaluated them, read from the gateway's PUBLIC `/fabric/nodes` list,
-//!   which names each node by a prefix of its id (8, 16 or 24 characters).
+//!   which names each node by its id or a prefix of it (8, 16 or 24
+//!   characters before 2026-11-23, the whole 32 character id since).
 //!
 //! The node never decides its own trust level (PROTOCOL.md v5.5); this
 //! module only reads what the gateway publishes and explains it. When the
@@ -69,8 +70,8 @@ pub struct FabricView {
 }
 
 /// The shortest public id the gateway has ever published (8 hex characters
-/// before 2026-11-13, 16 until 2026-11-15, 24 since). Anything shorter
-/// cannot name a node.
+/// before 2026-11-13, 16 until 2026-11-15, 24 until 2026-11-23, the whole
+/// 32 character id since). Anything shorter cannot name a node.
 pub const MIN_PUBLIC_ID: usize = 8;
 
 /// A node id as the gateway compares it: lower case, without dashes.
@@ -91,11 +92,12 @@ fn node_list(body: &Value) -> Option<&Vec<Value>> {
 /// Find `node_id` in a `/fabric/nodes` answer. Pure, so every branch is
 /// tested without a gateway.
 ///
-/// The gateway publishes a PREFIX of the node id in `node`, never the full
-/// id, and has grown that prefix over time (8, then 16, now 24 hex
-/// characters). So an entry is this node when its `node` is a prefix of the
-/// full id, whatever its length; the longest such prefix wins, and two
-/// entries that match equally well are ambiguous.
+/// The gateway publishes the node id, or a prefix of it, in `node`, and has
+/// grown that over time (8, then 16, then 24 hex characters, and since
+/// 2026-11-23 the whole 32 character id). So an entry is this node when its
+/// `node` is a prefix of the full id (the whole id included), whatever its
+/// length; the longest such prefix wins, and two entries that match equally
+/// well are ambiguous.
 pub fn match_entry(body: &Value, node_id: &str, now_ms: u64) -> FabricView {
     let mut view = FabricView {
         read_at_ms: now_ms,
@@ -822,6 +824,47 @@ mod tests {
         let v = match_entry(&body, "99999999aaaaaaaabbbbbbbbcccccccc", 7);
         assert_eq!(v.state, Match::NotListed);
         assert!(fabric_line(&v).contains("the fabric answered"));
+    }
+
+    #[test]
+    fn the_node_is_found_by_the_whole_32_character_id_of_the_newer_gateway() {
+        // The same live shape, as a gateway that publishes the whole id
+        // (2026-11-23) serves it: every `node` is the full 32 characters.
+        let mut body: Value = serde_json::from_str(LIVE_SHAPE).unwrap();
+        for e in body.as_array_mut().unwrap() {
+            let full = match e["node"].as_str().unwrap() {
+                "0123456789abcdef01234567" => LIVE_ID,
+                _ => "fedcba9876543210fedcba9876543210",
+            };
+            e["node"] = json!(full);
+        }
+        let v = match_entry(&body, LIVE_ID, 7);
+        assert_eq!(v.state, Match::Matched, "{v:?}");
+        assert_eq!(v.trust_level.as_deref(), Some("community"));
+        let other = match_entry(&body, "fedcba9876543210fedcba9876543210", 7);
+        assert_eq!(other.trust_level.as_deref(), Some("trusted"));
+        // A gateway still on 24 characters and one on 32 name the same node:
+        // the 24-character entry keeps matching, and next to a 32-character
+        // entry of the same node the longer one wins.
+        let entry = |node: &str, level: &str| json!({"node": node, "trust_level": level});
+        let mixed = json!([
+            entry(&LIVE_ID[..24], "community"),
+            entry(LIVE_ID, "trusted")
+        ]);
+        let v = match_entry(&mixed, LIVE_ID, 7);
+        assert_eq!(
+            (v.state, v.trust_level.as_deref()),
+            (Match::Matched, Some("trusted"))
+        );
+        let only_24 = json!([entry(&LIVE_ID[..24], "community")]);
+        assert_eq!(match_entry(&only_24, LIVE_ID, 7).state, Match::Matched);
+        // A 32-character id that differs only in its last 8 characters is
+        // another node, not this one.
+        let lookalike = format!("{}ffffffff", &LIVE_ID[..24]);
+        assert_eq!(
+            match_entry(&json!([entry(&lookalike, "trusted")]), LIVE_ID, 7).state,
+            Match::NotListed
+        );
     }
 
     #[test]
