@@ -30,7 +30,7 @@ mod probe;
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Bumped whenever a rule here changes what passes, so the gateway can tell
@@ -46,7 +46,12 @@ pub const MAX_CHECK_AGE_S: u64 = 6 * 3600;
 pub const RECHECK_INTERVAL: Duration = Duration::from_secs(3 * 3600);
 
 /// One run of the self-check.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+///
+/// `Deserialize` so the published `status.json` can carry it to
+/// `kmplify-node status` in another process; `details` and `elevated` stay
+/// in this process.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Report {
     pub os: String,
     pub disk_encrypted: Option<bool>,
@@ -71,6 +76,10 @@ pub struct Report {
     /// local paths.
     #[serde(skip)]
     pub details: Vec<(Item, String)>,
+    /// Whether the check ran with administrator rights, where the OS tells
+    /// (Windows today). Shown on this machine only; never sent.
+    #[serde(skip)]
+    pub elevated: Option<bool>,
 }
 
 /// The baseline items, in the order they are shown.
@@ -244,6 +253,100 @@ fn store(r: Report) {
     }
 }
 
+static RECHECKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True while a check asked for by the operator is running.
+pub fn rechecking() -> bool {
+    RECHECKING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Run the check now, because the operator asked (the dashboard's
+/// "Re-check now"), and make it the latest. The next pong carries it to the
+/// fabric, signed, like any other check. `None` when one is already running,
+/// so a double click does not start two PowerShell runs.
+pub async fn recheck() -> Option<Report> {
+    use std::sync::atomic::Ordering;
+    if RECHECKING.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+    let r = check().await;
+    store(r.clone());
+    RECHECKING.store(false, Ordering::Release);
+    Some(r)
+}
+
+/// The hint for a Windows node that cannot read BitLocker because it runs
+/// without administrator rights. Says what is missing and both ways to fix
+/// it; the node itself never elevates.
+pub const WINDOWS_BITLOCKER_NOT_ELEVATED: &str =
+    "BitLocker status could not be read: this kmplify-node runs without administrator \
+     rights, and Windows shows the encryption of some drives only to administrators. The \
+     node never asks for more rights by itself. To see the result once: open PowerShell with \
+     \"Run as administrator\" and run `kmplify-node security check`. To have the node send \
+     it: start kmplify-node from an elevated PowerShell, or run it at startup as a scheduled \
+     task with highest privileges (README, \"Windows: administrator rights\").";
+
+/// One line on how an item stands, without the mark: "on", "off",
+/// "last security update 3 days ago, none waiting", "unknown: counts as
+/// failing". Shared by the checklist, the startup summary and the dashboard.
+pub fn state_text(r: &Report, item: Item) -> String {
+    let v = r.verdict(item);
+    match (item, v) {
+        (Item::PatchAge, _) => {
+            let age = match r.patch_age_days {
+                Some(d) => format!(
+                    "last security update {d} day{} ago",
+                    if d == 1 { "" } else { "s" }
+                ),
+                None => "last security update unknown".into(),
+            };
+            let pending = match r.pending_security_updates {
+                Some(0) => "none waiting".to_string(),
+                Some(1) => "1 waiting".to_string(),
+                Some(n) => format!("{n} waiting"),
+                None => "waiting updates unknown".to_string(),
+            };
+            match v {
+                Verdict::Unknown => format!("{age}, {pending}: counts as failing"),
+                Verdict::Fail => format!(
+                    "{age}, {pending} (passes with none waiting or at most {MAX_PATCH_AGE_DAYS} days)"
+                ),
+                _ => format!("{age}, {pending}"),
+            }
+        }
+        (_, Verdict::Pass) => match item {
+            Item::SshPasswordAuth => "off".into(),
+            Item::SshRootLogin => "off".into(),
+            _ => "on".into(),
+        },
+        (_, Verdict::Fail) => match item {
+            Item::SshPasswordAuth | Item::SshRootLogin => "allowed".into(),
+            _ => "off".into(),
+        },
+        (_, Verdict::Unknown) => "unknown: counts as failing".into(),
+        (Item::ScreenLock, Verdict::NotApplicable) => {
+            "not checked (no desktop session, or not readable here)".into()
+        }
+        (_, Verdict::NotApplicable) => "not checked (no SSH server running)".into(),
+    }
+}
+
+/// [`how_to`] as numbered steps: one sentence per step, in order.
+pub fn steps(item: Item, os: &str) -> Vec<String> {
+    let text = how_to(item, os);
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(". ") {
+        let (head, tail) = rest.split_at(i + 1);
+        out.push(head.trim().to_string());
+        rest = tail.trim_start();
+    }
+    if !rest.trim().is_empty() {
+        out.push(rest.trim().to_string());
+    }
+    out
+}
+
 /// Start checking: now, then every `RECHECK_INTERVAL`. Idempotent. The
 /// first hello does not wait for it; a hello sent before the first check
 /// finished carries no `security`, and the next pong does.
@@ -362,44 +465,7 @@ pub fn render(r: &Report, now: u64, color: bool) -> String {
             Verdict::Unknown => paint("31", "[ ?? ]"),
             Verdict::NotApplicable => paint("2", "[ -- ]"),
         };
-        let state = match (item, v) {
-            (Item::PatchAge, _) => {
-                let age = match r.patch_age_days {
-                    Some(d) => format!(
-                        "last security update {d} day{} ago",
-                        if d == 1 { "" } else { "s" }
-                    ),
-                    None => "last security update unknown".into(),
-                };
-                let pending = match r.pending_security_updates {
-                    Some(0) => "none waiting".to_string(),
-                    Some(1) => "1 waiting".to_string(),
-                    Some(n) => format!("{n} waiting"),
-                    None => "waiting updates unknown".to_string(),
-                };
-                match v {
-                    Verdict::Unknown => format!("{age}, {pending}: counts as failing"),
-                    Verdict::Fail => format!(
-                        "{age}, {pending} (passes with none waiting or at most {MAX_PATCH_AGE_DAYS} days)"
-                    ),
-                    _ => format!("{age}, {pending}"),
-                }
-            }
-            (_, Verdict::Pass) => match item {
-                Item::SshPasswordAuth => "off".into(),
-                Item::SshRootLogin => "off".into(),
-                _ => "on".into(),
-            },
-            (_, Verdict::Fail) => match item {
-                Item::SshPasswordAuth | Item::SshRootLogin => "allowed".into(),
-                _ => "off".into(),
-            },
-            (_, Verdict::Unknown) => "unknown: counts as failing".into(),
-            (Item::ScreenLock, Verdict::NotApplicable) => {
-                "not checked (no desktop session, or not readable here)".into()
-            }
-            (_, Verdict::NotApplicable) => "not checked (no SSH server running)".into(),
-        };
+        let state = state_text(r, item);
         out.push_str(&format!("  {mark} {:<20} {state}\n", item.label()));
         if let Some(d) = r.detail(item) {
             out.push_str(&format!("         {d}\n"));
@@ -447,6 +513,7 @@ mod tests {
             checker_version: CHECKER_VERSION.into(),
             hints: vec![],
             details: vec![],
+            elevated: None,
         }
     }
 
@@ -597,6 +664,42 @@ mod tests {
         );
         assert!(v["sig"].is_null(), "no identity key, no signature");
         assert!(!v.to_string().contains("private-path"));
+    }
+
+    #[test]
+    fn fixes_split_into_steps_in_order() {
+        let s = steps(Item::DiskEncrypted, "windows");
+        assert_eq!(s.len(), 2, "{s:?}");
+        assert!(s[0].starts_with("Turn on BitLocker"));
+        assert!(s[1].starts_with("On Windows Home"));
+        for os in ["windows", "macos", "linux"] {
+            for item in Item::ALL {
+                let joined = steps(item, os).join(" ");
+                assert_eq!(joined, how_to(item, os), "{item:?} {os}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_windows_node_without_admin_rights_is_told_exactly_that() {
+        let h = WINDOWS_BITLOCKER_NOT_ELEVATED;
+        assert!(h.contains("without administrator"));
+        assert!(h.contains("Run as administrator"));
+        assert!(h.contains("never asks for more rights"));
+        assert!(!h.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn the_report_round_trips_through_status_json_without_local_details() {
+        let mut r = good(1_800_000_000);
+        r.details.push((Item::DiskEncrypted, "D: is plain".into()));
+        r.elevated = Some(false);
+        let text = serde_json::to_string(&r).unwrap();
+        assert!(!text.contains("D: is plain"));
+        let back: Report = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.disk_encrypted, r.disk_encrypted);
+        assert!(back.details.is_empty());
+        assert_eq!(back.elevated, None);
     }
 
     #[test]

@@ -281,6 +281,19 @@ pub struct Snapshot {
     pub vectors_used_mb: u64,
     pub vectors_max_mb: u64,
 
+    /// The latest trusted node baseline check of this machine (facts and
+    /// hints, without the on-screen details), for `kmplify-node status`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security: Option<crate::security::Report>,
+    /// This node as the gateway's public `/fabric/nodes` lists it: trust
+    /// level, site, baseline as the fabric evaluated it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fabric_trust: Option<crate::trust::FabricView>,
+    /// Port of the local web dashboard, when it runs. The URL with its
+    /// token is in its own owner-only file (`dashboard::URL_FILE`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dashboard_port: Option<u16>,
+
     /// Tail of the log ring, oldest first.
     pub logs: Vec<String>,
 }
@@ -405,6 +418,8 @@ pub fn snapshot() -> Snapshot {
         since_ms: s.started_at_ms,
     };
     s.reconnects = RECONNECTS.load(Ordering::Relaxed);
+    s.security = crate::security::latest();
+    s.fabric_trust = crate::trust::latest();
     s.paused = paused();
     s.published_at_ms = now_ms();
     s

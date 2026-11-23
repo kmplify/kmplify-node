@@ -3,9 +3,12 @@
 //! This is the half of the fabric that runs on **your** machine. It dials out
 //! to a gateway, advertises what the machine can serve, executes inference
 //! jobs against a local model server, and (only if you opt in) hosts
-//! container sessions on your GPU. Nothing here ever listens on a port: the
-//! node opens one outbound WebSocket and everything travels over it, so
-//! joining a fabric never exposes your machine to the internet.
+//! container sessions on your GPU. Nothing here listens on a network port:
+//! the node opens one outbound WebSocket and everything travels over it, so
+//! joining a fabric never exposes your machine to the internet. The one
+//! listener is the optional local dashboard (`--ui gui`), bound to 127.0.0.1
+//! only and refusing every request without its per-start token
+//! (see [`dashboard`]).
 //!
 //! The scheduler, registry, billing and marketplace live on the gateway and
 //! are not part of this crate. The split is deliberate and permanent: what
@@ -17,6 +20,7 @@
 pub mod catalog;
 pub mod control;
 pub mod credits;
+pub mod dashboard;
 pub mod engines;
 pub mod envelope;
 pub mod fabric_worker;
@@ -33,6 +37,8 @@ pub mod rewards;
 pub mod security;
 pub mod settings;
 pub mod status;
+pub mod summary;
+pub mod trust;
 pub mod vectors;
 pub mod vllm_managed;
 pub mod wire;

@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="kn-token" content="__KN_TOKEN__">
+<link rel="icon" href="data:,">
+<title>kmplify-node</title>
+<link rel="stylesheet" href="/app.css?t=__KN_TOKEN__">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="logo" aria-hidden="true"></span>
+    <div>
+      <div class="title">kmplify-node</div>
+      <div class="sub" id="sub">loading...</div>
+    </div>
+  </div>
+  <div class="pills">
+    <span class="pill" id="pill-link">...</span>
+    <span class="pill" id="pill-trust">...</span>
+  </div>
+</header>
+<nav class="tabs" role="tablist" aria-label="Sections">
+  <button role="tab" data-tab="overview" aria-selected="true">Overview</button>
+  <button role="tab" data-tab="trust">Trusted node <span class="badge" id="badge-trust" hidden></span></button>
+  <button role="tab" data-tab="sessions">Sessions</button>
+  <button role="tab" data-tab="earnings">Earnings</button>
+  <button role="tab" data-tab="settings">Settings</button>
+  <button role="tab" data-tab="logs">Logs</button>
+</nav>
+<div class="banner" id="banner" hidden></div>
+<main>
+  <section id="tab-overview" class="tab"></section>
+  <section id="tab-trust" class="tab" hidden></section>
+  <section id="tab-sessions" class="tab" hidden></section>
+  <section id="tab-earnings" class="tab" hidden></section>
+  <section id="tab-settings" class="tab" hidden></section>
+  <section id="tab-logs" class="tab" hidden></section>
+</main>
+<footer class="foot">This page is served by kmplify-node on this computer only (127.0.0.1). It closes when the node stops.</footer>
+<script src="/app.js?t=__KN_TOKEN__"></script>
+</body>
+</html>
