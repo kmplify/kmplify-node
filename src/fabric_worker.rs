@@ -10640,6 +10640,14 @@ mod document_terms_tests {
     }
 
     async fn run(base: &str, frame: Value) -> Vec<Value> {
+        run_watched(base, frame, crate::host::ObservedJob::none()).await
+    }
+
+    async fn run_watched(
+        base: &str,
+        frame: Value,
+        job: Arc<crate::host::ObservedJob>,
+    ) -> Vec<Value> {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
         let far = tokio::spawn(async move {
@@ -10671,10 +10679,155 @@ mod document_terms_tests {
             reqwest::Client::new(),
             upstreams,
             frame,
-            crate::host::ObservedJob::none(),
+            job,
         )
         .await;
         far.await.unwrap()
+    }
+
+    /// What an embedding host's observer is told about each job: the calls
+    /// in order, the engine's own bodies, and fixed codes for failures,
+    /// never an upstream's message.
+    #[tokio::test]
+    async fn a_host_observer_sees_each_job_in_order() {
+        use crate::host::{JobEnd, JobObserver};
+        #[derive(Clone, Default)]
+        struct Calls(Arc<std::sync::Mutex<Vec<String>>>);
+        impl JobObserver for Calls {
+            fn request(&mut self, _p: &Value, streamed: bool) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("request streamed={streamed}"));
+            }
+            fn http_status(&mut self, s: u16) {
+                self.0.lock().unwrap().push(format!("status {s}"));
+            }
+            fn native_line(&mut self, _v: &Value) {
+                self.0.lock().unwrap().push("native".into());
+            }
+            fn openai_chunk(&mut self, _v: &Value) {
+                self.0.lock().unwrap().push("chunk".into());
+            }
+            fn reply(&mut self, b: &Value) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("reply {}", b["usage"]["total_tokens"]));
+            }
+            fn error(&mut self, code: &'static str) {
+                self.0.lock().unwrap().push(format!("error {code}"));
+            }
+            fn end(&mut self, how: JobEnd, _e: Duration) {
+                self.0.lock().unwrap().push(format!("end {how:?}"));
+            }
+        }
+        async fn calls(base: &str, frame: Value) -> Vec<String> {
+            let c = Calls::default();
+            let job = crate::host::ObservedJob::watched(Box::new(c.clone()));
+            run_watched(base, frame, job.clone()).await;
+            job.finish();
+            let out = c.0.lock().unwrap().clone();
+            out
+        }
+        let chat = |stream: bool| {
+            json!({"type": "job", "id": "o1", "kind": "chat",
+                "payload": {"model": "m", "messages": [{"role": "user", "content": MARK}], "stream": stream}})
+        };
+
+        let ok =
+            json!({"choices": [{"index": 0, "message": {"role": "assistant", "content": "x"}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}})
+            .to_string();
+        let base = fake_engine("200 OK", "application/json", ok).await;
+        assert_eq!(
+            calls(&base, chat(false)).await,
+            [
+                "request streamed=false",
+                "status 200",
+                "reply 5",
+                "end Finished"
+            ]
+        );
+
+        let sse = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"choices": [{"index": 0, "delta": {"content": "a"}}]}),
+            json!({"choices": [], "usage": {"total_tokens": 4}})
+        );
+        let base = fake_engine("200 OK", "text/event-stream", sse).await;
+        assert_eq!(
+            calls(&base, chat(true)).await,
+            [
+                "request streamed=true",
+                "status 200",
+                "chunk",
+                "chunk",
+                "end Finished"
+            ]
+        );
+
+        let base = fake_engine("502 Bad Gateway", "text/plain", format!("said {MARK}")).await;
+        let got = calls(&base, chat(false)).await;
+        assert_eq!(
+            got,
+            [
+                "request streamed=false",
+                "status 502",
+                "error upstream_5xx",
+                "end Finished"
+            ]
+        );
+        assert!(!got.concat().contains(MARK));
+
+        let got = calls("http://127.0.0.1:9", chat(false)).await;
+        assert_eq!(
+            got,
+            [
+                "request streamed=false",
+                "error upstream_unreachable",
+                "end Finished"
+            ]
+        );
+
+        let embed = json!({"type": "job", "id": "o2", "kind": "embeddings",
+            "payload": {"model": "colibri-only", "input": "a"}});
+        let up = JobUpstreams {
+            ollama_base: String::new(),
+            colibri_base: "http://127.0.0.1:9".into(),
+            colibri_api_key: String::new(),
+            engines: [("colibri-only".to_string(), "colibri".to_string())].into(),
+            envelope: None,
+            primary_openai_only: false,
+        };
+        let c = Calls::default();
+        let job = crate::host::ObservedJob::watched(Box::new(c.clone()));
+        let (ws_far, sink) = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            let far = tokio::spawn(async move {
+                let (sock, _) = l.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(sock).await.unwrap();
+                ws.next().await
+            });
+            let (ws, _) = connect_async(format!("ws://{addr}")).await.unwrap();
+            (far, ws.split().0)
+        };
+        run_job(
+            Arc::new(Mutex::new(sink)),
+            reqwest::Client::new(),
+            up,
+            embed,
+            job.clone(),
+        )
+        .await;
+        let _ = ws_far.await;
+        drop(job);
+        assert_eq!(
+            *c.0.lock().unwrap(),
+            ["error unsupported_kind", "end Cancelled"],
+            "a job dropped without finish() ends as cancelled"
+        );
     }
 
     #[tokio::test]

@@ -197,6 +197,16 @@ impl ObservedJob {
         })
     }
 
+    /// A job watched by `observer`, for tests that call the job runner
+    /// directly.
+    #[cfg(test)]
+    pub(crate) fn watched(observer: Box<dyn JobObserver>) -> Arc<Self> {
+        Arc::new(ObservedJob {
+            observer: std::sync::Mutex::new(Some(observer)),
+            started: std::time::Instant::now(),
+        })
+    }
+
     /// Hand the observer to `f`, if there is one and it has not ended.
     pub(crate) fn with(&self, f: impl FnOnce(&mut dyn JobObserver)) {
         let mut g = self.observer.lock().unwrap_or_else(|e| e.into_inner());
