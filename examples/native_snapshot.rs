@@ -3,7 +3,7 @@
 //! machine does not have; the window can photograph itself).
 //!
 //! ```text
-//! cargo run --release --example native_snapshot -- NODE_DIR OUT_DIR [light|dark]
+//! cargo run --release --example native_snapshot -- NODE_DIR OUT_DIR [light|dark] [WIDTH HEIGHT]
 //! ```
 //!
 //! NODE_DIR is the directory of a RUNNING node (`KMPLIFY_NODE_DIR`); the
@@ -28,6 +28,7 @@ mod snapshot {
         waiting: bool,
         out: PathBuf,
         scheme: String,
+        width: u32,
     }
 
     impl eframe::App for Snap {
@@ -43,9 +44,10 @@ mod snapshot {
                 })
             });
             if let Some(image) = shot {
-                let path = self
-                    .out
-                    .join(format!("{}-{}.bmp", self.ids[self.i], self.scheme));
+                let path = self.out.join(format!(
+                    "{}-{}-{}.bmp",
+                    self.ids[self.i], self.scheme, self.width
+                ));
                 write_bmp(&path, &image).expect("write the snapshot");
                 println!("{}", path.display());
                 self.i += 1;
@@ -106,6 +108,10 @@ mod snapshot {
             std::process::exit(2);
         };
         let scheme = args.get(2).cloned().unwrap_or_else(|| "light".into());
+        let size: [f32; 2] = [
+            args.get(3).and_then(|w| w.parse().ok()).unwrap_or(1180.0),
+            args.get(4).and_then(|h| h.parse().ok()).unwrap_or(780.0),
+        ];
         std::fs::create_dir_all(out).expect("create OUT_DIR");
         let snap = Snap {
             app: App::new(PathBuf::from(dir), String::new()),
@@ -115,11 +121,13 @@ mod snapshot {
             waiting: false,
             out: PathBuf::from(out),
             scheme: scheme.clone(),
+            width: size[0] as u32,
         };
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_title("KMPLIFY Node")
-                .with_inner_size([1180.0, 780.0]),
+                .with_inner_size(size)
+                .with_min_inner_size([300.0, 300.0]),
             ..Default::default()
         };
         eframe::run_native(
