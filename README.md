@@ -318,7 +318,7 @@ you can switch between them while it runs, without a restart:
 |---|---|---|
 | Terminal view | The terminal dashboard in the console the node runs in (the same screens as `kmplify-node tui`) | `--ui tui`, or `1` in the chooser |
 | Web view | The dashboard in your browser | `--ui gui`, or `2` in the chooser |
-| App window | The same dashboard in a window of its own | `--ui app`, or `3` in the chooser |
+| App window | The node's native window: the same sections, figures and buttons, plus the LAN router | `--ui app` (or `--ui native`), `3` in the chooser, or `kmplify-node window` for a node already running |
 
 **The chooser.** Started by hand in a console (a terminal, or a double-click on
 `kmplify-node.exe`), with no `--ui` and nothing remembered, the node asks which
@@ -340,12 +340,17 @@ local dashboard runs in every view, so:
   do the same; Terminal brings the terminal view up in the console window the
   node runs in.
 
-The app window is an **interim step**: until the native window (the router GUI
-port) exists, it is the dashboard in a Chromium-family browser in app mode (no
-tabs, no address bar): Edge on Windows, Chrome, Edge, Chromium or Brave on macOS
-and Linux, else your normal browser with a note. The link goes to the browser as
-a program argument, never through a shell, so the per-start token is visible in
-your own process list, exactly as it is when the node opens your browser.
+The app window is a native window (egui, the `native-gui` feature, on by
+default) in a process of its own that attaches to the node: closing it leaves
+the node running, stopping the node closes it. Where it cannot open (no
+display, or a build without it such as the static Linux release binaries), the
+node falls back to the dashboard in a Chromium-family browser in app mode (no
+tabs, no address bar): Edge on Windows, Chrome, Edge, Chromium or Brave on
+macOS and Linux, else your normal browser with a note. The link goes to the
+browser as a program argument, never through a shell, so the per-start token
+is visible in your own process list, exactly as it is when the node opens your
+browser. The window and the LAN router it shows are described in
+[docs/ROUTER.md](docs/ROUTER.md).
 
 The other starts keep their meaning: `--ui terminal` is the startup summary in
 the console (plus the view keys when you are at it), `--ui none` plain log lines

@@ -77,12 +77,18 @@ jobs:
         include:
           # musl + rustls: fully static, zero runtime deps. If the kernel
           # runs, the binary runs, which is the whole 24/7 fleet story.
+          # The static musl builds leave out the native app window
+          # (`native-gui`): a static binary cannot load the display
+          # libraries, and these builds run on servers and in containers.
+          # `--ui app` there falls back to the browser app window.
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
+            features: --no-default-features --features tui,wasm,dashboard,router
           # Native ARM runner rather than cross-compiling: free for public
           # repos, and a native build cannot lie about linker behaviour.
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
+            features: --no-default-features --features tui,wasm,dashboard,router
           - target: aarch64-apple-darwin
             runner: macos-latest
           - target: x86_64-apple-darwin
@@ -102,7 +108,7 @@ jobs:
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.features }}
       - name: Name the artifact after its version and target
         shell: bash
         # kmplify-node-<version>-<target>[.exe], e.g. kmplify-node-0.8.2-x86_64-pc-windows-msvc.exe,
