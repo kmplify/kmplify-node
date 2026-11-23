@@ -30,18 +30,21 @@ pub mod gpu;
 pub mod host;
 pub mod hostcpu;
 pub mod identity;
+#[cfg(feature = "native-gui")]
+pub mod native;
 pub mod operator_session;
 pub mod peers;
 pub mod proc;
 pub mod provider_terms;
 pub mod rewards;
+pub mod router;
 pub mod security;
 pub mod settings;
 pub mod status;
 pub mod summary;
 pub mod trust;
 pub mod vectors;
-#[cfg(any(feature = "dashboard", feature = "tui"))]
+#[cfg(any(feature = "dashboard", feature = "tui", feature = "native-gui"))]
 pub mod views;
 pub mod vllm_managed;
 pub mod wire;

@@ -17,6 +17,11 @@ allow = [
     "Unicode-3.0",
     "MPL-2.0",       # file-level copyleft only; safe to link, safe to ship
     "CDLA-Permissive-2.0",
+    # Boost Software License 1.0: permissive, no copyleft, no attribution
+    # duty for binaries. Only clipboard-win and error-code, the Windows
+    # clipboard behind the native app window (eframe forces its clipboard
+    # support on; added 2026-11-23 with the `native-gui` feature).
+    "BSL-1.0",
 ]
 confidence-threshold = 0.9
 

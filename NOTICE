@@ -34,6 +34,27 @@ The local dashboard embeds third-party assets under their own licenses:
 - Icon outlines from Heroicons 2 (src/dashboard/assets/index.html).
   Copyright (c) Tailwind Labs, Inc. MIT License.
 
+The native app window (src/native) draws with the same Inter, as TrueType
+instances of that file (src/native/fonts/Inter-Regular-latin.ttf and
+Inter-SemiBold-latin.ttf, weights 400 and 600). Copyright 2016 The Inter
+Project Authors. SIL Open Font License 1.1; the license text is
+src/native/fonts/OFL.txt. egui's own default fonts are not included.
+
+---
+
+The LAN router (src/router) and the native app window (src/native) adapt the
+design of NVIDIA Personal AI Router:
+
+    Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+    Licensed under the Apache License, Version 2.0.
+    https://github.com/NVIDIA/Personal-AI-Router
+
+The adaptation is a reimplementation in Rust of that project's architecture
+(node discovery over one consolidated mDNS record, per-node telemetry and the
+overview of every node on the network), not a copy of its Go or TypeScript
+source. NVIDIA, Personal AI Router and PAIR are trademarks of NVIDIA
+Corporation and are not used to name or endorse this software.
+
 The KMPLIFY name and logo (the dashboard mark, its tab icon and the Windows
 program icon) are trademarks of KMPLIFY and are not licensed under the Apache
 License; see TRADEMARKS.md.

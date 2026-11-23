@@ -47,6 +47,10 @@ pub struct Response {
     pub status: u16,
     pub content_type: &'static str,
     pub body: Vec<u8>,
+    /// Headers beyond the fixed set [`encode`] always writes (the router's
+    /// response signature). Names are compile-time constants; values must
+    /// not contain line breaks, which [`encode`] enforces.
+    pub extra: Vec<(&'static str, String)>,
 }
 
 impl Response {
@@ -55,7 +59,14 @@ impl Response {
             status,
             content_type,
             body: body.into(),
+            extra: Vec::new(),
         }
+    }
+
+    /// The same response with one more header.
+    pub fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
+        self.extra.push((name, value.into()));
+        self
     }
 
     pub fn text(status: u16, body: &str) -> Self {
@@ -112,12 +123,22 @@ pub fn encode(r: &Response) -> Vec<u8> {
          Cross-Origin-Opener-Policy: same-origin\r\n\
          Cross-Origin-Resource-Policy: same-origin\r\n\
          Permissions-Policy: camera=(), microphone=(), geolocation=()\r\n\
-         Connection: close\r\n\r\n",
+         Connection: close\r\n",
         r.status,
         reason(r.status),
         r.content_type,
         r.body.len()
     );
+    let mut head = head;
+    for (name, value) in &r.extra {
+        // A header value with a line break would let it write headers of
+        // its own; such a header is dropped rather than sent.
+        if value.contains(['\r', '\n']) || name.contains(['\r', '\n', ':']) {
+            continue;
+        }
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
     let mut out = head.into_bytes();
     out.extend_from_slice(&r.body);
     out

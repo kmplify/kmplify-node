@@ -356,6 +356,10 @@ pub const EDITABLE: &[&str] = &[
     "max-disk-gb",
 ];
 
+fn env_value(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
 fn opt<T: serde::Serialize>(v: Option<T>) -> Value {
     v.map(|v| json!(v)).unwrap_or(Value::Null)
 }
@@ -537,6 +541,40 @@ pub fn model(src: &Source) -> Value {
         ),
         with_how(
             setting(
+                "router",
+                "LAN router (off, local or lan)",
+                json!(stored
+                    .router
+                    .clone()
+                    .or_else(|| env_value("KMPLIFY_ROUTER"))
+                    .unwrap_or_else(|| "off".into())),
+                Value::Null,
+                stored.router.is_some(),
+                "text",
+                "KMPLIFY_ROUTER",
+            ),
+            "kmplify-node set router=local (this computer only) or router=lan (the network: \
+             needs router-allow and the cluster key, see kmplify-node router)",
+        ),
+        with_how(
+            setting(
+                "router-allow",
+                "LAN router allowlist",
+                json!(stored
+                    .router_allow
+                    .as_ref()
+                    .map(|v| v.join(","))
+                    .or_else(|| env_value("KMPLIFY_ROUTER_ALLOW"))
+                    .unwrap_or_default()),
+                Value::Null,
+                stored.router_allow.is_some(),
+                "text",
+                "KMPLIFY_ROUTER_ALLOW",
+            ),
+            "kmplify-node set router-allow=192.168.1.0/24 (private, link-local or VPN ranges only)",
+        ),
+        with_how(
+            setting(
                 "ui",
                 "Starting view",
                 json!(start_view_text(stored, &src.view)),
@@ -669,6 +707,180 @@ pub fn merge_changes(current: &Settings, saved: &Settings, draft: &Settings) -> 
         }
     }
     serde_json::from_value(Value::Object(out)).unwrap_or_else(|_| current.clone())
+}
+
+// ---------------------------------------------------------------- actions
+
+/// Which node an action is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// The node running in this process (the web dashboard, the terminal
+    /// view the node brought up): commands go to [`crate::control::submit`].
+    InProcess,
+    /// A node running in another process (the native app window, an
+    /// attached terminal): commands are dropped into its `control/`
+    /// directory with [`crate::control::request`], and the session list is
+    /// read from what it publishes.
+    Attached,
+}
+
+/// One of [`ACTIONS`], with what it needs. Every view turns its button or
+/// key into one of these and calls [`perform`], so an action cannot mean
+/// one thing in the browser and another in the app window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Act {
+    Pause,
+    Resume,
+    Reconnect,
+    Recheck,
+    /// Change one of [`EDITABLE`].
+    Setting {
+        key: String,
+        value: String,
+    },
+    /// Hand one of [`EDITABLE`] back to the environment.
+    SettingClear {
+        key: String,
+    },
+    StopSession(String),
+    Report,
+    StopNode,
+    /// `web`, `app` or `terminal`.
+    View(String),
+}
+
+impl Act {
+    /// The [`ACTIONS`] id this is.
+    pub fn id(&self) -> &'static str {
+        match self {
+            Act::Pause => "pause",
+            Act::Resume => "resume",
+            Act::Reconnect => "reconnect",
+            Act::Recheck => "recheck",
+            Act::Setting { .. } => "setting",
+            Act::SettingClear { .. } => "setting_clear",
+            Act::StopSession(_) => "stop_session",
+            Act::Report => "report",
+            Act::StopNode => "stop_node",
+            Act::View(v) => match v.as_str() {
+                "web" => "view_web",
+                "app" => "view_app",
+                _ => "view_terminal",
+            },
+        }
+    }
+}
+
+/// What came of an action: an HTTP-shaped status (the web dashboard answers
+/// with it as is), and the sentence to show.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Outcome {
+    pub status: u16,
+    pub ok: bool,
+    pub message: String,
+}
+
+impl Outcome {
+    fn ok(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            ok: true,
+            message: message.into(),
+        }
+    }
+
+    fn fail(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            ok: false,
+            message: message.into(),
+        }
+    }
+}
+
+fn send(target: Target, node_dir: &Path, cmd: &crate::control::Command) -> Result<(), String> {
+    match target {
+        Target::InProcess => crate::control::submit(cmd),
+        Target::Attached => crate::control::request(node_dir, cmd),
+    }
+}
+
+fn command(target: Target, node_dir: &Path, cmd: crate::control::Command) -> Outcome {
+    let message = cmd.confirmation();
+    let ok = if matches!(cmd, crate::control::Command::Recheck) {
+        202
+    } else {
+        200
+    };
+    match send(target, node_dir, &cmd) {
+        Ok(()) => Outcome::ok(ok, message),
+        Err(e) => Outcome::fail(409, e),
+    }
+}
+
+/// Carry out `act` on the node `target` names, whose directory is
+/// `node_dir`. The one implementation behind every view's controls.
+pub fn perform(target: Target, node_dir: &Path, act: &Act) -> Outcome {
+    use crate::control::Command;
+    let snapshot = || match target {
+        Target::InProcess => crate::status::snapshot(),
+        Target::Attached => crate::status::read_published(node_dir).unwrap_or_default(),
+    };
+    match act {
+        Act::Pause => command(target, node_dir, Command::Pause),
+        Act::Resume => command(target, node_dir, Command::Resume),
+        Act::Reconnect => command(target, node_dir, Command::Reconnect),
+        Act::Recheck => command(target, node_dir, Command::Recheck),
+        Act::StopNode => command(target, node_dir, Command::Shutdown),
+        Act::View(v) => {
+            if !crate::control::VIEWS.contains(&v.as_str()) {
+                return Outcome::fail(400, "view must be web, app or terminal");
+            }
+            command(target, node_dir, Command::View(v.clone()))
+        }
+        Act::StopSession(id) => {
+            if id.is_empty() {
+                return Outcome::fail(400, "no session id");
+            }
+            // Only a session this node hosts now; anything else is refused
+            // before a command is sent.
+            if !snapshot().sessions.iter().any(|s| &s.session_id == id) {
+                return Outcome::fail(404, "no such session on this machine");
+            }
+            command(target, node_dir, Command::StopSession(id.clone()))
+        }
+        Act::Report => match write_report(node_dir, &snapshot()) {
+            Ok(p) => Outcome::ok(200, format!("wrote {}", p.display())),
+            Err(e) => Outcome::fail(500, e),
+        },
+        Act::Setting { key, value } => change_setting(target, node_dir, key, Some(value)),
+        Act::SettingClear { key } => change_setting(target, node_dir, key, None),
+    }
+}
+
+/// `value: None` hands the key back to the environment.
+fn change_setting(target: Target, node_dir: &Path, key: &str, value: Option<&str>) -> Outcome {
+    if !EDITABLE.contains(&key) {
+        return Outcome::fail(
+            403,
+            format!("{key} is not changed from the dashboard; use kmplify-node set"),
+        );
+    }
+    let mut stored = Settings::load(node_dir);
+    let result = match value {
+        None => stored.clear(key),
+        Some(v) => stored.set(key, v),
+    };
+    if let Err(e) = result {
+        return Outcome::fail(400, e);
+    }
+    if let Err(e) = stored.save(node_dir) {
+        return Outcome::fail(500, format!("cannot save: {e}"));
+    }
+    // No live gateway session is fine: the worker re-reads the file before
+    // it dials again.
+    let _ = send(target, node_dir, &crate::control::Command::Reload);
+    Outcome::ok(200, "saved; the node re-advertises within seconds")
 }
 
 // ----------------------------------------------------------------- report

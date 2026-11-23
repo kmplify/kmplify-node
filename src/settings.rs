@@ -140,6 +140,21 @@ pub struct Settings {
     /// console sees first.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ui: Option<String>,
+    /// The LAN router (`KMPLIFY_ROUTER`): `off`, `local` (this machine's
+    /// report on loopback only) or `lan` (other machines on the allowlist,
+    /// with the cluster key). See [`crate::router`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub router: Option<String>,
+    /// Who on the network may reach the router in `lan` mode
+    /// (`KMPLIFY_ROUTER_ALLOW`): addresses or CIDR ranges in private,
+    /// link-local or CGNAT space. Never a credential.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub router_allow: Option<Vec<String>>,
+    /// How this node calls itself to the other nodes (`KMPLIFY_ROUTER_NAME`).
+    /// Unset, it is "node-" and the first characters of the node id, never
+    /// the computer's name, which often carries a person's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub router_name: Option<String>,
 }
 
 /// The settings a caller may address by name, in `kmplify-node set` and in
@@ -175,6 +190,9 @@ pub const KEYS: &[(&str, &str)] = &[
     ("max-vector-mb", "PROVIDER_MAX_VECTOR_MB"),
     ("rewards", "PROVIDER_REWARDS"),
     ("ui", "KMPLIFY_NODE_UI"),
+    ("router", "KMPLIFY_ROUTER"),
+    ("router-allow", "KMPLIFY_ROUTER_ALLOW"),
+    ("router-name", "KMPLIFY_ROUTER_NAME"),
 ];
 
 pub fn path(node_dir: &Path) -> PathBuf {
@@ -533,6 +551,20 @@ impl Settings {
                 crate::dashboard::UiMode::parse(value)?;
                 self.ui = Some(value.to_ascii_lowercase());
             }
+            "router" => {
+                self.router = Some(crate::router::policy::Mode::parse(value)?.as_str().into())
+            }
+            "router-allow" => {
+                let entries: Vec<String> = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(String::from)
+                    .collect();
+                crate::router::policy::Allowlist::parse(&entries)?;
+                self.router_allow = Some(entries);
+            }
+            "router-name" => self.router_name = Some(crate::router::policy::check_name(value)?),
             _ => {
                 return Err(format!(
                     "unknown setting {key:?} (one of: {})",
@@ -571,6 +603,9 @@ impl Settings {
             "max-vector-mb" => self.max_vector_mb = None,
             "rewards" => self.rewards = None,
             "ui" => self.ui = None,
+            "router" => self.router = None,
+            "router-allow" => self.router_allow = None,
+            "router-name" => self.router_name = None,
             _ => {
                 return Err(format!(
                     "unknown setting {key:?} (one of: {})",
@@ -644,6 +679,12 @@ impl Settings {
         push("max-vector-mb", self.max_vector_mb.map(|v| v.to_string()));
         push("rewards", self.rewards.map(|v| v.to_string()));
         push("ui", self.ui.clone());
+        push("router", self.router.clone());
+        push(
+            "router-allow",
+            self.router_allow.as_ref().map(|v| v.join(",")),
+        );
+        push("router-name", self.router_name.clone());
         out
     }
 }
@@ -1010,6 +1051,9 @@ mod tests {
                 "vllm-gpu-util" => "0.8",
                 "workloads" => "ollama-cpu",
                 "ui" => "gui",
+                "router" => "local",
+                "router-allow" => "192.168.1.0/24",
+                "router-name" => "studio",
                 _ => "1",
             };
             assert!(s.set(key, sample).is_ok(), "{key} not settable");
