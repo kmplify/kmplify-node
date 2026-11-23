@@ -37,6 +37,7 @@ pub mod provider_terms;
 pub mod rewards;
 pub mod security;
 pub mod settings;
+pub mod startup;
 pub mod status;
 pub mod summary;
 pub mod trust;

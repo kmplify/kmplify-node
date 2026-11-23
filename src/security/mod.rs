@@ -438,7 +438,9 @@ pub fn start() {
     }
     tokio::spawn(async {
         loop {
+            crate::startup::step("security check: begin");
             let r = check().await;
+            crate::startup::step("security check: end");
             store(r);
             tokio::time::sleep(RECHECK_INTERVAL).await;
         }

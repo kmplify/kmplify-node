@@ -271,6 +271,30 @@ Then watch and steer it from a terminal:
 kmplify-node tui
 ```
 
+### When the node ends without a word
+
+Every start writes `startup.log` to the node directory (the first line the
+node prints names it): one timestamped line per start step, the previous
+start kept as `startup.prev.log`. Whatever ended the process, the last line
+is the step it was in. A crash also writes `startup-crash.log` there, with
+the message and a backtrace (in the temp directory when the node directory
+cannot be written). Neither file holds a token or an environment value.
+
+On Windows, also look at:
+
+- `$LASTEXITCODE` right after the node returned to the prompt. `-1073741571`
+  (`0xC00000FD`) is a stack overflow, `-1073741819` (`0xC0000005`) an access
+  violation, `1` or `2` a refused start (the reason is printed) and `101` a
+  crash with a report.
+- Windows Security > Virus & threat protection > Protection history: Defender
+  stopping or quarantining `kmplify-node.exe` leaves no message in the
+  console.
+
+A Docker that is not running, or does not answer, is not a reason to stop:
+the node says so in one line, leaves containerised sessions off and keeps
+lending chat models. A GPU tool or Docker that never answers is given up on
+after 15 s and 5 s.
+
 ### Your engine, found rather than typed
 
 KMPLIFY ships no model runner of its own; the node lends whatever
