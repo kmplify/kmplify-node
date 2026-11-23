@@ -382,8 +382,23 @@ pub(crate) fn parse_gpu_json(out: &str) -> Option<(Option<String>, Option<u64>)>
 // Probes
 // ---------------------------------------------------------------------------
 
+/// A vendor tool gets this long; a driver tool that hangs (a wedged
+/// nvidia-smi is not rare) must not hold the node's start.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 async fn run(bin: &str, args: &[&str]) -> Option<String> {
-    let out = crate::proc::command(bin).args(args).output().await.ok()?;
+    let mut cmd = crate::proc::command(bin);
+    cmd.args(args).kill_on_drop(true);
+    let out = match tokio::time::timeout(PROBE_TIMEOUT, cmd.output()).await {
+        Ok(r) => r.ok()?,
+        Err(_) => {
+            eprintln!(
+                "[kmplify-node] {bin} did not answer within {} s; carrying on without it",
+                PROBE_TIMEOUT.as_secs()
+            );
+            return None;
+        }
+    };
     if !out.status.success() {
         return None;
     }

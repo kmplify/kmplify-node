@@ -172,10 +172,19 @@ pub fn base_url() -> String {
 }
 
 pub async fn remove() {
-    let _ = crate::proc::command("docker")
-        .args(["rm", "-f", CONTAINER])
-        .output()
-        .await;
+    // A Docker that is not running, still starting or wedged can leave the
+    // CLI waiting for minutes; this clean-up must never hold the node's start.
+    let mut cmd = crate::proc::command("docker");
+    cmd.args(["rm", "-f", CONTAINER]).kill_on_drop(true);
+    if tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
+        .await
+        .is_err()
+    {
+        eprintln!(
+            "[kmplify-node] docker did not answer within 10 s (is Docker running?); \
+             skipped removing an old vLLM container"
+        );
+    }
 }
 
 /// Start vLLM for `model` and wait until it answers. Returns the base URL

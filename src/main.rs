@@ -2198,6 +2198,13 @@ async fn main() {
     // because probing four vendor tools to print a node id is pure latency in
     // whatever script called it.
     let gpus = if matches!(cli.cmd, cli::Cmd::Check | cli::Cmd::Run | cli::Cmd::Tui) {
+        // Said before the probes, so a slow vendor tool is not a silent start.
+        if !cli.json {
+            eprintln!(
+                "[kmplify-node] {} starting: looking for GPUs…",
+                kmplify_node::version_string()
+            );
+        }
         gpu::detect_all().await
     } else {
         Vec::new()
