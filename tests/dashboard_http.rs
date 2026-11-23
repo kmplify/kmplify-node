@@ -1,6 +1,8 @@
 //! The local dashboard, served for real on loopback inside this test
 //! process: what it answers with the token, and what it refuses without.
 
+#![cfg(feature = "dashboard")]
+
 use std::net::SocketAddr;
 
 use kmplify_node::dashboard::{self, Ctx};

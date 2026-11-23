@@ -242,6 +242,10 @@ fn describe_close(frame: Option<&tokio_tungstenite::tungstenite::protocol::Close
 /// rare enough that `docker system df` is not scanning a provider's disk
 /// every ten seconds.
 const SLOW_SAMPLE_EVERY: u8 = 6;
+/// Heartbeats in a row on which Docker itself (`docker info`) did not answer
+/// before a quiet pull is given up as a dead daemon rather than a slow layer.
+const PULL_DAEMON_MISSES: u32 = 4;
+
 /// Longest silence tolerated from `docker pull`.
 ///
 /// Sized from the real catalog rather than intuition: non-TTY docker prints
@@ -291,6 +295,21 @@ pub struct HostedSession {
     /// node's receipts start counting. Distinct from `since`: the minutes a
     /// session spent pulling an image are not compute anybody is paid for.
     pub running_since: Option<i64>,
+}
+
+impl HostedSession {
+    /// Every container this session may own right now: the session's own
+    /// container and, while models are being fetched before it starts, the
+    /// prefetch helper. The helper is named after the session, not recorded
+    /// in it, so anything deciding "is this container someone's live work?"
+    /// has to ask here. Counting only `container` showed a live session's
+    /// downloader as an orphan, with a Remove button that killed the fetch.
+    pub fn containers(&self) -> [String; 2] {
+        [
+            self.container.clone(),
+            prefetch_container_name(&self.session_id),
+        ]
+    }
 }
 
 static HOSTED: std::sync::OnceLock<Arc<Mutex<Vec<HostedSession>>>> = std::sync::OnceLock::new();
@@ -381,6 +400,45 @@ fn current_sink_cell() -> &'static tokio::sync::RwLock<Option<Arc<Mutex<WsSink>>
     static CURRENT: std::sync::OnceLock<tokio::sync::RwLock<Option<Arc<Mutex<WsSink>>>>> =
         std::sync::OnceLock::new();
     CURRENT.get_or_init(|| tokio::sync::RwLock::new(None))
+}
+
+/// The gateway link as it is, for an embedding application's own screen.
+///
+/// A worker task that exists is not a worker that serves: one that dials
+/// nowhere looks identical to one serving peers, and every provider of the
+/// public fabric was once missing from it for nine days while each owner's
+/// screen said "sharing on". This is the same state `kmplify-node status`
+/// reads ([`crate::status::snapshot`]), in the shape an app's provider
+/// status needs.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct LinkState {
+    /// The hello was answered with a welcome and the socket is still up.
+    pub connected: bool,
+    /// The gateway the worker dials, "" before the first attempt.
+    pub gateway: String,
+    /// Unix seconds of the current connection's welcome.
+    pub since: Option<u64>,
+    /// Why the last attempt ended, kept across retries until a welcome.
+    pub last_error: Option<String>,
+    /// Connections that were up and then lost since the worker started.
+    pub reconnects: u64,
+    /// Models this node currently advertises. A connected node lending
+    /// nothing is the next invisible failure after "not running".
+    pub models: usize,
+}
+
+/// A snapshot of the gateway link.
+pub fn link_state() -> LinkState {
+    let s = crate::status::snapshot();
+    let connected = s.link == crate::status::Link::Online;
+    LinkState {
+        connected,
+        gateway: s.gateway,
+        since: (connected && s.connected_at_ms > 0).then_some(s.connected_at_ms / 1000),
+        last_error: Some(s.last_error).filter(|e| !e.is_empty()),
+        reconnects: s.reconnects,
+        models: s.models.len(),
+    }
 }
 
 /// Sessions this PROCESS hosts, shared across gateway connections.
@@ -602,6 +660,7 @@ impl Default for WorkerConfig {
         Self {
             gateway_url: crate::PUBLIC_FABRIC_URL.to_string(),
             ollama_base: "http://127.0.0.1:11434".to_string(),
+            builtin_base: None,
             // Empty = no colibri upstream; the node behaves exactly as it
             // did before colibri existed.
             colibri_base: String::new(),
@@ -663,6 +722,10 @@ impl WorkerConfig {
 pub struct WorkerConfig {
     pub gateway_url: String,
     pub ollama_base: String,
+    /// An embedder's built-in engine (an OpenAI-compatible server it runs
+    /// itself, like the desktop app's llama.cpp), lent INSTEAD of
+    /// `ollama_base` when that one lists no models. None for the binary.
+    pub builtin_base: Option<String>,
     /// Optional second local upstream: a colibri `coli serve` gateway
     /// (protocol v2.5). Colibri streams frontier MoE models (284B-2.8T)
     /// from NVMe through RAM/VRAM, so what this node can lend is no longer
@@ -825,6 +888,8 @@ fn log(msg: impl std::fmt::Display) {
     // at the call sites so a line can never exist in one surface and not the
     // other.
     crate::status::push_log(msg.clone());
+    // An embedding application's own log (host.rs).
+    crate::host::with(|h| h.log_line(&msg));
     // A full-screen dashboard owns the terminal; printing under it would draw
     // over the frame it just painted. The line is not lost, it is in the ring.
     if !crate::status::quiet() {
@@ -1392,17 +1457,96 @@ pub async fn discover_kind(
     client: &reqwest::Client,
     cfg: &WorkerConfig,
 ) -> (Vec<String>, std::collections::HashMap<String, String>, bool) {
-    let (primary, is_ollama) = local_models_kind(client, &cfg.ollama_base).await;
+    let d = discover_upstreams(client, cfg).await;
+    (d.models, d.engines, d.primary_openai_only)
+}
+
+/// What a connection lends and where: the chosen primary upstream, whether
+/// it speaks only the OpenAI shape, and the model list with its per-model
+/// overrides (colibri).
+#[derive(Clone, Debug)]
+pub struct Discovery {
+    pub models: Vec<String>,
+    pub engines: std::collections::HashMap<String, String>,
+    /// The upstream jobs go to: `ollama_base`, the same address on the other
+    /// loopback family, or `builtin_base`.
+    pub primary_base: String,
+    pub primary_openai_only: bool,
+}
+
+/// The same URL on the other loopback family (127.0.0.1 or localhost to
+/// [::1], and back), or None when the base is not a loopback address.
+fn other_loopback(base: &str) -> Option<String> {
+    for (from, to) in [
+        ("//127.0.0.1", "//[::1]"),
+        ("//localhost", "//[::1]"),
+        ("//[::1]", "//127.0.0.1"),
+    ] {
+        if let Some(i) = base.find(from) {
+            let rest = &base[i + from.len()..];
+            if rest.is_empty() || rest.starts_with(':') || rest.starts_with('/') {
+                return Some(format!("{}{to}{rest}", &base[..i]));
+            }
+        }
+    }
+    None
+}
+
+/// `ollama_base` first. When it lists nothing, the same address on the other
+/// loopback family (two servers can share the port: on Windows a native
+/// ollama.exe binds 127.0.0.1:11434 while Docker's Ollama publishes
+/// [::]:11434, so the IPv4 address reaches an empty store and the models sit
+/// behind ::1), and then an embedder's built-in engine (`builtin_base`).
+/// Colibri rides along in every case.
+pub async fn discover_upstreams(client: &reqwest::Client, cfg: &WorkerConfig) -> Discovery {
+    let (mut primary, is_ollama) = local_models_kind(client, &cfg.ollama_base).await;
+    let mut primary_base = cfg.ollama_base.clone();
+    let mut primary_openai_only = !is_ollama;
+    if primary.is_empty() {
+        if let Some(alt) = other_loopback(&cfg.ollama_base) {
+            let (models, alt_is_ollama) = local_models_kind(client, &alt).await;
+            if !models.is_empty() {
+                log(format!(
+                    "no models at {} — lending {alt} instead ({} model(s)); two servers share this port",
+                    cfg.ollama_base,
+                    models.len()
+                ));
+                primary = models;
+                primary_base = alt;
+                primary_openai_only = !alt_is_ollama;
+            }
+        }
+    }
+    if primary.is_empty() {
+        if let Some(builtin) = cfg.builtin_base.as_deref().filter(|b| !b.is_empty()) {
+            let (models, builtin_is_ollama) = local_models_kind(client, builtin).await;
+            if !models.is_empty() {
+                log(format!(
+                    "no models at {} — lending the built-in engine at {builtin} ({} model(s))",
+                    cfg.ollama_base,
+                    models.len()
+                ));
+                primary = models;
+                primary_base = builtin.to_string();
+                primary_openai_only = !builtin_is_ollama;
+            }
+        }
+    }
     let colibri = colibri_models(client, &cfg.colibri_base, &cfg.colibri_api_key).await;
     let mut engines = std::collections::HashMap::new();
-    let mut all = primary.clone();
+    let mut models = primary.clone();
     for m in colibri {
         if !primary.contains(&m) {
             engines.insert(m.clone(), "colibri".to_string());
-            all.push(m);
+            models.push(m);
         }
     }
-    (all, engines, !is_ollama)
+    Discovery {
+        models,
+        engines,
+        primary_base,
+        primary_openai_only,
+    }
 }
 
 /// Total VRAM of GPU 0 in MB via nvidia-smi, or None. The one number the
@@ -1647,8 +1791,9 @@ fn cpu_info() -> Value {
 /// `docker version` talks to the SERVER, not just the CLI — the failure this
 /// catches is Docker Desktop being installed but not running, which reports
 /// exactly the error a consumer saw: "failed to connect to the docker API at
-/// npipe:////./pipe/dockerDesktopLinux".
-async fn docker_ok() -> bool {
+/// npipe:////./pipe/dockerDesktopLinux". Bounded: a wedged socket costs
+/// seconds, not forever.
+pub async fn docker_ok() -> bool {
     matches!(
         bounded_output("docker", &["version", "--format", "{{.Server.Version}}"], DOCKER_PROBE_TIMEOUT).await,
         Ok(o) if o.status.success()
@@ -2918,10 +3063,8 @@ fn parse_container_state(inspect_ok: bool, stdout: &str) -> Option<i64> {
 /// session dies before becoming ready. Captured BEFORE the container is
 /// removed — afterwards there is nothing to ask.
 async fn container_log_tail(name: &str, lines: u32) -> String {
-    let out = crate::proc::command("docker")
-        .args(["logs", "--tail", &lines.to_string(), name])
-        .output()
-        .await;
+    let window = lines.max(400).to_string();
+    let out = docker_bounded(&["logs", "--tail", &window, name], Duration::from_secs(20)).await;
     let combined = match out {
         Ok(o) => {
             // vLLM and friends log almost everything to stderr; take both.
@@ -2937,7 +3080,7 @@ async fn container_log_tail(name: &str, lines: u32) -> String {
         }
         Err(_) => String::new(),
     };
-    trim_log_tail(&combined, 900)
+    explain_log(&combined, lines as usize)
 }
 
 /// Keep the END of the log — the crash is at the bottom, and a gateway
@@ -2959,6 +3102,36 @@ fn trim_log_tail(txt: &str, max_chars: usize) -> String {
         .rev()
         .collect();
     format!("…{tail}")
+}
+
+/// Cause first (when the tail doesn't already show it), then the last lines.
+fn explain_log(log: &str, tail_lines: usize) -> String {
+    let all: Vec<&str> = log.lines().collect();
+    let tail = all[all.len().saturating_sub(tail_lines)..].join("\n");
+    let tail = trim_log_tail(&tail, 900);
+    match first_error_line(log) {
+        Some(cause) if !tail.contains(cause) => {
+            let cause: String = cause.chars().take(300).collect();
+            format!("cause: {cause}\n{tail}")
+        }
+        _ => tail,
+    }
+}
+
+/// The first line that names an exception ("ModuleNotFoundError: …",
+/// "PermissionError: …"), skipping traceback frames.
+fn first_error_line(log: &str) -> Option<&str> {
+    log.lines().map(str::trim).find(|l| {
+        let Some((head, rest)) = l.split_once(": ") else {
+            return false;
+        };
+        !rest.is_empty()
+            && head.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            && head
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+            && (head.ends_with("Error") || head.ends_with("Exception"))
+    })
 }
 
 async fn remove_container(name: &str) -> Result<(), String> {
@@ -3002,6 +3175,9 @@ async fn docker_rm(name: &str) -> Result<(), String> {
 /// never answers cannot hold the worker.
 const DOCKER_INVENTORY_TIMEOUT: Duration = Duration::from_secs(25);
 
+/// How long the model discovery before the dial may take.
+const UPSTREAM_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// A docker command's output, or why there is none, within `limit`.
 ///
 /// The inventory runs BEFORE the worker dials the gateway and again on the
@@ -3011,7 +3187,10 @@ const DOCKER_INVENTORY_TIMEOUT: Duration = Duration::from_secs(25);
 /// Windows machine with sharing on that the gateway had not seen for three
 /// days and that never once tried to connect). The child is killed when the
 /// limit passes, so a hung CLI does not pile up either.
-async fn docker_bounded(args: &[&str], limit: Duration) -> Result<std::process::Output, String> {
+pub async fn docker_bounded(
+    args: &[&str],
+    limit: Duration,
+) -> Result<std::process::Output, String> {
     bounded_output("docker", args, limit).await
 }
 
@@ -3228,6 +3407,228 @@ async fn drop_volumes(sink: Arc<Mutex<WsSink>>, frame: Value) {
                "removed": removed, "absent": absent, "in_use": in_use, "failed": failed}),
     )
     .await;
+}
+
+/// Free space this node always keeps on the disk Docker writes to. Below it
+/// the node stops offering container sessions: a first vLLM image pull once
+/// filled a provider's system drive, containerd crashed and Docker hung.
+const DOCKER_DISK_RESERVE_MB: u64 = 15 * 1024;
+
+/// A pull in progress is stopped when free space falls under this.
+const PULL_ABORT_FREE_MB: u64 = 5 * 1024;
+
+/// What an image of unknown size is assumed to need before it is pulled.
+/// CUDA serving images (vLLM, ComfyUI) are 10-20 GB unpacked.
+const UNKNOWN_IMAGE_MB_CUDA: u64 = 20 * 1024;
+const UNKNOWN_IMAGE_MB_CPU: u64 = 4 * 1024;
+
+/// Where Docker's data lands on THIS machine's own disk. On Docker Desktop
+/// that is the VM's disk image (it grows until the host drive is full, while
+/// the VM itself still reports a near-empty 1 TB disk), so the host drive is
+/// the number that matters.
+#[cfg(target_os = "windows")]
+async fn docker_data_host_path() -> Option<std::path::PathBuf> {
+    {
+        let settings = std::env::var_os("APPDATA").map(|a| {
+            std::path::PathBuf::from(a)
+                .join("Docker")
+                .join("settings-store.json")
+        });
+        if let Some(raw) = settings.and_then(|p| std::fs::read_to_string(p).ok()) {
+            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                for key in ["CustomWslDistroDir", "DataFolder"] {
+                    if let Some(dir) = v[key].as_str().filter(|d| !d.is_empty()) {
+                        if std::path::Path::new(dir).exists() {
+                            return Some(dir.into());
+                        }
+                    }
+                }
+            }
+        }
+        // Only the default location when the disk image is really there: a
+        // disk moved to D: by a setting this code doesn't know must not be
+        // judged by C:'s free space, which would refuse every session.
+        std::env::var_os("LOCALAPPDATA")
+            .map(|l| std::path::PathBuf::from(l).join("Docker").join("wsl"))
+            .filter(|dir| dir.join("disk").join("docker_data.vhdx").exists())
+    }
+}
+
+/// See the Windows variant above.
+#[cfg(target_os = "macos")]
+async fn docker_data_host_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .map(|h| std::path::PathBuf::from(h).join("Library/Containers/com.docker.docker"))
+}
+
+/// See the Windows variant above.
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+async fn docker_data_host_path() -> Option<std::path::PathBuf> {
+    {
+        let root = docker_bounded(
+            &["info", "--format", "{{.DockerRootDir}}"],
+            DOCKER_PROBE_TIMEOUT,
+        )
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|r| !r.is_empty());
+        Some(root.unwrap_or_else(|| "/var/lib/docker".into()).into())
+    }
+}
+
+/// Unused space inside Docker Desktop's disk image: its size on the host
+/// minus what `docker system df` says images, containers, volumes and build
+/// cache take. Shared layers are counted per image there, so this errs low.
+async fn docker_disk_slack_mb(data_dir: &std::path::Path) -> Option<u64> {
+    let vhdx = std::fs::metadata(data_dir.join("disk").join("docker_data.vhdx"))
+        .ok()?
+        .len()
+        / 1_048_576;
+    let out = docker_bounded(
+        &["system", "df", "--format", "{{.Size}}"],
+        DOCKER_INVENTORY_TIMEOUT,
+    )
+    .await
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(disk_slack_mb(vhdx, &String::from_utf8_lossy(&out.stdout)))
+}
+
+/// `docker system df` prints decimal sizes ("15.2GB"); the image is in MiB.
+fn disk_slack_mb(image_mib: u64, df_sizes: &str) -> u64 {
+    let used_mb: u64 = df_sizes.lines().map(parse_docker_size_mb).sum();
+    let used_mib = used_mb * 1_000_000 / 1_048_576;
+    image_mib.saturating_sub(used_mib)
+}
+
+/// Room Docker has to write into, in MB, or None when unknown: free space on
+/// the host drive that holds its data, plus (Docker Desktop on Windows) the
+/// part of its disk image it already owns but no longer uses. Docker reuses
+/// that before growing the file, so leaving it out would refuse sessions
+/// that fit, e.g. after unused images were deleted.
+async fn docker_host_free_mb() -> Option<u64> {
+    let path = docker_data_host_path().await?;
+    let host = free_disk_bytes(&path)? / 1_048_576;
+    Some(host + docker_disk_slack_mb(&path).await.unwrap_or(0))
+}
+
+/// Disk an image takes while and after it is pulled, from its download
+/// size: the compressed layers are kept (containerd's image store keeps the
+/// blobs) AND unpacked, which typically runs 2–2.5× the download. 3.5× the
+/// compressed size covers both without refusing images that would fit.
+fn image_disk_need_mb(compressed_mb: u64) -> u64 {
+    compressed_mb * 7 / 2
+}
+
+fn docker_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        _ => "amd64",
+    }
+}
+
+/// Sum of layer sizes in a `docker manifest inspect -v` body: one object
+/// for a single-platform image, a list (one per platform) for a multi-arch
+/// one, from which only linux/<arch> counts.
+fn manifest_compressed_bytes(v: &Value, arch: &str) -> Option<u64> {
+    let layers_of = |m: &Value| -> Option<u64> {
+        let manifest = ["SchemaV2Manifest", "OCIManifest"]
+            .iter()
+            .find_map(|k| m.get(*k))?;
+        let layers = manifest["layers"].as_array()?;
+        Some(layers.iter().filter_map(|l| l["size"].as_u64()).sum())
+    };
+    match v {
+        Value::Array(list) => list
+            .iter()
+            .find(|m| {
+                let p = &m["Descriptor"]["platform"];
+                p["os"] == "linux" && p["architecture"] == arch
+            })
+            .and_then(layers_of),
+        _ => layers_of(v),
+    }
+}
+
+/// The image's download size in MB, as the registry states it for this
+/// machine's platform (`docker manifest inspect -v`: per-layer compressed
+/// sizes). None when the registry can't be asked; the caller then assumes.
+async fn registry_image_mb(image: &str) -> Option<u64> {
+    let out = docker_bounded(
+        &["manifest", "inspect", "-v", image],
+        Duration::from_secs(30),
+    )
+    .await
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
+    manifest_compressed_bytes(&v, docker_arch()).map(|b| b.div_ceil(1_048_576))
+}
+
+/// Is this image already in the local store (so pulling it costs ~nothing)?
+async fn image_present(image: &str) -> bool {
+    matches!(
+        docker_bounded(&["image", "inspect", "--format", "{{.Id}}", image], DOCKER_PROBE_TIMEOUT).await,
+        Ok(o) if o.status.success()
+    )
+}
+
+/// Why `need_mb` more cannot be written to Docker's disk, or None. Unknown
+/// free space is not a refusal (no worse than before this check existed).
+fn host_disk_refusal(free_mb: Option<u64>, need_mb: u64, what: &str) -> Option<String> {
+    let free_mb = free_mb?;
+    (need_mb + DOCKER_DISK_RESERVE_MB > free_mb).then(|| {
+        format!(
+            "{what} needs about {:.1} GB, but the provider's Docker disk has only {:.1} GB free \
+             ({:.0} GB is kept in reserve)",
+            need_mb as f64 / 1024.0,
+            free_mb as f64 / 1024.0,
+            DOCKER_DISK_RESERVE_MB as f64 / 1024.0,
+        )
+    })
+}
+
+/// Docker answers AND its disk has room: only then are sessions offered.
+async fn docker_can_host() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !docker_ok().await {
+        return false;
+    }
+    let low = matches!(docker_host_free_mb().await, Some(free) if free < DOCKER_DISK_RESERVE_MB);
+    if low != WARNED.swap(low, Ordering::Relaxed) {
+        log(if low {
+            "Docker's disk is nearly full — not offering container sessions until space is freed"
+                .to_string()
+        } else {
+            "Docker's disk has room again".to_string()
+        });
+    }
+    !low
+}
+
+/// Free bytes on the volume whose mount point is the longest prefix of
+/// `path`, or `None` when no mounted volume contains it.
+pub fn free_disk_bytes(path: &std::path::Path) -> Option<u64> {
+    use sysinfo::Disks;
+    let disks = Disks::new_with_refreshed_list();
+    let mut best: Option<(usize, u64)> = None;
+    for d in disks.list() {
+        let mp = d.mount_point();
+        if path.starts_with(mp) {
+            let len = mp.as_os_str().len();
+            if best.map(|(l, _)| len > l).unwrap_or(true) {
+                best = Some((len, d.available_space()));
+            }
+        }
+    }
+    best.map(|(_, bytes)| bytes)
 }
 
 /// How much disk the fabric's own volumes are using, in MB.
@@ -3688,6 +4089,116 @@ const MODEL_FETCH_IMAGE: &str = "alpine:3.20";
 /// patience is for the consumer to grant, not for retries to multiply.
 const MODEL_FETCH_TOTAL_TIMEOUT: Duration = Duration::from_secs(3600);
 
+/// Marks a session as being started by a task; released when that task ends.
+struct StartGuard(String);
+
+fn starting_cell() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static STARTING: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    STARTING.get_or_init(Default::default)
+}
+
+impl StartGuard {
+    fn claim(session: &str) -> Option<Self> {
+        starting_cell()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session.to_string())
+            .then(|| StartGuard(session.to_string()))
+    }
+}
+
+impl Drop for StartGuard {
+    fn drop(&mut self) {
+        starting_cell()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
+/// One lock per model file (volume + path), shared by every session on this
+/// machine.
+///
+/// Two sessions of the same template need the same files. Without this they
+/// both ran a downloader into the SAME `.part`, interleaving writes, and the
+/// first one to stop or fail deleted the file the other was still filling,
+/// so one session's end broke the other. Now the first session downloads and
+/// any other waits for it, then finds the finished file and skips it. A stop
+/// only ever ends the stopping session's own downloader.
+fn file_lock(volume: &str, path: &str) -> Arc<Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(format!("{volume}/{path}"))
+        .or_default()
+        .clone()
+}
+
+/// Remove prefetch helpers no live session owns.
+///
+/// A helper from a run that crashed (or one the startup sweep missed because
+/// Docker came up late) keeps appending to the `.part` a new session is about
+/// to resume, which would corrupt it. Called with the file's lock held, so
+/// the only helpers left that matter are ours or nobody's.
+async fn reap_stale_prefetch_helpers() {
+    let Ok(out) = docker_bounded(
+        &[
+            "ps",
+            "-a",
+            "--filter",
+            "name=kmplify-fabric-prefetch-",
+            "--format",
+            "{{.Names}}",
+        ],
+        Duration::from_secs(30),
+    )
+    .await
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let owned: std::collections::HashSet<String> = hosted_sessions()
+        .await
+        .iter()
+        .map(|h| prefetch_container_name(&h.session_id))
+        .collect();
+    for name in String::from_utf8_lossy(&out.stdout).lines().map(str::trim) {
+        if name.starts_with("kmplify-fabric-prefetch-") && !owned.contains(name) {
+            log(format!("removing stale model downloader {name}"));
+            let _ = remove_container(name).await;
+        }
+    }
+}
+
+/// What to do with a `.part` left by an earlier attempt, given its size.
+#[derive(Debug, PartialEq)]
+enum PartState {
+    /// Nothing there: download from the start.
+    Absent,
+    /// Some bytes already there: continue from them (`wget -c`).
+    Resume(u64),
+    /// Already the full size: skip the download, the digest decides.
+    Complete,
+    /// Larger than the manifest says the file is: not this file, start over.
+    Oversized,
+}
+
+fn part_state(size: Option<u64>, expected: u64) -> PartState {
+    match size {
+        None | Some(0) => PartState::Absent,
+        Some(n) if expected > 0 && n == expected => PartState::Complete,
+        Some(n) if expected > 0 && n > expected => PartState::Oversized,
+        Some(n) => PartState::Resume(n),
+    }
+}
+
 fn prefetch_container_name(session: &str) -> String {
     format!(
         "kmplify-fabric-prefetch-{}",
@@ -3743,6 +4254,34 @@ async fn volume_file_size(volume: &str, path: &str) -> Option<u64> {
     .and_then(|out| out.parse().ok())
 }
 
+/// Bytes of the manifest not yet in their volumes.
+async fn missing_model_bytes(specs: &[ModelSpec]) -> u64 {
+    let mut missing = 0;
+    for spec in specs {
+        if volume_file_size(&spec.volume, &spec.path).await.is_none() {
+            missing += spec.bytes;
+        }
+    }
+    missing
+}
+
+/// Why the owner's disk budget does not allow these downloads, or None.
+///
+/// Models stay in the volume after the session, so they count against the
+/// disk the owner agreed to lend, like a model a consumer fetches by hand.
+fn disk_refusal(cap_gb: Option<u64>, used_mb: u64, missing_bytes: u64) -> Option<String> {
+    let cap_gb = cap_gb?;
+    let need_mb = missing_bytes.div_ceil(1_048_576);
+    let free_mb = (cap_gb * 1024).saturating_sub(used_mb);
+    (need_mb > free_mb).then(|| {
+        format!(
+            "this app needs {:.1} GB of model files, but the provider has {:.1} GB left of the {cap_gb} GB they agreed to share",
+            need_mb as f64 / 1024.0,
+            free_mb as f64 / 1024.0,
+        )
+    })
+}
+
 /// Fetch every missing manifest file into its volume, digest-verified.
 ///
 /// Ok(true): all present. Ok(false): the session was stopped mid-fetch and
@@ -3769,6 +4308,47 @@ async fn prefetch_models(
             done += spec.bytes;
             continue;
         }
+        // Wait for any other session fetching this same file, honoring a
+        // stop meanwhile, then look again: it is usually there by now.
+        let lock = file_lock(&spec.volume, &spec.path);
+        let mut waited: u32 = 0;
+        let _guard = loop {
+            if let Ok(g) = lock.clone().try_lock_owned() {
+                break g;
+            }
+            if stopped.lock().await.remove(session) {
+                return Ok(false);
+            }
+            // Show the shared download's progress, not this session's own:
+            // a waiting session downloads nothing itself, so its bar sat at
+            // 0% for the whole fetch while the file was filling fine. Sized
+            // every ~12 s (it costs a helper container), the lock every 3 s.
+            if waited.is_multiple_of(4) {
+                let name = spec.path.rsplit('/').next().unwrap_or(&spec.path);
+                let shared = volume_file_size(&spec.volume, &format!("{}.part", spec.path))
+                    .await
+                    .unwrap_or(0)
+                    .min(spec.bytes);
+                workload_progress(
+                    sink,
+                    session,
+                    pct(done + shared, total),
+                    &format!(
+                        "another session is downloading {name}: {:.1} / {:.1} GB",
+                        shared as f64 / (1 << 30) as f64,
+                        spec.bytes as f64 / (1 << 30) as f64
+                    ),
+                )
+                .await;
+            }
+            waited = waited.wrapping_add(1);
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        };
+        if volume_file_size(&spec.volume, &spec.path).await.is_some() {
+            done += spec.bytes;
+            continue;
+        }
+        reap_stale_prefetch_helpers().await;
         let label = format!(
             "fetching model {}/{}: {} ({:.1} GB)",
             i + 1,
@@ -3779,133 +4359,152 @@ async fn prefetch_models(
         log(format!("session {session}: {label}"));
         workload_progress(sink, session, pct(done, total), &label).await;
         let part = format!("{}.part", spec.path);
-        if let Some((dir, _)) = spec.path.rsplit_once('/') {
-            volume_exec(
-                &spec.volume,
-                true,
-                &["mkdir", "-p", &format!("/models/{dir}")],
-            )
-            .await
-            .map_err(|e| format!("could not create {dir:?} in {}: {e}", spec.volume))?;
-        }
-        // Downloader: detached so the loop below can watch bytes arrive,
-        // report progress, and honor a stop. Network is the default bridge —
-        // this is the one helper that must reach the model host.
-        let _ = remove_container(&helper).await;
-        let run = crate::proc::command("docker")
-            .args([
-                "run",
-                "-d",
-                "--name",
-                &helper,
-                "--cap-drop",
-                "ALL",
-                "--security-opt",
-                "no-new-privileges",
-                "--memory",
-                "256m",
-                "--pids-limit",
-                "64",
-                "-v",
-                &format!("{}:/models", spec.volume),
-                MODEL_FETCH_IMAGE,
-                "wget",
-                "-q",
-                "-O",
-                &format!("/models/{part}"),
-                &spec.url,
-            ])
-            .output()
-            .await;
-        match run {
-            Ok(o) if o.status.success() => {}
-            Ok(o) => {
-                return Err(format!(
-                    "could not start the downloader: {}",
-                    String::from_utf8_lossy(&o.stderr).trim()
-                ))
-            }
-            Err(e) => return Err(format!("docker unavailable: {e}")),
-        }
-        let failure = loop {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            if stopped.lock().await.remove(session) {
-                let _ = remove_container(&helper).await;
-                let _ = volume_exec(
-                    &spec.volume,
-                    true,
-                    &["rm", "-f", &format!("/models/{part}")],
-                )
-                .await;
-                return Ok(false);
-            }
-            if std::time::Instant::now() >= deadline {
-                break Some(format!(
-                    "model fetch exceeded {} min — the provider's line may be too slow for this template",
-                    MODEL_FETCH_TOTAL_TIMEOUT.as_secs() / 60
-                ));
-            }
-            let running = crate::proc::command("docker")
-                .args([
-                    "inspect",
-                    "-f",
-                    "{{.State.Running}} {{.State.ExitCode}}",
-                    &helper,
-                ])
-                .output()
-                .await;
-            let (running, exit_code) = match running {
-                Ok(o) if o.status.success() => {
-                    let out = String::from_utf8_lossy(&o.stdout);
-                    let mut it = out.split_whitespace();
-                    (
-                        it.next() == Some("true"),
-                        it.next().and_then(|c| c.parse::<i64>().ok()).unwrap_or(-1),
-                    )
-                }
-                // The container vanished under us (daemon restart, manual rm).
-                _ => break Some("the downloader disappeared mid-fetch".to_string()),
-            };
-            if !running {
-                if exit_code == 0 {
-                    break None;
-                }
-                let logs = crate::proc::command("docker")
-                    .args(["logs", "--tail", "3", &helper])
-                    .output()
-                    .await
-                    .map(|o| {
-                        format!(
-                            "{}{}",
-                            String::from_utf8_lossy(&o.stdout).trim(),
-                            String::from_utf8_lossy(&o.stderr).trim()
-                        )
-                    })
-                    .unwrap_or_default();
-                break Some(format!("download failed (exit {exit_code}): {logs}"));
-            }
-            let sofar = volume_file_size(&spec.volume, &part).await.unwrap_or(0);
-            workload_progress(
-                sink,
-                session,
-                pct(done + sofar.min(spec.bytes), total),
-                &format!(
-                    "{label} — {:.1} / {:.1} GB",
-                    (done + sofar) as f64 / (1 << 30) as f64,
-                    total as f64 / (1 << 30) as f64
-                ),
-            )
-            .await;
-        };
-        let _ = remove_container(&helper).await;
-        if let Some(why) = failure {
+        // Interrupted downloads are kept and continued, not restarted: a
+        // ComfyUI manifest is many GB, and a dropped link, a stop or an app
+        // restart used to throw away everything fetched so far.
+        let state = part_state(volume_file_size(&spec.volume, &part).await, spec.bytes);
+        if state == PartState::Oversized {
             let _ = volume_exec(
                 &spec.volume,
                 true,
                 &["rm", "-f", &format!("/models/{part}")],
             )
             .await;
-            return Err(why);
+        }
+        if let PartState::Resume(have) = state {
+            log(format!(
+                "session {session}: resuming {} at {:.1} GB",
+                spec.path,
+                have as f64 / (1 << 30) as f64
+            ));
+        }
+        if state != PartState::Complete {
+            if let Some((dir, _)) = spec.path.rsplit_once('/') {
+                volume_exec(
+                    &spec.volume,
+                    true,
+                    &["mkdir", "-p", &format!("/models/{dir}")],
+                )
+                .await
+                .map_err(|e| format!("could not create {dir:?} in {}: {e}", spec.volume))?;
+            }
+            // Downloader: detached so the loop below can watch bytes arrive,
+            // report progress, and honor a stop. Network is the default bridge —
+            // this is the one helper that must reach the model host.
+            let _ = remove_container(&helper).await;
+            let run = crate::proc::command("docker")
+                .args([
+                    "run",
+                    "-d",
+                    "--name",
+                    &helper,
+                    "--cap-drop",
+                    "ALL",
+                    "--security-opt",
+                    "no-new-privileges",
+                    "--memory",
+                    "256m",
+                    "--pids-limit",
+                    "64",
+                    "-v",
+                    &format!("{}:/models", spec.volume),
+                    MODEL_FETCH_IMAGE,
+                    "wget",
+                    "-q",
+                    "-c",
+                    "-O",
+                    &format!("/models/{part}"),
+                    &spec.url,
+                ])
+                .output()
+                .await;
+            match run {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => {
+                    return Err(format!(
+                        "could not start the downloader: {}",
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    ))
+                }
+                Err(e) => return Err(format!("docker unavailable: {e}")),
+            }
+            let failure = loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                if stopped.lock().await.remove(session) {
+                    // The .part stays: the next session continues from it.
+                    let _ = remove_container(&helper).await;
+                    return Ok(false);
+                }
+                if std::time::Instant::now() >= deadline {
+                    break Some(format!(
+                        "model fetch exceeded {} min — the provider's line may be too slow for this template",
+                        MODEL_FETCH_TOTAL_TIMEOUT.as_secs() / 60
+                    ));
+                }
+                let running = crate::proc::command("docker")
+                    .args([
+                        "inspect",
+                        "-f",
+                        "{{.State.Running}} {{.State.ExitCode}}",
+                        &helper,
+                    ])
+                    .output()
+                    .await;
+                let (running, exit_code) = match running {
+                    Ok(o) if o.status.success() => {
+                        let out = String::from_utf8_lossy(&o.stdout);
+                        let mut it = out.split_whitespace();
+                        (
+                            it.next() == Some("true"),
+                            it.next().and_then(|c| c.parse::<i64>().ok()).unwrap_or(-1),
+                        )
+                    }
+                    // The container vanished under us (daemon restart, manual rm,
+                    // or a stop that removed it between our checks).
+                    _ => {
+                        if stopped.lock().await.remove(session) {
+                            return Ok(false);
+                        }
+                        break Some("the downloader disappeared mid-fetch".to_string());
+                    }
+                };
+                if !running {
+                    if exit_code == 0 {
+                        break None;
+                    }
+                    let logs = crate::proc::command("docker")
+                        .args(["logs", "--tail", "3", &helper])
+                        .output()
+                        .await
+                        .map(|o| {
+                            format!(
+                                "{}{}",
+                                String::from_utf8_lossy(&o.stdout).trim(),
+                                String::from_utf8_lossy(&o.stderr).trim()
+                            )
+                        })
+                        .unwrap_or_default();
+                    break Some(format!("download failed (exit {exit_code}): {logs}"));
+                }
+                let sofar = volume_file_size(&spec.volume, &part).await.unwrap_or(0);
+                workload_progress(
+                    sink,
+                    session,
+                    pct(done + sofar.min(spec.bytes), total),
+                    &format!(
+                        "{label} — {:.1} / {:.1} GB",
+                        (done + sofar) as f64 / (1 << 30) as f64,
+                        total as f64 / (1 << 30) as f64
+                    ),
+                )
+                .await;
+            };
+            let _ = remove_container(&helper).await;
+            if let Some(why) = failure {
+                // Kept for the next attempt to continue; a bad one is caught by
+                // the digest below and only then thrown away.
+                return Err(why);
+            }
         }
         // The digest decides, not the exit code: only a file that hashes to
         // the manifest's sha256 may take the final name.
@@ -3967,6 +4566,55 @@ fn pct(done: u64, total: u64) -> f64 {
 
 /// The ComfyUI models volume both ComfyUI templates mount.
 const COMFYUI_MODELS_VOLUME: &str = "kmplify-fabric-comfyui-models";
+
+/// Is this file a TAESD preview decoder/encoder rather than a full VAE?
+fn is_preview_decoder(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.starts_with("taesd")
+        || n.starts_with("taef1")
+        || n.starts_with("taesdxl")
+        || n.starts_with("taesd3")
+}
+
+/// Move TAESD preview decoders out of `vae/` into `vae_approx/`, where ComfyUI
+/// looks for them.
+///
+/// A TAESD file in `vae/` is offered by Load VAE as if it were a full VAE, and
+/// picking it fails with "VAE is invalid: None" (seen 2026-11-14: a
+/// `taesd_decoder.pth` from an older setup sat beside `ae.safetensors`, and a
+/// restored canvas had it selected). In `vae_approx/` it still does its real
+/// job, live previews, and can no longer be chosen by mistake. Best effort:
+/// a failure here never blocks the session.
+async fn tidy_preview_decoders(volume: &str) {
+    let Ok(listing) = volume_exec(volume, false, &["ls", "-1", "/models/vae"]).await else {
+        return;
+    };
+    let strays: Vec<&str> = listing
+        .lines()
+        .map(str::trim)
+        .filter(|n| is_preview_decoder(n) && !n.contains('/'))
+        .collect();
+    if strays.is_empty() {
+        return;
+    }
+    if volume_exec(volume, true, &["mkdir", "-p", "/models/vae_approx"])
+        .await
+        .is_err()
+    {
+        return;
+    }
+    for name in strays {
+        let from = format!("/models/vae/{name}");
+        let to = format!("/models/vae_approx/{name}");
+        // -n: never overwrite a decoder already in vae_approx.
+        match volume_exec(volume, true, &["mv", "-n", &from, &to]).await {
+            Ok(_) => log(format!(
+                "moved preview decoder {name} from vae/ to vae_approx/"
+            )),
+            Err(e) => log(format!("could not move preview decoder {name}: {e}")),
+        }
+    }
+}
 
 /// The model files a template needs when the gateway's frame names none.
 ///
@@ -4147,6 +4795,26 @@ async fn workload_progress(sink: &Arc<Mutex<WsSink>>, session: &str, pct: f64, m
     .await;
 }
 
+/// What a quiet pull says while it waits on a big layer. Progress is
+/// counted in layers, so a 6 GB CUDA layer holds the bar still for many
+/// minutes (vLLM sat at 25.6% for 10 min on its first pull). Naming the
+/// layer count and the minutes makes "slow" and "stuck" tell apart.
+fn pull_heartbeat_message(done: usize, seen: usize, waited: Duration) -> String {
+    let secs = waited.as_secs();
+    let elapsed = if secs >= 120 {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{secs}s")
+    };
+    if seen == 0 {
+        format!("still downloading the image, {elapsed} so far")
+    } else {
+        format!(
+            "still downloading the image ({done} of {seen} layers done, a large layer takes a while), {elapsed} so far"
+        )
+    }
+}
+
 /// Pull the template image explicitly, streaming layer-completion progress to
 /// the gateway. `docker run` alone also pulls, but silently: the consumer
 /// stared at a bare "pulling" badge for minutes (CUDA images are multi-GB)
@@ -4177,7 +4845,24 @@ async fn pull_image(
     let mut last_sent = std::time::Instant::now() - Duration::from_secs(10);
     let started = std::time::Instant::now();
     let mut silence = Duration::ZERO;
+    let mut daemon_misses = 0u32;
+    let mut disk_checked = std::time::Instant::now();
     loop {
+        // The size estimate before the pull can be wrong, and other things
+        // write to the same disk meanwhile. Docker crashes when its disk
+        // fills (containerd died that way on a provider), so stop the pull first.
+        if disk_checked.elapsed() >= PULL_HEARTBEAT {
+            disk_checked = std::time::Instant::now();
+            if let Some(free) = docker_host_free_mb().await {
+                if free < PULL_ABORT_FREE_MB {
+                    let _ = child.kill().await;
+                    return Err(format!(
+                        "stopped the image download: the provider's Docker disk is down to {:.1} GB free",
+                        free as f64 / 1024.0
+                    ));
+                }
+            }
+        }
         // Read with a heartbeat tick rather than an open-ended await. Two
         // things depend on it: the consumer needs to see that a quiet pull
         // is still alive, and a pull that has genuinely wedged has to end.
@@ -4209,6 +4894,27 @@ async fn pull_image(
                         PULL_TOTAL_TIMEOUT.as_secs() / 60
                     ));
                 }
+                // A silent pull is normal; a silent DAEMON is not. When the
+                // provider's disk filled up, containerd crashed and the pull
+                // sat at "still downloading" until the 65-min deadline. Ask
+                // Docker itself; several missed answers in a row end it.
+                if docker_bounded(&["info", "--format", "{{.ID}}"], Duration::from_secs(15))
+                    .await
+                    .map(|o| o.status.success())
+                    .unwrap_or(false)
+                {
+                    daemon_misses = 0;
+                } else {
+                    daemon_misses += 1;
+                    if daemon_misses >= PULL_DAEMON_MISSES {
+                        let _ = child.kill().await;
+                        return Err(
+                            "Docker on the provider stopped responding during the image download \
+                             (is its disk full?)"
+                                .into(),
+                        );
+                    }
+                }
                 // A big single layer is silent for minutes at a time, so an
                 // unchanged percentage here is normal — the elapsed count is
                 // what tells the consumer the difference between slow and dead.
@@ -4216,7 +4922,7 @@ async fn pull_image(
                     sink,
                     session,
                     last_pct.max(0.0),
-                    &format!("still downloading — {}s so far", waited.as_secs()),
+                    &pull_heartbeat_message(done.len(), seen.len(), waited),
                 )
                 .await;
                 continue;
@@ -4255,6 +4961,16 @@ async fn pull_image(
     }
     workload_progress(sink, session, 100.0, "image ready").await;
     Ok(())
+}
+
+/// Env vars that pick GPUs inside a container. A CPU session's template
+/// may not set them: `NVIDIA_VISIBLE_DEVICES=all` from a catalog entry would
+/// undo the `void` this node pins for CPU sessions.
+fn is_gpu_selector_env(key: &str) -> bool {
+    matches!(
+        key.to_ascii_uppercase().as_str(),
+        "NVIDIA_VISIBLE_DEVICES" | "CUDA_VISIBLE_DEVICES" | "NVIDIA_DRIVER_CAPABILITIES"
+    )
 }
 
 /// Handle a `workload_start` frame: launch the template's container with
@@ -4439,6 +5155,23 @@ async fn start_workload(
         }
     }
 
+    // One start task per session. A second workload_start for a session this
+    // node is already starting (a gateway retry, a frame replayed across a
+    // reconnect) used to run a second task beside the first: it removed the
+    // first one's model downloader to start its own, the first then saw its
+    // downloader vanish and failed the session.
+    let Some(_starting) = StartGuard::claim(&session) else {
+        log(format!(
+            "session {session}: already starting here, ignoring a duplicate start"
+        ));
+        return;
+    };
+    if sessions.lock().await.contains_key(&session) {
+        log(format!(
+            "session {session}: already running here, ignoring a duplicate start"
+        ));
+        return;
+    }
     let name = container_name(&session);
     // Settled here rather than at `docker run` because the session is
     // announced below and the owner is shown what it holds from that moment:
@@ -4448,6 +5181,7 @@ async fn start_workload(
     // not once it is running: a pull is exactly when the owner most wants to
     // see (and be able to cancel) what their machine took on.
     hosted_add(&session, &template, &name, "pulling", cpus).await;
+    crate::host::with(|h| h.workload_started(&session, &template));
     workload_status(&sink, &session, "pulling", "").await;
     // Retried: the CUDA images are multi-GB and a single transient hiccup —
     // registry reset, Docker Desktop restarting its VM — surfaced as
@@ -4458,6 +5192,27 @@ async fn start_workload(
     // multiply the node's real patience by three, past the point where the
     // gateway had already given up on the session.
     let pull_deadline = std::time::Instant::now() + PULL_TOTAL_TIMEOUT;
+    // An image not on this machine yet must fit on Docker's disk first: a
+    // pull that fills it crashes Docker for everything else the owner runs.
+    // The gateway's size wins, then the registry's manifest, then a guess
+    // by kind.
+    if !image_present(&image).await {
+        let need_mb = match frame["image_size_mb"].as_u64() {
+            Some(mb) => mb,
+            None => match registry_image_mb(&image).await {
+                Some(compressed) => image_disk_need_mb(compressed),
+                None if required.is_some() => UNKNOWN_IMAGE_MB_CUDA,
+                None => UNKNOWN_IMAGE_MB_CPU,
+            },
+        };
+        if let Some(why) =
+            host_disk_refusal(docker_host_free_mb().await, need_mb, "the app's image")
+        {
+            hosted_remove(&session).await;
+            workload_status(&sink, &session, "error", &why).await;
+            return;
+        }
+    }
     for attempt in 1..=3u8 {
         if std::time::Instant::now() >= pull_deadline {
             break;
@@ -4557,6 +5312,26 @@ async fn start_workload(
             return;
         }
         Ok(specs) if !specs.is_empty() => {
+            // Models stay in their volume after the session, so they count
+            // against the disk the owner agreed to lend, and they must fit on
+            // Docker's disk at all.
+            let missing = missing_model_bytes(&specs).await;
+            if missing > 0 {
+                let used_mb = fabric_disk_used_mb().await.unwrap_or(0);
+                let host_free = docker_host_free_mb().await;
+                let why = disk_refusal(cfg.max_shared_disk_gb, used_mb, missing).or_else(|| {
+                    host_disk_refusal(
+                        host_free,
+                        missing.div_ceil(1_048_576),
+                        "this app's model files",
+                    )
+                });
+                if let Some(why) = why {
+                    hosted_remove(&session).await;
+                    workload_status(&sink, &session, "error", &why).await;
+                    return;
+                }
+            }
             match prefetch_models(&sink, &session, &stopped, &specs).await {
                 Ok(true) => {}
                 Ok(false) => {
@@ -4580,6 +5355,9 @@ async fn start_workload(
             }
         }
         Ok(_) => {}
+    }
+    if mounted_fabric.contains(COMFYUI_MODELS_VOLUME) {
+        tidy_preview_decoders(COMFYUI_MODELS_VOLUME).await;
     }
 
     // Hardening (README, "Trust model"): no capabilities, no privilege escalation,
@@ -4781,9 +5559,21 @@ async fn start_workload(
                 ));
                 continue;
             }
+            if required.is_none() && is_gpu_selector_env(k) {
+                continue;
+            }
             args.push("-e".into());
             args.push(format!("{k}={v}"));
         }
+    }
+    if required.is_none() {
+        // A CPU session must not get the GPU. Where Docker's default runtime
+        // is nvidia (common on Linux GPU hosts), CUDA images expose every
+        // card unless told otherwise, so an "ollama-cpu" session ran fully
+        // on the provider's GPU without reserving any VRAM. `void` makes the
+        // nvidia runtime mount no device; on runc it is inert.
+        args.push("-e".into());
+        args.push("NVIDIA_VISIBLE_DEVICES=void".into());
     }
     args.push(image.clone());
     // Protocol v2.2: template CMD args, appended AFTER the image so they are
@@ -4847,15 +5637,18 @@ async fn start_workload(
         _ => None,
     };
     let Some(host_port) = host_port else {
+        // No published port usually means the container is already dead: say
+        // why, with its own last lines, instead of a message about ports.
+        let reason = match container_exit(&name).await {
+            Some(code) => format!(
+                "container exited (code {code}) right after starting — last log lines:\n{}",
+                container_log_tail(&name, 15).await
+            ),
+            None => "could not resolve the container's host port".to_string(),
+        };
         let _ = remove_container(&name).await;
         hosted_remove(&session).await;
-        workload_status(
-            &sink,
-            &session,
-            "error",
-            "could not resolve the container's host port",
-        )
-        .await;
+        workload_status(&sink, &session, "error", &reason).await;
         return;
     };
 
@@ -5007,6 +5800,7 @@ async fn stop_workload(
 ) {
     let removed = sessions.lock().await.remove(&session);
     hosted_remove(&session).await;
+    crate::host::with(|h| h.workload_ended(&session, "stopped"));
     if let Some((name, _)) = removed {
         match remove_container(&name).await {
             Ok(()) => {
@@ -5036,6 +5830,12 @@ async fn stop_workload(
         // Tombstone it so start_workload aborts instead of launching a
         // container nobody tracks.
         stopped.lock().await.insert(session.clone());
+        // It may be fetching models, though, and the session is already off
+        // the hosted list, so its downloader would read as an orphan until
+        // the fetch loop next looks at the tombstone. End it now; the loop
+        // sees the tombstone and unwinds quietly, and the partial file stays
+        // for the next session to continue.
+        let _ = remove_container(&prefetch_container_name(&session)).await;
     }
     workload_status(&sink, &session, "stopped", "").await;
 }
@@ -5624,11 +6424,19 @@ async fn cleanup_sessions(sessions: &Sessions) {
         .drain(..)
         .map(|h| h.session_id)
         .collect();
+    //
+    // The model downloader of such a session is ended here too: it would
+    // otherwise stay up with no session behind it (shown as an orphan). Its
+    // partial file is kept for the next session to continue.
     if !pulling.is_empty() {
         let mut stopped = stopped_cell().lock().await;
-        for session in pulling {
-            stopped.insert(session);
+        for session in &pulling {
+            stopped.insert(session.clone());
         }
+    }
+    for session in pulling {
+        let _ = remove_container(&prefetch_container_name(&session)).await;
+        log(format!("abandoned session {session} mid-pull"));
     }
 }
 
@@ -5900,11 +6708,32 @@ fn seal_job_frame(sealer: &mut crate::envelope::ResponseSealer, mut msg: Value) 
     msg
 }
 
+/// Machine code for an upstream HTTP failure (never its message, which can
+/// echo the prompt), for a host's [`crate::host::JobObserver`].
+fn upstream_error_code(status: u16) -> &'static str {
+    match status {
+        429 => "rate_limited",
+        400..=499 => "upstream_4xx",
+        500..=599 => "upstream_5xx",
+        _ => "upstream_error",
+    }
+}
+
+/// Machine code for a request that never got an HTTP answer.
+fn transport_error_code(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "timeout"
+    } else {
+        "upstream_unreachable"
+    }
+}
+
 async fn run_job(
     sink: Arc<Mutex<WsSink>>,
     client: reqwest::Client,
     upstreams: JobUpstreams,
     frame: Value,
+    job: Arc<crate::host::ObservedJob>,
 ) {
     let job_id = frame["id"].as_str().unwrap_or_default().to_string();
     let kind = frame["kind"].as_str().unwrap_or_default();
@@ -5929,6 +6758,7 @@ async fn run_job(
             }
             Err(code) => {
                 crate::status::count_job_error();
+                job.with(|o| o.error(code));
                 let _ = sink
                     .lock()
                     .await
@@ -5970,6 +6800,7 @@ async fn run_job(
         // Colibri serves chat/completions only. Failing here with a clear
         // message beats forwarding into a 404 whose text names a path the
         // consumer never called.
+        job.with(|o| o.error("unsupported_kind"));
         send(
             sink,
             json!({"type": "error", "id": job_id, "message": format!(
@@ -6020,6 +6851,7 @@ async fn run_job(
             .get("stream")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+    job.with(|o| o.request(&payload, streaming));
 
     let base = if is_colibri {
         upstreams.colibri_base.clone()
@@ -6040,10 +6872,14 @@ async fn run_job(
             .await;
         match resp {
             Ok(resp) if resp.status().is_success() => {
+                job.with(|o| o.http_status(resp.status().as_u16()));
                 let mut stream = resp.bytes_stream();
                 let mut buf = String::new();
                 while let Some(chunk) = stream.next().await {
-                    let Ok(chunk) = chunk else { break };
+                    let Ok(chunk) = chunk else {
+                        job.with(|o| o.error("stream_interrupted"));
+                        break;
+                    };
                     buf.push_str(&String::from_utf8_lossy(&chunk));
                     while let Some(nl) = buf.find('\n') {
                         let line = buf[..nl].trim().to_string();
@@ -6056,6 +6892,7 @@ async fn run_job(
                                 continue;
                             }
                             if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                                job.with(|o| o.native_line(&v));
                                 let out = native_line_to_openai_chunk(&v, &model);
                                 send(
                                     sink.clone(),
@@ -6072,6 +6909,7 @@ async fn run_job(
                             break;
                         }
                         if let Ok(v) = serde_json::from_str::<Value>(data) {
+                            job.with(|o| o.openai_chunk(&v));
                             send(
                                 sink.clone(),
                                 json!({"type": "chunk", "id": job_id, "data": v}),
@@ -6087,10 +6925,16 @@ async fn run_job(
                 .await;
             }
             Ok(resp) => {
+                let code = resp.status().as_u16();
+                job.with(|o| {
+                    o.http_status(code);
+                    o.error(upstream_error_code(code));
+                });
                 let msg = resp.text().await.unwrap_or_default();
                 send(sink, json!({"type": "error", "id": job_id, "message": msg})).await;
             }
             Err(e) => {
+                job.with(|o| o.error(transport_error_code(&e)));
                 send(
                     sink,
                     json!({"type": "error", "id": job_id, "message": e.to_string()}),
@@ -6104,7 +6948,13 @@ async fn run_job(
             .await
         {
             Ok(resp) if resp.status().is_success() => {
+                let code = resp.status().as_u16();
                 let data: Value = resp.json().await.unwrap_or(Value::Null);
+                // The engine's own reply, before any reshaping: its counts.
+                job.with(|o| {
+                    o.http_status(code);
+                    o.reply(&data);
+                });
                 // Non-streamed native reply -> OpenAI completion shape, so a
                 // think-carrying job is indistinguishable from any other on
                 // the wire. `thinking` -> `reasoning`, same mapping as the
@@ -6141,10 +6991,16 @@ async fn run_job(
                 send(sink, json!({"type": "done", "id": job_id, "data": data})).await;
             }
             Ok(resp) => {
+                let code = resp.status().as_u16();
+                job.with(|o| {
+                    o.http_status(code);
+                    o.error(upstream_error_code(code));
+                });
                 let msg = resp.text().await.unwrap_or_default();
                 send(sink, json!({"type": "error", "id": job_id, "message": msg})).await;
             }
             Err(e) => {
+                job.with(|o| o.error(transport_error_code(&e)));
                 send(
                     sink,
                     json!({"type": "error", "id": job_id, "message": e.to_string()}),
@@ -6168,10 +7024,47 @@ async fn session(
     // `serving()` is the switch AND the dashboard's live pause: a paused node
     // stays connected, keeps its hosted sessions and its place in the
     // registry, and advertises nothing.
-    let (models, engines, primary_openai_only) = if serving(cfg) {
-        discover_kind(client, cfg).await
+    let (models, engines, primary_base, primary_openai_only) = if serving(cfg) {
+        // Bounded: this runs before the dial, with the 10-minute inference
+        // client. A local engine that accepts the connection and then says
+        // nothing (still loading, or wedged) must cost a model list, not the
+        // connection to the fabric.
+        match tokio::time::timeout(UPSTREAM_DISCOVERY_TIMEOUT, discover_upstreams(client, cfg))
+            .await
+        {
+            Ok(d) => (d.models, d.engines, d.primary_base, d.primary_openai_only),
+            Err(_) => {
+                log(format!(
+                    "local engines did not answer within {} s; connecting without models                      (they are read again when the worker next connects)",
+                    UPSTREAM_DISCOVERY_TIMEOUT.as_secs()
+                ));
+                (
+                    Vec::new(),
+                    std::collections::HashMap::new(),
+                    cfg.ollama_base.clone(),
+                    false,
+                )
+            }
+        }
     } else {
-        (Vec::new(), std::collections::HashMap::new(), false)
+        (
+            Vec::new(),
+            std::collections::HashMap::new(),
+            cfg.ollama_base.clone(),
+            false,
+        )
+    };
+    // For this connection the primary upstream is the one discovery chose
+    // (another loopback family, or the built-in engine): jobs, telemetry and
+    // the model refresh all go there.
+    let effective;
+    let cfg = if primary_base != cfg.ollama_base {
+        let mut c = cfg.clone();
+        c.ollama_base = primary_base;
+        effective = c;
+        &effective
+    } else {
+        cfg
     };
     if models.is_empty() && serving(cfg) {
         // Informational, not an error: the owner of a Windows PC read the
@@ -6202,7 +7095,7 @@ async fn session(
     // Probed BEFORE the hello so this node never announces container
     // capability it cannot honour. Safe to block here — nothing is connected
     // yet, so there is no read loop to stall.
-    let docker_live = docker_ok().await;
+    let docker_live = docker_can_host().await;
     let runtimes_live = if docker_live {
         docker_runtimes().await
     } else {
@@ -6276,6 +7169,7 @@ async fn session(
         } else {
             1
         }) as usize;
+    crate::host::with(|h| h.hardware(&gpu_facts, Some(&cpu_info())));
     let hello = json!({
         "type": "hello",
         "node_id": creds.node_id,
@@ -6776,7 +7670,7 @@ async fn session(
                                 let used_all = crate::gpu::used_mb_all(accel).await;
                                 let resident = loaded_models(&client, &base).await;
                                 let names = local_models(&client, &base).await;
-                                let dok = docker_ok().await;
+                                let dok = docker_can_host().await;
                                 // Disk and image inventory change slowly and
                                 // cost far more to read, so they ride a slow
                                 // tick instead of every ping.
@@ -6954,7 +7848,16 @@ async fn session(
                             let running = running.clone();
                             async move {
                                 let _counted = crate::status::JobGuard::start(&model);
-                                run_job(sink, client, upstreams, frame).await;
+                                // An embedding host's view of this job
+                                // (host.rs). Dropped unfinished when the task
+                                // is aborted, which reports it as cancelled.
+                                let observed = crate::host::ObservedJob::start(&crate::host::JobStart {
+                                    id: &job_id,
+                                    kind: frame["kind"].as_str().unwrap_or_default(),
+                                    model: &model,
+                                });
+                                run_job(sink, client, upstreams, frame, observed.clone()).await;
+                                observed.finish();
                                 running.lock().unwrap().remove(&job_id);
                             }
                         });
@@ -7227,6 +8130,7 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
         return;
     }
     crate::hostcpu::start();
+    crate::host::with(|h| h.worker_started(&node_dir));
     // The trusted node baseline: checked now and every 3 hours, sent in the
     // hello and every pong. Idempotent, like the sampler above.
     crate::security::start();
@@ -7296,6 +8200,8 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
         // been up for weeks still picks up an edit made an hour ago.
         cfg = baseline.clone();
         crate::settings::Settings::load(&node_dir).apply(&mut cfg);
+        // An embedding application's current choices, on top (host.rs).
+        crate::host::with(|h| h.configure(&mut cfg));
         publish_config(&cfg);
         let dialled_at = std::time::Instant::now();
         let outcome = session(&client, &cfg, &mut stop).await;
@@ -9765,6 +10671,7 @@ mod document_terms_tests {
             reqwest::Client::new(),
             upstreams,
             frame,
+            crate::host::ObservedJob::none(),
         )
         .await;
         far.await.unwrap()
@@ -9881,5 +10788,248 @@ mod document_terms_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos()
+    }
+}
+
+/// Session start, model prefetch, disk and upstream behaviour that grew in
+/// the desktop app's copy of this worker first (kmplify-desktop, 2026-10 and
+/// 2026-11) and lives here since the desktop runs this crate.
+#[cfg(test)]
+mod embedded_parity_tests {
+    use super::*;
+
+    #[test]
+    fn a_cpu_session_cannot_ask_for_the_gpu() {
+        assert!(is_gpu_selector_env("NVIDIA_VISIBLE_DEVICES"));
+        assert!(is_gpu_selector_env("cuda_visible_devices"));
+        assert!(!is_gpu_selector_env("OLLAMA_HOST"));
+    }
+
+    #[test]
+    fn a_download_that_would_fill_dockers_disk_is_refused() {
+        // A provider with 4.6 GB free on C: and a ~20 GB vLLM image to come.
+        let why = host_disk_refusal(Some(4700), 20 * 1024, "the app's image").unwrap();
+        assert!(why.contains("4.6 GB free"), "{why}");
+        // Plenty of room, or unknown room: no refusal.
+        assert!(host_disk_refusal(Some(200 * 1024), 20 * 1024, "x").is_none());
+        assert!(host_disk_refusal(None, 20 * 1024, "x").is_none());
+        // The reserve counts: 30 GB free cannot take 20 GB plus 15 kept back.
+        assert!(host_disk_refusal(Some(30 * 1024), 20 * 1024, "x").is_some());
+    }
+
+    #[test]
+    fn a_gateway_manifest_wins_and_other_templates_get_nothing() {
+        let frame = json!({"models": []});
+        assert!(
+            parse_models(&session_manifest(&frame, "comfyui"), &comfy_mounts())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(session_manifest(&json!({}), "ollama").is_null());
+    }
+
+    /// The case from the Resources page: a comfyui session still pulling,
+    /// its model downloader `kmplify-fabric-prefetch-<session>` listed as a
+    /// leftover. The session must claim that helper as its own.
+    #[test]
+    fn a_live_session_owns_its_prefetch_helper() {
+        let h = HostedSession {
+            session_id: "2c7cc804132a9f1e".into(),
+            template: "comfyui".into(),
+            container: container_name("2c7cc804132a9f1e"),
+            since: 0,
+            state: "pulling".into(),
+            cpus: 2.0,
+            running_since: None,
+        };
+        let owned = h.containers();
+        assert!(owned.contains(&"kmplify-fabric-2c7cc804132a".to_string()));
+        assert!(owned.contains(&"kmplify-fabric-prefetch-2c7cc804132a".to_string()));
+        // Another session's helper is still not this one's.
+        assert!(!owned.contains(&"kmplify-fabric-prefetch-000000000000".to_string()));
+    }
+
+    #[test]
+    fn a_quiet_pull_names_its_layers_and_minutes() {
+        let m = pull_heartbeat_message(3, 12, Duration::from_secs(785));
+        assert!(m.contains("3 of 12 layers") && m.contains("13 min"), "{m}");
+        assert!(pull_heartbeat_message(0, 0, Duration::from_secs(40)).contains("40s"));
+    }
+
+    #[test]
+    fn a_session_is_started_by_one_task_at_a_time() {
+        let first = StartGuard::claim("dup-session-1").unwrap();
+        assert!(StartGuard::claim("dup-session-1").is_none());
+        assert!(StartGuard::claim("dup-session-2").is_some());
+        drop(first);
+        assert!(StartGuard::claim("dup-session-1").is_some());
+    }
+
+    #[test]
+    fn an_images_size_is_read_from_its_manifest() {
+        let single =
+            json!({"SchemaV2Manifest": {"layers": [{"size": 3u64 << 30}, {"size": 1u64 << 30}]}});
+        assert_eq!(
+            manifest_compressed_bytes(&single, "amd64"),
+            Some(4u64 << 30)
+        );
+        let multi = json!([
+            {"Descriptor": {"platform": {"os": "linux", "architecture": "arm64"}},
+             "OCIManifest": {"layers": [{"size": 1}]}},
+            {"Descriptor": {"platform": {"os": "linux", "architecture": "amd64"}},
+             "OCIManifest": {"layers": [{"size": 5}, {"size": 7}]}},
+        ]);
+        assert_eq!(manifest_compressed_bytes(&multi, "amd64"), Some(12));
+        assert_eq!(manifest_compressed_bytes(&json!([]), "amd64"), None);
+        // An 8 GB download needs ~28 GB of disk.
+        assert_eq!(image_disk_need_mb(8 * 1024), 28 * 1024);
+    }
+
+    #[test]
+    fn an_interrupted_download_is_continued_not_restarted() {
+        assert_eq!(part_state(None, 100), PartState::Absent);
+        assert_eq!(part_state(Some(0), 100), PartState::Absent);
+        assert_eq!(part_state(Some(40), 100), PartState::Resume(40));
+        assert_eq!(part_state(Some(100), 100), PartState::Complete);
+        assert_eq!(part_state(Some(140), 100), PartState::Oversized);
+    }
+
+    #[test]
+    fn fetch_arguments_never_put_the_url_in_the_shell_text() {
+        let argv = fetch_script_args(
+            "checkpoints/m.safetensors",
+            "https://huggingface.co/x';rm -rf /;'",
+        );
+        assert_eq!(argv[0], "sh");
+        assert!(!argv[2].contains("rm -rf"));
+        assert_eq!(argv.last().unwrap(), "https://huggingface.co/x';rm -rf /;'");
+    }
+
+    #[test]
+    fn hostile_manifests_are_refused() {
+        let m = comfy_mounts();
+        let bad_host = json!([{"volume": COMFYUI_MODELS_VOLUME, "path": "a/b.safetensors",
+            "url": "https://evil.example/x", "sha256": "a".repeat(64), "bytes": 10}]);
+        assert!(parse_models(&bad_host, &m).is_err());
+        let traversal = json!([{"volume": COMFYUI_MODELS_VOLUME, "path": "../etc/x",
+            "url": "https://huggingface.co/x", "sha256": "a".repeat(64), "bytes": 10}]);
+        assert!(parse_models(&traversal, &m).is_err());
+    }
+
+    #[test]
+    fn only_taesd_preview_decoders_are_moved_out_of_vae() {
+        for n in [
+            "taesd_decoder.pth",
+            "taesdxl_encoder.pth",
+            "taef1_decoder.pth",
+            "TAESD3_decoder.pth",
+        ] {
+            assert!(is_preview_decoder(n), "{n}");
+        }
+        for n in [
+            "ae.safetensors",
+            "sdxl_vae.safetensors",
+            "vae-ft-mse.pt",
+            "pixel_space",
+        ] {
+            assert!(!is_preview_decoder(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn sessions_fetching_the_same_file_share_one_lock() {
+        let a = file_lock("kmplify-fabric-comfyui-models", "vae/ae.safetensors");
+        let b = file_lock("kmplify-fabric-comfyui-models", "vae/ae.safetensors");
+        let other = file_lock("kmplify-fabric-comfyui-models", "vae/other.safetensors");
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(!Arc::ptr_eq(&a, &other));
+        let held = a.clone().try_lock_owned().unwrap();
+        assert!(b.clone().try_lock_owned().is_err());
+        drop(held);
+        assert!(b.try_lock_owned().is_ok());
+    }
+
+    #[test]
+    fn space_freed_inside_dockers_disk_counts_as_room() {
+        // A 190 GiB disk image holding 150 GB (decimal) of data: ~50 GiB to reuse.
+        let slack = disk_slack_mb(190 * 1024, "100GB\n20GB\n30GB\n0B\n");
+        assert!((51_000..52_000).contains(&slack), "{slack}");
+        // Never negative.
+        assert_eq!(disk_slack_mb(10, "50GB\n"), 0);
+    }
+
+    #[test]
+    fn swaps_loopback_families() {
+        assert_eq!(
+            other_loopback("http://127.0.0.1:11434").as_deref(),
+            Some("http://[::1]:11434")
+        );
+        assert_eq!(
+            other_loopback("http://localhost:11434/").as_deref(),
+            Some("http://[::1]:11434/")
+        );
+        assert_eq!(
+            other_loopback("http://[::1]:11434").as_deref(),
+            Some("http://127.0.0.1:11434")
+        );
+    }
+
+    #[test]
+    fn leaves_other_hosts_alone() {
+        assert_eq!(other_loopback("http://192.168.1.5:11434"), None);
+        assert_eq!(other_loopback("http://localhost.example:11434"), None);
+        assert_eq!(other_loopback("http://ollama:11434"), None);
+    }
+
+    #[test]
+    fn the_builtin_list_needs_the_models_volume_mounted() {
+        // A session that does not mount the store cannot be used to write
+        // into it.
+        let only_install: std::collections::HashSet<String> =
+            ["kmplify-fabric-comfyui-cu126".to_string()]
+                .into_iter()
+                .collect();
+        assert!(parse_models(&builtin_models("comfyui"), &only_install).is_err());
+    }
+
+    #[test]
+    fn the_first_error_is_shown_even_when_the_tail_only_has_the_last() {
+        let mut log = String::from(
+            "INFO starting\nTraceback (most recent call last):\n  File \"x.py\", line 1\n",
+        );
+        log.push_str(
+            "ModuleNotFoundError: No module named 'lmcache.integration.vllm.vllm_v1_adapter'\n",
+        );
+        for i in 0..40 {
+            log.push_str(&format!("noise {i}\n"));
+        }
+        log.push_str("RuntimeError: Engine core initialization failed");
+        let msg = explain_log(&log, 15);
+        assert!(
+            msg.starts_with("cause: ModuleNotFoundError: No module named"),
+            "{msg}"
+        );
+        assert!(msg.contains("Engine core initialization failed"));
+        // When the cause is already in the tail it isn't repeated.
+        assert!(!explain_log("PermissionError: denied", 15).starts_with("cause:"));
+    }
+
+    #[test]
+    fn the_owner_disk_budget_is_respected() {
+        // No budget declared: no refusal (as for every other disk use).
+        assert!(disk_refusal(None, 0, 21 << 30).is_none());
+        // 32 GB lent, 15 GB already used: 21 GB more do not fit.
+        let why = disk_refusal(Some(32), 15 * 1024, 21 << 30).unwrap();
+        assert!(why.contains("agreed to share"), "{why}");
+        // Everything already present: nothing to refuse.
+        assert!(disk_refusal(Some(32), 31 * 1024, 0).is_none());
+        assert!(disk_refusal(Some(64), 10 * 1024, 21 << 30).is_none());
+    }
+
+    fn comfy_mounts() -> std::collections::HashSet<String> {
+        ["kmplify-fabric-comfyui-cu126", COMFYUI_MODELS_VOLUME]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 }

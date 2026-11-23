@@ -1001,7 +1001,33 @@ marketplace are the business. The agent on your hardware is something you are
 entitled to audit, and that is worth more to us as source than as a secret.
 
 The same worker powers the KMPLIFY desktop app's provider mode. This repository
-is the headless build of it.
+is the headless build of it, and the desktop app links this crate rather than
+keeping a copy, so the two cannot drift apart.
+
+## Embedding the provider in an application
+
+The provider is a library as well as a binary. An application that lends its
+machine to a fabric links the crate without the terminal UI and the dashboard:
+
+```toml
+kmplify-node = { git = "https://github.com/kmplify/kmplify-node", tag = "<a release with provider-core>", default-features = false, features = ["provider-core"] }
+```
+
+Add `wasm` to the features to host signed functions. It then runs
+`fabric_worker::run(WorkerConfig, stop)` and, optionally, installs a
+`host::ProviderHost` for what differs per host: the operator's current
+choices before every connection, the log, session start and end, the
+hardware a connection advertises, and a `JobObserver` per job (counts only:
+the provider terms forbid keeping request or reply content, and that covers
+what a host does with these callbacks). `fabric_worker::link_state()` and
+`status::snapshot()` say what the worker is doing, `security::check()` and
+`trust::readiness()` give the trusted node checklist, and
+`operator_session::set()` reports a signed-in operator. Whatever the host,
+the frames are the same: `tests/protocol_golden.rs` holds every `hello` and
+`pong` key against the reference in [PROTOCOL.md](PROTOCOL.md).
+
+An application that redistributes the crate carries its NOTICE
+(`kmplify_node::NOTICE`, Apache-2.0 section 4(d)).
 
 ## Learn more
 

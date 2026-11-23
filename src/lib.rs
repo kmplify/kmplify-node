@@ -27,6 +27,7 @@ pub mod fabric_worker;
 pub mod flow;
 pub mod functions;
 pub mod gpu;
+pub mod host;
 pub mod hostcpu;
 pub mod identity;
 pub mod operator_session;
