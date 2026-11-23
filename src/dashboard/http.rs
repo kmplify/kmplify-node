@@ -94,7 +94,8 @@ fn reason(status: u16) -> &'static str {
 /// The content security policy: this page, nothing else. No inline script
 /// or style, no other origin, no framing, no form posts.
 pub const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
-                       img-src 'self' data:; connect-src 'self'; base-uri 'none'; \
+                       img-src 'self' data:; font-src 'self'; connect-src 'self'; \
+                       base-uri 'none'; \
                        form-action 'none'; frame-ancestors 'none'";
 
 /// Serialize a response with the headers every answer carries.

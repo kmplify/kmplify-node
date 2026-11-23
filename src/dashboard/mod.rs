@@ -54,6 +54,14 @@ const INDEX_HTML: &str = include_str!("assets/index.html");
 const APP_JS: &str = include_str!("assets/app.js");
 #[cfg(feature = "dashboard")]
 const APP_CSS: &str = include_str!("assets/app.css");
+/// The KMPLIFY mark on the app-icon tile, as the tab icon. The KMPLIFY name
+/// and logo are trademarks and not licensed under Apache-2.0 (TRADEMARKS.md).
+#[cfg(feature = "dashboard")]
+const FAVICON_SVG: &str = include_str!("assets/favicon.svg");
+/// Inter, the KMPLIFY brand text face, Latin subset, variable weight. SIL Open
+/// Font License 1.1: `assets/fonts/OFL.txt`, shipped beside it.
+#[cfg(feature = "dashboard")]
+const INTER_WOFF2: &[u8] = include_bytes!("assets/fonts/inter-latin-wght.woff2");
 
 /// How the node talks to the person at the machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -339,7 +347,15 @@ pub async fn route(req: &Request, ctx: &Ctx, port: u16) -> Response {
             INDEX_HTML.replace("__KN_TOKEN__", &ctx.token).into_bytes(),
         ),
         ("GET", "/app.js") => Response::new(200, "text/javascript; charset=utf-8", APP_JS),
-        ("GET", "/app.css") => Response::new(200, "text/css; charset=utf-8", APP_CSS),
+        // The stylesheet names the font with the token, like the page names
+        // the stylesheet: every request to this server carries it.
+        ("GET", "/app.css") => Response::new(
+            200,
+            "text/css; charset=utf-8",
+            APP_CSS.replace("__KN_TOKEN__", &ctx.token).into_bytes(),
+        ),
+        ("GET", "/favicon.svg") => Response::new(200, "image/svg+xml", FAVICON_SVG),
+        ("GET", "/inter.woff2") => Response::new(200, "font/woff2", INTER_WOFF2),
         ("GET", "/api/state") => Response::json(200, &state(ctx)),
         ("POST", "/api/recheck") => recheck(),
         ("POST", "/api/pause") => command(crate::control::Command::Pause),
@@ -911,6 +927,10 @@ mod tests {
             }
         }
         assert!(INDEX_HTML.contains("__KN_TOKEN__"));
+        assert!(APP_CSS.contains("/inter.woff2?t=__KN_TOKEN__"));
+        // The icon and the font are this crate's own bytes.
+        assert!(FAVICON_SVG.starts_with("<svg") && !FAVICON_SVG.contains("href"));
+        assert_eq!(&INTER_WOFF2[..4], b"wOF2");
         assert!(
             !APP_JS.contains("innerHTML"),
             "data is written with textContent only"
