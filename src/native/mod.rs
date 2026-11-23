@@ -1525,7 +1525,7 @@ impl App {
                     self.confirm = Some(Confirm::NewKey);
                 }
             });
-            muted(ui, "Off until you choose. This computer only binds 127.0.0.1. On the network answers only the addresses on the allowlist (private, link-local or VPN ranges), and only requests signed with the cluster key; the key never crosses the network and is never shown here, only its fingerprint. Show it with kmplify-node router key on this computer.");
+            muted(ui, "Off until you choose. This computer only binds 127.0.0.1. On the network answers only the addresses on the allowlist (private, link-local or VPN ranges), and only requests signed with the cluster key; the key is never shown here, only its fingerprint, and crosses the network only sealed, during PIN pairing (Pair a device here, Join with PIN on the other device). Between v2 nodes the reports travel in mutual TLS.");
         });
         // Pairing: this side shows a PIN, the other enters it; the cluster
         // key itself is never shown or typed (owner decision "Show key: no").

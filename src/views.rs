@@ -196,17 +196,17 @@ pub const METRICS: &[Metric] = &[
     },
     Metric {
         section: "router",
+        label: "Pairing",
+        terminal_form: "",
+    },
+    Metric {
+        section: "router",
         label: "Nodes on the network",
         terminal_form: "a text bar per meter instead of the one-minute charts",
     },
     Metric {
         section: "router",
         label: "Router log",
-        terminal_form: "",
-    },
-    Metric {
-        section: "router",
-        label: "Pairing",
         terminal_form: "",
     },
 ];

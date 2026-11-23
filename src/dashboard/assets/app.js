@@ -558,7 +558,7 @@ function routerTab(s) {
           el("button", { class: "btn ghost", onclick: () => {
             if (window.confirm("Make a new cluster key? Every other node must join again with it.")) act("/api/router/new-key");
           } }, "New cluster key")))),
-    el("p", { class: "muted small", text: "Off until you choose. This computer only binds 127.0.0.1. On the network answers only the addresses on the allowlist (private, link-local or VPN ranges), and only requests signed with the cluster key; the key never crosses the network and is never shown here, only its fingerprint. Show it with kmplify-node router key on this computer." }));
+    el("p", { class: "muted small", text: "Off until you choose. This computer only binds 127.0.0.1. On the network answers only the addresses on the allowlist (private, link-local or VPN ranges), and only requests signed with the cluster key; the key is never shown here, only its fingerprint, and crosses the network only sealed, during PIN pairing (Pair a device here, Join with PIN on the other device). Between v2 nodes the reports travel in mutual TLS." }));
 
   const cards = [];
   if (r.local) cards.push(nodeCard(r.local.name + " (this node)", "online", "ok", r.local, r.local_meters, ""));
