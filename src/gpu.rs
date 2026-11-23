@@ -465,6 +465,9 @@ async fn probe_metal() -> Option<Gpu> {
     let chip = crate::proc::sysctl_string(c"machdep.cpu.brand_string");
     #[cfg(not(target_os = "macos"))]
     let chip: Option<String> = None;
+    // On non-macOS builds `chip` is a literal None (the function returns early
+    // there); clippy flags that on Linux CI.
+    #[allow(clippy::unnecessary_literal_unwrap)]
     let name = chip.unwrap_or_else(|| "Apple Silicon".to_string());
     // What the GPU can actually address, not total RAM: unified memory is
     // shared and the GPU is capped well below the machine's total.
