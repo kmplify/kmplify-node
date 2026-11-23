@@ -9,7 +9,8 @@
 //! [`MAX_SKEW_MS`] window, and not at all to the same node, whose
 //! [`Verifier`] remembers the nonces it saw.
 //!
-//! The key lives in `router.key` in the node directory, owner-only, beside
+//! The key lives in `router.key` in the node directory (see [`super::key`]
+//! for the store an embedding application brings instead), owner-only, beside
 //! the node's credential and never inside `settings.json` (owner rule: no
 //! secret in a settings file). Nodes join one cluster by holding the same
 //! key: `kmplify-node router key` shows it on the first machine, and
@@ -25,12 +26,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256};
 
-type HmacSha256 = Hmac<Sha256>;
+use super::key::{hex, unhex, DOMAIN};
+pub use super::key::{ClusterKey, KEY_FILE};
 
-/// File in the node directory holding the cluster key, hex.
-pub const KEY_FILE: &str = "router.key";
+type HmacSha256 = Hmac<sha2::Sha256>;
+
 /// Request header: `v1.<unix ms>.<nonce hex>.<signature hex>`.
 pub const AUTH_HEADER: &str = "x-kmplify-router-auth";
 /// Response header: the signature over the request's nonce and the body.
@@ -41,70 +42,9 @@ pub const MAX_SKEW_MS: u64 = 30_000;
 /// key) cannot grow the cache without bound.
 const MAX_NONCES: usize = 4096;
 
-const DOMAIN: &str = "kmplify-router-v1";
-
-/// The shared secret of one cluster: 32 random bytes.
-#[derive(Clone, PartialEq, Eq)]
-pub struct ClusterKey([u8; 32]);
-
-impl std::fmt::Debug for ClusterKey {
-    // Never the bytes, wherever a key ends up being debug-printed.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ClusterKey({})", self.fingerprint())
-    }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn unhex(s: &str) -> Option<Vec<u8>> {
-    let s = s.trim();
-    if !s.len().is_multiple_of(2) || !s.bytes().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
-}
-
-impl ClusterKey {
-    /// A fresh key from the operating system's random source.
-    pub fn generate() -> Self {
-        use rand_core::RngCore;
-        let mut b = [0u8; 32];
-        rand_core::OsRng.fill_bytes(&mut b);
-        Self(b)
-    }
-
-    /// 64 hex characters, as `router key` prints it and `router join` reads it.
-    pub fn parse(s: &str) -> Result<Self, String> {
-        let bytes = unhex(s).filter(|b| b.len() == 32).ok_or(
-            "a cluster key is 64 hexadecimal characters, as `kmplify-node router key` prints it",
-        )?;
-        let mut b = [0u8; 32];
-        b.copy_from_slice(&bytes);
-        Ok(Self(b))
-    }
-
-    /// The key as text, for the person who asked to see it. Never logged.
-    pub fn reveal(&self) -> String {
-        hex(&self.0)
-    }
-
-    /// Eight hex characters of SHA-256 over the key: enough to tell two
-    /// clusters apart on a screen or in an mDNS record, useless for finding
-    /// the key.
-    pub fn fingerprint(&self) -> String {
-        let digest = Sha256::digest([DOMAIN.as_bytes(), b"/fingerprint/", &self.0].concat());
-        hex(&digest[..4])
-    }
-
-    fn mac(&self) -> HmacSha256 {
-        // HMAC takes a key of any length; 32 bytes is never refused.
-        HmacSha256::new_from_slice(&self.0).expect("HMAC accepts any key length")
-    }
+fn mac(key: &ClusterKey) -> HmacSha256 {
+    // HMAC takes a key of any length; 32 bytes is never refused.
+    HmacSha256::new_from_slice(key.bytes()).expect("HMAC accepts any key length")
 }
 
 pub fn key_path(node_dir: &Path) -> PathBuf {
@@ -134,7 +74,7 @@ fn request_preimage(method: &str, path: &str, ts_ms: u64, nonce: &str) -> String
 
 /// The header value for one request.
 pub fn sign_request(key: &ClusterKey, method: &str, path: &str, ts_ms: u64, nonce: &str) -> String {
-    let mut m = key.mac();
+    let mut m = mac(key);
     m.update(request_preimage(method, path, ts_ms, nonce).as_bytes());
     format!("v1.{ts_ms}.{nonce}.{}", hex(&m.finalize().into_bytes()))
 }
@@ -149,7 +89,7 @@ pub fn new_nonce() -> String {
 
 /// The signature of an answer to the request that carried `nonce`.
 pub fn sign_response(key: &ClusterKey, nonce: &str, body: &[u8]) -> String {
-    let mut m = key.mac();
+    let mut m = mac(key);
     m.update(format!("{DOMAIN}\nres\n{nonce}\n").as_bytes());
     m.update(body);
     hex(&m.finalize().into_bytes())
@@ -160,7 +100,7 @@ pub fn verify_response(key: &ClusterKey, nonce: &str, body: &[u8], sig_hex: &str
     let Some(sig) = unhex(sig_hex) else {
         return false;
     };
-    let mut m = key.mac();
+    let mut m = mac(key);
     m.update(format!("{DOMAIN}\nres\n{nonce}\n").as_bytes());
     m.update(body);
     m.verify_slice(&sig).is_ok()
@@ -222,7 +162,7 @@ impl Verifier {
         }
         // The signature before the replay cache: only a request that proves
         // the key may occupy a slot in it.
-        let mut m = key.mac();
+        let mut m = mac(key);
         m.update(request_preimage(method, path, ts, nonce).as_bytes());
         m.verify_slice(&sig).map_err(|_| Denied::BadSignature)?;
         self.seen.retain(|_, t| t.abs_diff(now_ms) <= MAX_SKEW_MS);
@@ -246,7 +186,7 @@ mod tests {
     const NOW: u64 = 1_800_000_000_000;
 
     fn key(b: u8) -> ClusterKey {
-        ClusterKey([b; 32])
+        ClusterKey::from_bytes([b; 32])
     }
 
     #[test]

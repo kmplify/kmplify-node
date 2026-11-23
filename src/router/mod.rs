@@ -26,6 +26,7 @@
 //! window) is `router.json` in the node directory, owner-only, beside
 //! `status.json`. It holds no secret: the key's fingerprint, never the key.
 
+pub mod key;
 pub mod policy;
 
 #[cfg(feature = "router")]
@@ -42,6 +43,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub use key::{ClusterKey, FileKeyStore, KeyStore};
 pub use policy::Mode;
 
 /// The port of the node-info surface unless `KMPLIFY_ROUTER_PORT` says
@@ -399,7 +401,7 @@ impl Config {
 }
 
 #[cfg(feature = "router")]
-pub use running::run;
+pub use running::{run, run_with};
 
 #[cfg(feature = "router")]
 mod running {
@@ -434,32 +436,57 @@ mod running {
         }
     }
 
-    /// Run the router for the node in `node_dir` until `stop` turns true.
+    /// Run the router for the node in `node_dir` until `stop` turns true,
+    /// with the cluster key in `router.key` there ([`FileKeyStore`]).
     ///
     /// Re-reads its configuration every second, so `kmplify-node set
     /// router=...` (or a view's change) applies without a restart: the
     /// surfaces of the old configuration are torn down and the new one's
     /// started.
-    pub async fn run(node_dir: PathBuf, mut stop: tokio::sync::watch::Receiver<bool>) {
+    pub async fn run(node_dir: PathBuf, stop: tokio::sync::watch::Receiver<bool>) {
+        let store = Arc::new(FileKeyStore::new(&node_dir));
+        run_with(node_dir, stop, store).await
+    }
+
+    /// [`run`] with the cluster key in `keys` instead of `router.key`: for an
+    /// application that embeds the router and keeps credentials its own way
+    /// (kmplify-desktop). Settings (`settings.json`) and the published state
+    /// (`router.json`) still live in `node_dir`; neither holds a secret.
+    pub async fn run_with(
+        node_dir: PathBuf,
+        mut stop: tokio::sync::watch::Receiver<bool>,
+        keys: Arc<dyn KeyStore>,
+    ) {
         let shared: Shared = Arc::new(Mutex::new(RouterState {
             schema: 1,
             ..Default::default()
         }));
         let mut active: Option<Active> = None;
+        let mut reported_key_error = String::new();
         loop {
             let snap = crate::status::snapshot();
             let stored = crate::settings::Settings::load(&node_dir);
-            let mut key = auth::load_key(&node_dir);
+            let loaded = keys.load();
+            let key_error = loaded.as_ref().err().cloned().unwrap_or_default();
+            let mut key = loaded.unwrap_or(None);
             let mut config = Config::resolve(&stored, &snap.node_id, key.is_some());
-            // Any active mode authenticates every request, loopback
-            // included, so it needs a key: the first start makes one.
-            if config.mode != Mode::Off && key.is_none() {
+            if !key_error.is_empty() {
+                // Neither a new key over one that could not be read, nor a
+                // surface without one.
+                if key_error != reported_key_error {
+                    lock(&shared).push_log(format!("cluster key unreadable: {key_error}"));
+                }
+                config.mode = Mode::Off;
+                config.problem = format!("the cluster key cannot be read: {key_error}");
+            } else if config.mode != Mode::Off && key.is_none() {
+                // Any active mode authenticates every request, loopback
+                // included, so it needs a key: the first start makes one.
                 let fresh = auth::ClusterKey::generate();
-                match auth::save_key(&node_dir, &fresh).await {
+                match keys.save(&fresh) {
                     Ok(()) => {
                         lock(&shared).push_log(format!(
                             "created this node's cluster key ({}, fingerprint {})",
-                            auth::KEY_FILE,
+                            keys.place(),
                             fresh.fingerprint()
                         ));
                         key = Some(fresh);
@@ -471,6 +498,7 @@ mod running {
                     }
                 }
             }
+            reported_key_error = key_error;
             let changed = active
                 .as_ref()
                 .is_none_or(|a| a.config != config || a.key != key);

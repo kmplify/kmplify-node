@@ -45,7 +45,12 @@ pub mod status;
 pub mod summary;
 pub mod trust;
 pub mod vectors;
-#[cfg(any(feature = "dashboard", feature = "tui", feature = "native-gui"))]
+#[cfg(any(
+    feature = "dashboard",
+    feature = "tui",
+    feature = "native-gui",
+    feature = "router"
+))]
 pub mod views;
 pub mod vllm_managed;
 pub mod wire;

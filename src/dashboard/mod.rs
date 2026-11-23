@@ -379,6 +379,8 @@ pub async fn route(req: &Request, ctx: &Ctx, port: u16) -> Response {
         ("POST", "/api/report") => report(ctx),
         ("POST", "/api/shutdown") => command(ctx, crate::views::Act::StopNode),
         ("POST", "/api/view") => switch_view(ctx, &req.body),
+        ("POST", "/api/router/new-key") => act(ctx, crate::views::Act::RouterNewKey),
+        ("POST", "/api/router/join") => router_join(ctx, &req.body),
         (_, p) if p.starts_with("/api/") => Response::text(404, "no such call"),
         _ => Response::text(404, "not found"),
     }
@@ -393,6 +395,8 @@ fn act(ctx: &Ctx, act: crate::views::Act) -> Response {
         crate::views::Act::Report
             | crate::views::Act::Setting { .. }
             | crate::views::Act::SettingClear { .. }
+            | crate::views::Act::RouterNewKey
+            | crate::views::Act::RouterJoin(_)
     );
     let o = crate::views::perform(crate::views::Target::InProcess, &ctx.node_dir, &act);
     let mut body = json!({"ok": o.ok, "message": o.message});
@@ -439,6 +443,19 @@ fn switch_view(ctx: &Ctx, body: &[u8]) -> Response {
             &json!({"ok": false, "message": "view must be web, app or terminal"}),
         ),
     }
+}
+
+/// `/api/router/join {"key": "<64 hex>"}`. The key is handed to the action
+/// layer and stored; it is never logged nor echoed back.
+#[cfg(feature = "dashboard")]
+fn router_join(ctx: &Ctx, body: &[u8]) -> Response {
+    let Some(key) = body_str(body, "key") else {
+        return Response::json(400, &json!({"ok": false, "message": "no key"}));
+    };
+    act(
+        ctx,
+        crate::views::Act::RouterJoin(crate::views::JoinKey(key)),
+    )
 }
 
 #[cfg(feature = "dashboard")]
@@ -490,6 +507,7 @@ pub fn state(ctx: &Ctx) -> Value {
         logs: crate::status::logs(),
         rechecking: crate::security::rechecking(),
         view: crate::control::view_state(),
+        router: crate::views::RouterInput::read(&ctx.node_dir),
     })
 }
 
@@ -772,6 +790,7 @@ mod tests {
             logs: Vec::new(),
             rechecking: false,
             view: crate::control::ViewState::default(),
+            router: crate::views::RouterInput::default(),
         });
         let setting_labels: Vec<String> = model["settings"]
             .as_array()
