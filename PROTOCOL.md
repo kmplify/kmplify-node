@@ -943,6 +943,13 @@ POST /v1/nodes/key-check   Authorization: Bearer <FABRIC_API_KEY or FABRIC_ADMIN
 The answer is yes or no for a pair the caller already holds: the gateway never
 hands out a node's key or address. A node token does not open it.
 
+**Binding.** A code with a `nonce` links only the account that asked for that
+challenge (`POST /provider-nodes/link-challenge`, one use, 10 minutes); the
+account service refuses another account's nonce. KMPLIFY Desktop always fetches
+the challenge for the signed-in account, so every code it shows is bound. A code
+without a nonce (the CLI and the dashboards unless a challenge is given) can be
+redeemed by whoever has it within its lifetime; the views say so.
+
 Made by `kmplify-node link-code [--nonce X] [--json]`, the dashboard's Earnings
 tab ("Make a link code", `POST /api/link-code`), the terminal view (key `L`),
 and by embedders through `kmplify_node::link::for_credentials` (part of the

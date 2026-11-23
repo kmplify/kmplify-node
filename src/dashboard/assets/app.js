@@ -390,8 +390,10 @@ function sessionsTab(s) {
 let linkCode = null;
 
 async function makeLinkCode() {
+  const box = document.getElementById("link-nonce");
+  const nonce = box ? box.value.trim() : "";
   try {
-    const r = await api("/api/link-code", {});
+    const r = await api("/api/link-code", nonce ? { nonce } : {});
     if (r.ok) linkCode = r; else toast(r.message || "No link code was made.");
   } catch (e) {
     toast("The node did not answer: " + e.message);
@@ -416,6 +418,10 @@ function linkCard() {
     live
       ? el("p", { class: "muted small", text: "Valid until " + new Date(linkCode.expires_at * 1000).toLocaleTimeString() + ", once. Signed by this node's identity key; it carries no personal data." })
       : el("p", { class: "muted small", text: linkCode ? "That code has expired. Make a new one." : "A code is valid for 10 minutes and can be used once." }),
+    live ? (linkCode.lines || []).slice(3).map((l) => el("p", { class: "small warn-text", text: l })) : null,
+    !live ? el("p", { class: "muted small", text: "Without a challenge the code is not bound to an account: whoever has it within 10 minutes can redeem it. Binding is recommended: make the code in KMPLIFY Desktop (signed in), or paste the challenge your account shows (marketplace: Settings > Peer Compute)." }) : null,
+    el("label", { class: "small", for: "link-nonce", text: "Challenge from your account (optional)" }),
+    el("input", { id: "link-nonce", type: "text", autocomplete: "off", spellcheck: "false", maxlength: "64", onfocus: () => { editing = true; }, onblur: () => { editing = false; } }),
     el("div", { class: "actions" },
       el("button", { class: "btn", onclick: makeLinkCode }, "Make a link code"),
       live ? el("button", { class: "btn ghost", onclick: copyLinkCode }, "Copy") : null));

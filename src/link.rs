@@ -235,7 +235,7 @@ pub fn for_credentials(creds_path: &Path, nonce: Option<&str>) -> Result<LinkCod
 /// and terminal dashboards).
 pub fn instructions(c: &LinkCode, bound: bool) -> Vec<String> {
     let minutes = c.expires_at.saturating_sub(c.issued_at).div_ceil(60);
-    vec![
+    let mut out = vec![
         format!(
             "Link code for node {}: valid for {minutes} minutes, once{}.",
             c.node_id,
@@ -248,7 +248,16 @@ pub fn instructions(c: &LinkCode, bound: bool) -> Vec<String> {
         "Enter it in the KMPLIFY marketplace: Settings > Peer Compute > Link code.".into(),
         "It proves you run this machine and carries no personal data. Make a new one any time."
             .into(),
-    ]
+    ];
+    if !bound {
+        out.push(format!(
+            "Not bound to an account: whoever has this code within {minutes} minutes can redeem it. \
+             Binding is recommended: make the code in KMPLIFY Desktop (signed in), or run \
+             kmplify-node link-code --nonce CHALLENGE with the challenge from your account \
+             (marketplace: Settings > Peer Compute)."
+        ));
+    }
+    out
 }
 
 /// Check a code's form, times and signature. Does NOT check that the key is
@@ -500,6 +509,20 @@ mod tests {
         );
         assert!(make(&key(), "abc", None, T, 600).is_err());
         assert!(make(&key(), "zz79ed9d11112222aaaabbbbcccc0000", None, T, 600).is_err());
+    }
+
+    #[test]
+    fn an_unbound_code_says_who_can_redeem_it_and_how_to_bind() {
+        let c = vector();
+        let unbound = instructions(&c, false).join(" ");
+        assert!(
+            unbound.contains("whoever has this code within 10 minutes"),
+            "{unbound}"
+        );
+        assert!(unbound.contains("KMPLIFY Desktop") && unbound.contains("--nonce"));
+        let bound = instructions(&c, true).join(" ");
+        assert!(bound.contains("for the account that showed the challenge"));
+        assert!(!bound.contains("whoever has this code"));
     }
 
     #[test]

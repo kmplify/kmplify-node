@@ -3519,6 +3519,7 @@ fn draw_link_code(f: &mut Frame, app: &App, area: Rect) {
         None => vec![
             Line::raw("Links this machine to your KMPLIFY account, so the marketplace shows your @alias on its card."),
             Line::styled("Press L to make a link code (valid for 10 minutes, once; no personal data). Same as kmplify-node link-code.", Style::new().fg(MUTED)),
+            Line::styled("A code made here is not bound to an account: whoever has it within 10 minutes can redeem it. Binding is recommended: KMPLIFY Desktop, or kmplify-node link-code --nonce CHALLENGE.", Style::new().fg(MUTED)),
         ],
     };
     f.render_widget(
@@ -3530,7 +3531,7 @@ fn draw_link_code(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_earnings(f: &mut Frame, app: &App, area: Rect) {
-    let [area, link] = Layout::vertical([Constraint::Min(6), Constraint::Length(9)]).areas(area);
+    let [area, link] = Layout::vertical([Constraint::Min(6), Constraint::Length(11)]).areas(area);
     draw_link_code(f, app, link);
     let e = &app.model["earnings"];
     if e["enabled"].as_bool() != Some(true) {

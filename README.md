@@ -504,7 +504,7 @@ so a machine with no desktop is no harder to run than one with a window.
 | `kmplify-node peers` | Who may use it — list, approve, deny, block, invite, revoke. `--json`. |
 | `kmplify-node rewards` | What this node delivered, and what an optional payout companion says. |
 | `kmplify-node id` | Print this install's node id, the handle consumers pin and invite. |
-| `kmplify-node link-code` | Print a link code (valid 10 minutes, once) to link this machine to your KMPLIFY account in the marketplace: Settings > Peer Compute > Link code. Signed by the node's identity key; carries no personal data. `--nonce X` binds it to a challenge, `--json` for scripts. |
+| `kmplify-node link-code` | Print a link code (valid 10 minutes, once) to link this machine to your KMPLIFY account in the marketplace: Settings > Peer Compute > Link code. Signed by the node's identity key; carries no personal data. Without `--nonce` the code is not bound to an account: whoever has it within 10 minutes can redeem it. Binding is recommended: KMPLIFY Desktop makes bound codes for the signed-in account, or pass `--nonce X` with the challenge your account shows (marketplace: Settings > Peer Compute). `--json` for scripts. |
 | `kmplify-node version` · `help` | Version and build stamp; the full flag list. |
 
 **One configuration surface.** Settings are environment variables, so a

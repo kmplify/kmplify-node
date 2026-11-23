@@ -368,3 +368,5 @@ th:last-child { border-radius: 0 6px 6px 0; }
   table.sessions tr { display: block; border-top: 1px solid var(--line-soft); padding: 6px 0; }
   table.sessions td { display: block; border: 0; padding: 2px 0; }
 }
+.warn-text { color: var(--warn); }
+#link-nonce { width: 100%; max-width: 28rem; margin: 4px 0 8px; font-family: inherit; }
