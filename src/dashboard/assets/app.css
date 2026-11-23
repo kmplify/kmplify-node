@@ -368,5 +368,34 @@ th:last-child { border-radius: 0 6px 6px 0; }
   table.sessions tr { display: block; border-top: 1px solid var(--line-soft); padding: 6px 0; }
   table.sessions td { display: block; border: 0; padding: 2px 0; }
 }
-.warn-text { color: var(--warn); }
+
+/* ---------------------------------------------------------------- router */
+.grid.wide { grid-template-columns: minmax(0, 1fr); }
+.grid.wide > *, .nodes > *, .rrow > * { min-width: 0; }
+.warn-text { color: var(--warn); margin: 0 0 8px; }
+.rform { border-top: 1px solid var(--line-soft); margin-top: 14px; padding-top: 6px; }
+.rrow { display: grid; grid-template-columns: 140px 1fr; gap: 6px 16px; align-items: center; padding: 8px 0; }
+.rrow .ctl { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.rrow input[type=text], .rrow input[type=password] {
+  font: inherit; font-size: 14px; padding: 7px 10px; border-radius: var(--radius); border: 1px solid var(--line);
+  background: transparent; color: var(--head); min-width: 0; flex: 1 1 200px;
+}
+.rrow input:hover { border-color: var(--muted); }
+.seg { justify-self: start; display: inline-flex; flex-wrap: wrap; gap: 4px; padding: 3px; border: 1px solid var(--line); border-radius: var(--radius); }
+.seg button { font: inherit; font-size: 13px; font-weight: 500; padding: 5px 12px; border: 0; border-radius: 6px;
+  background: transparent; color: var(--ink); cursor: pointer; }
+.seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
+.seg button:hover:not([aria-pressed="true"]) { background: var(--hover); }
+.nodes { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+.node { border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; min-width: 0; }
+.node .card-head { margin-bottom: 10px; }
+.node-title { flex: 1; min-width: 0; margin: 0; font-size: 15px; color: var(--head); overflow-wrap: anywhere; }
+.nmeters { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 12px; margin-top: 12px; }
+.nmeter-head { display: flex; justify-content: space-between; font-size: 13px; }
+.spark { display: block; width: 100%; height: 28px; margin-top: 6px; }
+.spark polyline { fill: none; stroke: var(--accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+@media (max-width: 640px) {
+  .rrow { grid-template-columns: minmax(0, 1fr); }
+  .nodes { grid-template-columns: minmax(0, 1fr); }
+}
 #link-nonce { width: 100%; max-width: 28rem; margin: 4px 0 8px; font-family: inherit; }

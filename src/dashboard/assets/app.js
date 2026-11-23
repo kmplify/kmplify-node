@@ -462,7 +462,7 @@ function control(x) {
     ctl.append(el("button", { class: "btn" + (x.value ? " ghost" : ""), onclick: () => save(!x.value) }, x.value ? "Turn off" : "Turn on"));
   } else if (x.kind === "choice") {
     const sel = el("select", { "aria-label": x.label, onfocus: () => { editing = true; }, onblur: () => { editing = false; } },
-      ["auto", "manual"].map((o) => el("option", { value: o, selected: o === x.value, text: o })));
+      (x.options || []).map((o) => el("option", { value: o, selected: o === x.value, text: o })));
     sel.addEventListener("change", () => save(sel.value));
     ctl.append(sel);
   } else {
@@ -505,9 +505,126 @@ function logsTab(s) {
   return card("Last log lines", el("p", { class: "muted small", text: "The newest 200 lines of this run. Anything that looks like a key or token is replaced by [redacted]." }), filter, pre);
 }
 
+
+// ----------------------------------------------------------------- router
+
+const PEER_TONE = { online: "ok", found: "", unreachable: "warn" };
+const MODE_TEXT = { off: "Off", local: "This computer only", lan: "On the network" };
+
+// A minute of one meter as a small line chart (SVG elements, no markup).
+// The SVG namespace is taken from an embedded icon, so no URL is written here.
+function spark(points) {
+  const NS = icon("router").namespaceURI;
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("class", "spark");
+  svg.setAttribute("viewBox", "0 0 120 28");
+  svg.setAttribute("preserveAspectRatio", "none");
+  svg.setAttribute("aria-hidden", "true");
+  if (points && points.length > 1) {
+    const step = 120 / (points.length - 1);
+    const line = document.createElementNS(NS, "polyline");
+    line.setAttribute("points", points.map((v, i) => (i * step).toFixed(1) + "," + (27 - 26 * Math.max(0, Math.min(100, v)) / 100).toFixed(1)).join(" "));
+    svg.append(line);
+  }
+  return svg;
+}
+
+function nodeMeter(label, pct, series) {
+  if (pct === null || pct === undefined) return null;
+  return el("div", { class: "nmeter" },
+    el("div", { class: "nmeter-head" }, el("span", { text: label }), el("span", { class: "muted", text: Math.round(pct) + "%" })),
+    meter(pct), spark(series));
+}
+
+function nodeCard(title, stateText, tone, rep, meters, detail) {
+  const kids = [el("div", { class: "card-head" },
+    el("span", { class: "card-ico", "aria-hidden": "true" }, icon("cpu")),
+    el("h3", { class: "node-title", text: title }),
+    el("span", { class: "chip " + (tone || ""), text: stateText }))];
+  if (detail) kids.push(el("p", { class: "muted small", text: detail }));
+  if (!rep) {
+    kids.push(el("p", { class: "muted small", text: "No report yet." }));
+    return el("div", { class: "node" }, kids);
+  }
+  const ram = rep.ram_total_mb ? 100 * rep.ram_used_mb / rep.ram_total_mb : null;
+  kids.push(kv([
+    ["GPU", rep.gpu_name ? rep.gpu_name + (rep.vram_total_mb ? ", " + gb(rep.vram_total_mb) : "") : (rep.accelerator || "none")],
+    ["CPU", (rep.cpu_model ? rep.cpu_model + ", " : "") + (rep.cpus ? rep.cpus + " threads" : "")],
+    ["RAM", rep.ram_total_mb ? gb(rep.ram_used_mb) + " of " + gb(rep.ram_total_mb) : ""],
+    ["System", (OS_NAMES[rep.os] || rep.os) + (rep.version ? ", kmplify-node " + rep.version : "")],
+    ["Fabric", rep.link ? rep.link.toLowerCase() + (rep.paused ? ", paused" : "") : ""],
+    ["Models", rep.models && rep.models.length ? rep.models.join(", ") : "none"],
+    ["Jobs", rep.jobs_active + " running, " + rep.jobs_done + " done" + (rep.sessions ? ", " + rep.sessions + " sessions" : "")],
+  ]));
+  kids.push(el("div", { class: "nmeters" },
+    nodeMeter("CPU", rep.cpu_percent, meters && meters.cpu),
+    nodeMeter("RAM", ram, meters && meters.ram),
+    rep.gpu_percent !== null && rep.gpu_percent !== undefined ? nodeMeter("GPU", rep.gpu_percent, meters && meters.gpu) : null));
+  return el("div", { class: "node" }, kids);
+}
+
+function routerTab(s) {
+  const r = s.router;
+  const keep = { onfocus: () => { editing = true; }, onblur: () => { editing = false; } };
+  const setRouter = (key, value) => act("/api/settings", { key, value });
+  const modeSw = el("div", { class: "seg", role: "group", "aria-label": "Router mode" },
+    r.modes.map((m) => el("button", { type: "button", "data-mode": m, "aria-pressed": String(r.asked === m),
+      onclick: () => { if (r.asked !== m) setRouter("router", m); } }, MODE_TEXT[m] || m)));
+  const allow = el("input", Object.assign({ type: "text", value: (r.allow || []).join(", "), placeholder: "192.168.1.0/24", "aria-label": "LAN router allowlist" }, keep));
+  const name = el("input", Object.assign({ type: "text", value: r.name || "", "aria-label": "LAN router name" }, keep));
+  const join = el("input", Object.assign({ type: "password", autocomplete: "off", spellcheck: "false", placeholder: "64 hexadecimal characters", "aria-label": "Cluster key to join" }, keep));
+  const modeChip = el("span", { class: "chip " + (r.mode === "off" ? "" : r.mode === r.asked ? "ok" : "warn"), text: MODE_TEXT[r.mode] || r.mode });
+  const me = cardI("router", "This router",
+    el("p", { class: "lead" }, modeChip, " ", r.running ? "running" : r.mode === "off" ? "off until you choose" : "not running here (the node is not running, or this build has no router)"),
+    r.problem ? el("p", { class: "small warn-text", role: "status", text: r.problem }) : null,
+    kv([
+      ["Asked for", MODE_TEXT[r.asked] || r.asked],
+      ["Listening", r.listening || "no"],
+      ["Port", r.mode === "off" ? "" : String(r.port)],
+      ["Discovery", r.discovery],
+      ["Cluster key", r.key_fingerprint ? "fingerprint " + r.key_fingerprint : "none yet (made when the router is turned on)"],
+    ]),
+    el("div", { class: "rform" },
+      el("div", { class: "rrow" }, el("strong", { text: "Mode" }), modeSw),
+      el("div", { class: "rrow" }, el("strong", { text: "Allowlist" }),
+        el("div", { class: "ctl" }, allow, el("button", { class: "btn", onclick: () => { editing = false; setRouter("router-allow", allow.value); } }, "Save"))),
+      el("div", { class: "rrow" }, el("strong", { text: "Name" }),
+        el("div", { class: "ctl" }, name, el("button", { class: "btn", onclick: () => { editing = false; setRouter("router-name", name.value); } }, "Save"))),
+      el("div", { class: "rrow" }, el("strong", { text: "Cluster key" }),
+        el("div", { class: "ctl" },
+          join,
+          el("button", { class: "btn", onclick: () => {
+            const k = join.value.trim();
+            join.value = "";
+            editing = false;
+            if (!k) { toast("Paste the key from kmplify-node router key on the other node first."); return; }
+            act("/api/router/join", { key: k });
+          } }, "Join a cluster"),
+          el("button", { class: "btn ghost", onclick: () => {
+            if (window.confirm("Make a new cluster key? Every other node must join again with it.")) act("/api/router/new-key");
+          } }, "New cluster key")))),
+    el("p", { class: "muted small", text: "Off until you choose. This computer only binds 127.0.0.1. On the network answers only the addresses on the allowlist (private, link-local or VPN ranges), and only requests signed with the cluster key; the key never crosses the network and is never shown here, only its fingerprint. Show it with kmplify-node router key on this computer." }));
+
+  const cards = [];
+  if (r.local) cards.push(nodeCard(r.local.name + " (this node)", "online", "ok", r.local, r.local_meters, ""));
+  for (const p of r.peers) {
+    cards.push(nodeCard(p.name + " " + p.address, p.state_label, PEER_TONE[p.state] === undefined ? "bad" : PEER_TONE[p.state], p.report, p.meters, p.detail));
+  }
+  const nodes = cardI("cpu", "Nodes on the network",
+    cards.length ? el("div", { class: "nodes" }, cards) : null,
+    r.peers.length ? null : el("p", { class: "muted small", text: r.mode === "lan"
+      ? "No other node announced itself yet. Nodes appear here when they run the router in LAN mode with this cluster key and an allowlist that includes this machine."
+      : r.mode === "local" ? "This computer only: other nodes are not looked for. On the network finds them." : "The router is off. Turned on, it shows the kmplify-nodes on your network side by side, with their hardware and live load." }));
+
+  const pre = el("pre", { class: "log", "aria-label": "Router log" });
+  pre.textContent = r.log.slice().reverse().slice(0, 20).join("\n") || "Nothing yet.";
+  const log = cardI("logs", "Router log", pre);
+  return el("div", { class: "grid wide" }, me, nodes, log);
+}
+
 // ----------------------------------------------------------------- frame
 
-const TABS = { overview, trust: trustTab, sessions: sessionsTab, earnings: earningsTab, settings: settingsTab, logs: logsTab };
+const TABS = { overview, trust: trustTab, sessions: sessionsTab, earnings: earningsTab, settings: settingsTab, logs: logsTab, router: routerTab };
 
 function render() {
   if (!state) return;
