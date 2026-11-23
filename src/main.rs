@@ -1756,7 +1756,10 @@ async fn main() {
     // takes no document jobs.
     match env_opt("PROVIDER_DOCUMENT_TERMS") {
         Some(v) => match kmplify_node::provider_terms::accept(&dir, &v) {
-            Ok(a) => eprintln!("kmplify-node: provider document terms {} accepted at {}", a.version, a.accepted_at),
+            Ok(a) => eprintln!(
+                "kmplify-node: provider document terms {} accepted at {}",
+                a.version, a.accepted_at
+            ),
             Err(e) => {
                 let _ = kmplify_node::provider_terms::withdraw(&dir);
                 eprintln!("kmplify-node: PROVIDER_DOCUMENT_TERMS not used: {e}. No document jobs.");

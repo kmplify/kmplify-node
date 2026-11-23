@@ -74,7 +74,11 @@ pub struct Tuning {
 
 impl Default for Tuning {
     fn default() -> Self {
-        Self { kv_dtype: "auto".into(), gpu_util: DEFAULT_GPU_UTIL, offload_gb: 0 }
+        Self {
+            kv_dtype: "auto".into(),
+            gpu_util: DEFAULT_GPU_UTIL,
+            offload_gb: 0,
+        }
     }
 }
 
@@ -90,7 +94,12 @@ pub fn valid_gpu_util(v: f32) -> bool {
 }
 
 /// `docker run` arguments (detached; the node stops it on exit).
-pub fn run_args(backend: Backend, model: &str, max_model_len: u32, tuning: &Tuning) -> Result<Vec<String>, String> {
+pub fn run_args(
+    backend: Backend,
+    model: &str,
+    max_model_len: u32,
+    tuning: &Tuning,
+) -> Result<Vec<String>, String> {
     let (gpu, image): (Vec<String>, &str) = match backend {
         Backend::Cuda => (s(&["--gpus", "all"]), IMAGE_CUDA),
         Backend::Rocm => (
@@ -139,7 +148,11 @@ pub fn run_args(backend: Backend, model: &str, max_model_len: u32, tuning: &Tuni
     ]));
     a.push(max_model_len.to_string());
     a.extend(s(&["--gpu-memory-utilization"]));
-    let util = if valid_gpu_util(tuning.gpu_util) { tuning.gpu_util } else { DEFAULT_GPU_UTIL };
+    let util = if valid_gpu_util(tuning.gpu_util) {
+        tuning.gpu_util
+    } else {
+        DEFAULT_GPU_UTIL
+    };
     a.push(format!("{util:.2}"));
     if tuning.kv_dtype == "fp8" {
         a.extend(s(&["--kv-cache-dtype", "fp8"]));
@@ -167,7 +180,12 @@ pub async fn remove() {
 
 /// Start vLLM for `model` and wait until it answers. Returns the base URL
 /// to lend (the node's `ollama_base` for this run).
-pub async fn start(backend: Backend, model: &str, max_model_len: u32, tuning: &Tuning) -> Result<String, String> {
+pub async fn start(
+    backend: Backend,
+    model: &str,
+    max_model_len: u32,
+    tuning: &Tuning,
+) -> Result<String, String> {
     let args = run_args(backend, model, max_model_len, tuning)?;
     // Never two: a container left by a killed node holds the GPU and port.
     remove().await;
@@ -251,14 +269,28 @@ mod tests {
 
     #[test]
     fn kv_cache_tuning_reaches_vllm_and_the_default_is_unchanged() {
-        let d = run_args(Backend::Cuda, "Qwen/Qwen3-8B", 65536, &Tuning::default()).unwrap().join(" ");
+        let d = run_args(Backend::Cuda, "Qwen/Qwen3-8B", 65536, &Tuning::default())
+            .unwrap()
+            .join(" ");
         assert!(d.contains("--gpu-memory-utilization 0.90"), "{d}");
-        assert!(!d.contains("--kv-cache-dtype") && !d.contains("--kv-offloading"), "{d}");
-        let t = Tuning { kv_dtype: "fp8".into(), gpu_util: 0.7, offload_gb: 16 };
-        let a = run_args(Backend::Cuda, "Qwen/Qwen3-8B", 65536, &t).unwrap().join(" ");
+        assert!(
+            !d.contains("--kv-cache-dtype") && !d.contains("--kv-offloading"),
+            "{d}"
+        );
+        let t = Tuning {
+            kv_dtype: "fp8".into(),
+            gpu_util: 0.7,
+            offload_gb: 16,
+        };
+        let a = run_args(Backend::Cuda, "Qwen/Qwen3-8B", 65536, &t)
+            .unwrap()
+            .join(" ");
         assert!(a.contains("--gpu-memory-utilization 0.70"), "{a}");
         assert!(a.contains("--kv-cache-dtype fp8"), "{a}");
-        assert!(a.contains("--kv-offloading-size 16 --kv-offloading-backend native"), "{a}");
+        assert!(
+            a.contains("--kv-offloading-size 16 --kv-offloading-backend native"),
+            "{a}"
+        );
     }
 
     #[test]
@@ -277,7 +309,13 @@ mod tests {
 
     #[test]
     fn loopback_only_tool_calls_on_and_weights_outside_the_fabric_namespace() {
-        let a = run_args(Backend::Cuda, "ibm-granite/granite-3.3-2b-instruct", 65536, &Tuning::default()).unwrap();
+        let a = run_args(
+            Backend::Cuda,
+            "ibm-granite/granite-3.3-2b-instruct",
+            65536,
+            &Tuning::default(),
+        )
+        .unwrap();
         assert!(a
             .windows(2)
             .any(|w| w[0] == "-p" && w[1] == format!("127.0.0.1:{PORT}:8000")));
@@ -304,7 +342,10 @@ mod tests {
             "a/b/c",
             "a b",
         ] {
-            assert!(run_args(Backend::Cuda, bad, 4096, &Tuning::default()).is_err(), "{bad}");
+            assert!(
+                run_args(Backend::Cuda, bad, 4096, &Tuning::default()).is_err(),
+                "{bad}"
+            );
         }
     }
 
