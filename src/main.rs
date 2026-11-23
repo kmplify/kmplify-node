@@ -1716,6 +1716,7 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
     };
     kmplify_node::startup::step(format!("view: {}", ui.as_str()));
     let interactive = interactive_console();
+    kmplify_node::startup::step(format!("interactive console: {interactive}"));
     let ui_port = match dashboard::parse_port(env_opt("KMPLIFY_NODE_UI_PORT").as_deref()) {
         Ok(p) => p,
         Err(e) => {
@@ -1891,7 +1892,10 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
         quit: tokio::sync::watch::channel(false).0,
     };
     #[cfg(feature = "tui")]
-    let mut keys = switchable.then(tui::console_keys);
+    let mut keys = switchable.then(|| {
+        kmplify_node::startup::step("console keys: listening (interactive console)");
+        tui::console_keys()
+    });
     #[cfg(not(feature = "tui"))]
     let mut keys: Option<tokio::sync::mpsc::UnboundedReceiver<char>> = None;
     if ui != UiMode::None {
@@ -1901,6 +1905,7 @@ async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
         ));
     }
     if ui == UiMode::Tui {
+        kmplify_node::startup::step("terminal view: opening");
         views.show("terminal");
     } else if switchable && cfg!(feature = "tui") {
         println!(
