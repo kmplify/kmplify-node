@@ -1001,6 +1001,8 @@ pub(crate) async fn write_private(path: &Path, bytes: Vec<u8>) -> std::io::Resul
 /// process start per write, and this file is written every few seconds.
 /// Outside the profile (a service install under `C:\ProgramData`, say) the
 /// file is restricted like a credential.
+// Only the router writes such state today.
+#[cfg_attr(not(feature = "router"), allow(dead_code))]
 pub(crate) async fn write_private_state(path: &Path, bytes: Vec<u8>) -> std::io::Result<()> {
     #[cfg(unix)]
     {
