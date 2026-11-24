@@ -398,6 +398,24 @@ mod tests {
         assert_eq!(v.seen.len(), 1);
     }
 
+    /// Golden value shared with kmplify-rag-system's client
+    /// (tests/test_lan_router_admin.py), so the two never drift apart.
+    #[test]
+    fn the_body_bound_signature_matches_the_golden_value() {
+        assert_eq!(
+            sign_request_with_body(
+                &key(7),
+                "PUT",
+                "/v2/node-settings",
+                1_800_000_000_000,
+                "0123456789abcdef0123456789abcdef",
+                br#"{"name":"studio"}"#,
+            ),
+            "v2.1800000000000.0123456789abcdef0123456789abcdef.\
+             5582be7da0c48ae5164b91fcfe20fa8f8f8d0f619e59b7d28a5ac51fd11c9a0b"
+        );
+    }
+
     #[test]
     fn a_body_bound_request_covers_its_body_and_is_accepted_once() {
         let k = key(7);

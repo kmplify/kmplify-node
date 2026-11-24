@@ -182,6 +182,12 @@ fn flag(field: &'static str, v: &Value) -> Result<bool, Refusal> {
     })
 }
 
+fn valid_request_id(s: &str) -> bool {
+    s.len() <= 64
+        && s.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+}
+
 /// Check a request body: JSON object, only [`FIELDS`] and `request_id`,
 /// each value in range. Nothing is changed here.
 pub fn parse(body: &[u8]) -> Result<Plan, Refusal> {
@@ -215,13 +221,7 @@ pub fn parse(body: &[u8]) -> Result<Plan, Refusal> {
     }
     let request_id = match obj.get("request_id") {
         None | Some(Value::Null) => String::new(),
-        Some(Value::String(s))
-            if s.len() <= 64
-                && s.bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.')) =>
-        {
-            s.clone()
-        }
+        Some(Value::String(s)) if valid_request_id(s) => s.clone(),
         Some(_) => {
             return Err(Refusal::new(
                 400,
@@ -399,6 +399,15 @@ pub fn apply(plan: &Plan, host: &dyn RemoteHost) -> (u16, Value, String) {
 /// The whole request after its signature was checked: opt-in, parse,
 /// apply. Returns the status, the JSON body and the audit line.
 pub fn handle(body: &[u8], host: &dyn RemoteHost, caller: &mut Caller) -> (u16, Value, String) {
+    // The caller's request id, when it is a valid one, names a refused
+    // request too, so the two audits (here and the caller's) line up.
+    if let Ok(Value::Object(m)) = serde_json::from_slice::<Value>(body) {
+        if let Some(Value::String(id)) = m.get("request_id") {
+            if valid_request_id(id) {
+                caller.request_id = id.clone();
+            }
+        }
+    }
     if !host.allowed() {
         return (
             403,
@@ -614,7 +623,12 @@ mod tests {
             allowed: false,
             done: Mutex::new(Vec::new()),
         };
-        let (status, body, line) = handle(br#"{"name":"studio"}"#, &host, &mut caller());
+        let (status, body, line) = handle(
+            br#"{"request_id":"off-1","name":"studio"}"#,
+            &host,
+            &mut caller(),
+        );
+        assert!(line.contains("request off-1"), "{line}");
         assert_eq!(status, 403);
         assert_eq!(body["error"], "remote_settings_off");
         assert!(host.done.lock().unwrap().is_empty());
