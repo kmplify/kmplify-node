@@ -959,6 +959,12 @@ fn document_job_refusal(frame: &Value, terms_dir: Option<&Path>) -> Option<Value
 /// 0644: every local account could read the token and impersonate the node.
 /// A headless box is exactly where other accounts exist. Mode is set at
 /// creation, not afterwards, so there is no window with a readable file.
+///
+/// On Windows the same holds by a different route: the content goes into a
+/// fresh temporary file that is restricted while still EMPTY, and that file
+/// is then renamed over `path` (a renamed file keeps its own permissions).
+/// So the content never sits in a file with the folder's permissions, and a
+/// reader never sees half a file.
 pub(crate) async fn write_private(path: &Path, bytes: Vec<u8>) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -978,10 +984,108 @@ pub(crate) async fn write_private(path: &Path, bytes: Vec<u8>) -> std::io::Resul
     }
     #[cfg(not(unix))]
     {
-        tokio::fs::write(path, bytes).await?;
-        restrict_to_current_user(path).await;
-        Ok(())
+        write_restricted_atomic(path, bytes, true).await
     }
+}
+
+/// Write state that is this machine's business but holds no secret (the
+/// router's `router.json`): owner-only, and atomic through a temporary file
+/// of this write's own (see [`crate::node_dir::unique_tmp`]), so a reader
+/// never sees half a file and two writers never take each other's temporary
+/// file away.
+///
+/// On Windows `icacls` is skipped when the file lies in the user's own
+/// profile (`%USERPROFILE%`, the default node directory), whose permissions
+/// already grant only that user, SYSTEM and the administrators. It is a
+/// process start per write, and this file is written every few seconds.
+/// Outside the profile (a service install under `C:\ProgramData`, say) the
+/// file is restricted like a credential.
+pub(crate) async fn write_private_state(path: &Path, bytes: Vec<u8>) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let tmp = crate::node_dir::unique_tmp(path);
+        let r = match write_private(&tmp, bytes).await {
+            Ok(()) => tokio::fs::rename(&tmp, path).await,
+            Err(e) => Err(e),
+        };
+        if r.is_err() {
+            let _ = tokio::fs::remove_file(&tmp).await;
+        }
+        r
+    }
+    #[cfg(not(unix))]
+    {
+        let in_profile = std::env::var_os("USERPROFILE")
+            .filter(|p| !p.is_empty())
+            .is_some_and(|p| crate::node_dir::is_within(path, Path::new(&p)));
+        write_restricted_atomic(path, bytes, !in_profile).await
+    }
+}
+
+/// The Windows writer behind [`write_private`] and [`write_private_state`]:
+/// an empty temporary file, restricted (when asked), then filled, then
+/// renamed over `path`.
+#[cfg(not(unix))]
+async fn write_restricted_atomic(
+    path: &Path,
+    bytes: Vec<u8>,
+    restrict: bool,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let tmp = crate::node_dir::unique_tmp(path);
+    let result = async {
+        drop(tokio::fs::File::create(&tmp).await?);
+        if restrict {
+            restrict_to_current_user(&tmp, path).await;
+        }
+        // Opened as it is (not created again), so the permissions just set
+        // stay exactly as they are.
+        let mut f = tokio::fs::OpenOptions::new().write(true).open(&tmp).await?;
+        f.write_all(&bytes).await?;
+        f.flush().await?;
+        drop(f);
+        rename_over(&tmp, path).await
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    result
+}
+
+/// Rename `from` over `to`, retrying briefly: on Windows a reader that holds
+/// `to` open for a moment (an antivirus scan, a companion reading it) makes
+/// the rename fail with "access denied" until it lets go.
+#[cfg(not(unix))]
+async fn rename_over(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut tries = 0;
+    loop {
+        match tokio::fs::rename(from, to).await {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && tries < 5 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+            r => return r,
+        }
+    }
+}
+
+/// Whether a failure to restrict `target` is the first one this process has
+/// seen for that file. Later ones are not logged again: the cause (no
+/// USERNAME, an icacls that refuses) does not change between two writes, and
+/// a file written every few seconds would otherwise fill the log with the
+/// same line.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+fn first_restrict_failure(target: &Path) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let mut seen = match SEEN.get_or_init(|| Mutex::new(HashSet::new())).lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    seen.insert(target.to_path_buf())
 }
 
 /// Windows equivalent of the 0600 above: this file, this user, nobody else.
@@ -1002,9 +1106,19 @@ pub(crate) async fn write_private(path: &Path, bytes: Vec<u8>) -> std::io::Resul
 ///
 /// Best effort, like the MySQL session mode in the RAG service: a machine
 /// where icacls is missing or refuses should lose the hardening, not the
-/// node. The warning says which happened.
+/// node. The warning says which happened, once per file (`target`, the file
+/// the temporary `path` becomes) for the life of the process.
 #[cfg(windows)]
-async fn restrict_to_current_user(path: &Path) {
+async fn restrict_to_current_user(path: &Path, target: &Path) {
+    let warn = |why: String| {
+        if first_restrict_failure(target) {
+            log(format!(
+                "could not restrict {}: {why}; the file keeps the folder's permissions \
+                 (said once, for every later write of this file too)",
+                target.display()
+            ));
+        }
+    };
     // /inheritance:r drops the inherited ACEs — without it the grant below is
     // added to whatever the parent directory already allowed, which is the
     // thing being removed. Both grants are then required: with inheritance
@@ -1012,11 +1126,7 @@ async fn restrict_to_current_user(path: &Path) {
     let user = match std::env::var("USERNAME") {
         Ok(u) if !u.trim().is_empty() => u,
         _ => {
-            log(format!(
-                "could not restrict {} — USERNAME is not set, so there is no \
-                 account to grant it to; the file keeps the folder's permissions",
-                path.display()
-            ));
+            warn("USERNAME is not set, so there is no account to grant it to".into());
             return;
         }
     };
@@ -1033,10 +1143,8 @@ async fn restrict_to_current_user(path: &Path) {
     let out = match tokio::time::timeout(CONTROL_PROBE_TIMEOUT, cmd.output()).await {
         Ok(r) => r,
         Err(_) => {
-            log(format!(
-                "could not restrict {}: icacls did not finish within {} s; the file keeps \
-                 the folder's permissions",
-                path.display(),
+            warn(format!(
+                "icacls did not finish within {} s",
                 CONTROL_PROBE_TIMEOUT.as_secs()
             ));
             return;
@@ -1044,22 +1152,18 @@ async fn restrict_to_current_user(path: &Path) {
     };
     match out {
         Ok(o) if o.status.success() => {}
-        Ok(o) => log(format!(
-            "could not restrict {}: icacls said {}",
-            path.display(),
+        Ok(o) => warn(format!(
+            "icacls said {}",
             String::from_utf8_lossy(&o.stderr).trim()
         )),
-        Err(e) => log(format!(
-            "could not restrict {}: icacls did not run ({e})",
-            path.display()
-        )),
+        Err(e) => warn(format!("icacls did not run ({e})")),
     }
 }
 
 /// Nothing to do off Windows: the Unix branch above already created the file
 /// with mode 0600.
 #[cfg(all(not(unix), not(windows)))]
-async fn restrict_to_current_user(_path: &Path) {}
+async fn restrict_to_current_user(_path: &Path, _target: &Path) {}
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -11285,5 +11389,63 @@ mod embedded_parity_tests {
             .iter()
             .map(|s| s.to_string())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod restrict_log_tests {
+    use super::*;
+
+    /// A file written every few seconds whose restriction fails says so
+    /// once, not on every write; another file still gets its own line.
+    #[test]
+    fn a_restrict_failure_is_reported_once_per_file() {
+        let a = Path::new("/node/router.json.dedupe-test");
+        let b = Path::new("/node/fabric_node.json.dedupe-test");
+        assert!(first_restrict_failure(a));
+        assert!(!first_restrict_failure(a));
+        assert!(!first_restrict_failure(a));
+        assert!(first_restrict_failure(b));
+    }
+
+    #[tokio::test]
+    async fn state_writes_are_atomic_and_leave_no_temp_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "kmplify-node-state-{}-{}",
+            std::process::id(),
+            crate::status::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("router.json");
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                let target = target.clone();
+                tokio::spawn(async move {
+                    for _ in 0..20 {
+                        write_private_state(&target, format!("{{\"w\":{i}}}").into_bytes())
+                            .await
+                            .expect("a writer never loses its temporary file");
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.await.unwrap();
+        }
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+        assert!(v["w"].is_number());
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

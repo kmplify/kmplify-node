@@ -220,10 +220,13 @@ impl Settings {
     /// whatever the environment said.
     pub fn save(&self, node_dir: &Path) -> std::io::Result<()> {
         let target = path(node_dir);
-        let tmp = target.with_extension("json.tmp");
+        let tmp = crate::node_dir::unique_tmp(&target);
         let bytes = serde_json::to_vec_pretty(self)?;
-        write_owner_only(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &target)
+        write_owner_only(&tmp, &bytes)
+            .and_then(|()| std::fs::rename(&tmp, &target))
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp);
+            })
     }
 
     pub fn is_empty(&self) -> bool {

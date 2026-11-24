@@ -604,6 +604,10 @@ pub async fn main(cfg: WorkerConfig, dir: PathBuf, attach: bool, standalone: boo
     let node = if attach_mode {
         None
     } else {
+        // Before the terminal is taken over, so the refusal can be read.
+        if let Err(code) = crate::take_serve_lock(&dir) {
+            return code;
+        }
         // The dashboard owns the terminal from here on, so worker logs go to
         // the ring instead of over the frame.
         status::set_quiet(true);

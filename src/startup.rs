@@ -152,6 +152,27 @@ pub fn dir() -> Option<PathBuf> {
     cell().lock().ok().and_then(|t| t.dir.clone())
 }
 
+/// Add one line to the END of `dir`'s trace, without taking the trace over.
+///
+/// For a start that is refused because another node already serves from
+/// `dir`: [`set_dir`] would rotate that node's trace away, and its trace is
+/// what an operator needs. The refusal is appended instead, so the file says
+/// both what the running node did and that a second one was turned away.
+pub fn append_note(dir: &Path, msg: &str) {
+    let line = format!(
+        "{} {}",
+        utc_stamp(SystemTime::now()),
+        msg.replace(['\r', '\n'], " ")
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(dir.join(TRACE_FILE))
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 /// The command line as it may be written down: flags and short words stay,
 /// everything else (URLs, paths, numbers, a `key=value`'s value) becomes
 /// `…`. A value never reaches the file, whatever flag it belongs to.
