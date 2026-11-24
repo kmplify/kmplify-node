@@ -87,13 +87,16 @@ pub fn accept(dir: &Path, version: &str) -> Result<Acceptance, String> {
         accepted_at: now_secs(),
     };
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let tmp = dir.join(format!("{FILE}.tmp"));
+    let tmp = crate::node_dir::unique_tmp(&path(dir));
     std::fs::write(
         &tmp,
         serde_json::to_vec_pretty(&a).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path(dir)).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path(dir)).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })?;
     Ok(a)
 }
 

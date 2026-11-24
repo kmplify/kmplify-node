@@ -79,6 +79,59 @@ const EXIT_USAGE: i32 = 2;
 /// app window on this code (or any other failure in the first seconds).
 #[cfg(not(feature = "native-gui"))]
 const EXIT_NO_WINDOW: i32 = 3;
+/// Another kmplify-node already serves from this node directory. Nothing
+/// was started; the running node is untouched.
+const EXIT_ALREADY_RUNNING: i32 = 4;
+
+/// This process's serving lock on its node directory, once taken. Never
+/// released by hand: the OS drops it with the process.
+static SERVE_LOCK: std::sync::OnceLock<kmplify_node::node_dir::ServeLock> =
+    std::sync::OnceLock::new();
+
+/// Take the serving lock on `dir`, or refuse to serve.
+///
+/// Called by every path that serves (`run`, `init` going on to run, a `tui`
+/// that starts its own node) and by nothing that only reads or attaches.
+/// Idempotent within the process. Refusing prints why, adds a line to the
+/// running node's `startup.log` without rotating it, and returns
+/// [`EXIT_ALREADY_RUNNING`]. A node directory on a file system without locks
+/// (some network shares) is served without one, with a warning: that is how
+/// every release before this lock behaved.
+pub(crate) fn take_serve_lock(dir: &std::path::Path) -> Result<(), i32> {
+    use kmplify_node::node_dir::{self, LockError, ServeLock};
+    if SERVE_LOCK.get().is_some() {
+        return Ok(());
+    }
+    match ServeLock::acquire(dir) {
+        Ok(lock) => {
+            let _ = SERVE_LOCK.set(lock);
+            kmplify_node::startup::step("node dir lock: taken");
+            Ok(())
+        }
+        Err(LockError::Held { pid, started_at_ms }) => {
+            let msg = node_dir::already_running_message(dir, pid, started_at_ms);
+            eprintln!("kmplify-node: {msg}");
+            kmplify_node::startup::step("node dir lock: held by another node, refused");
+            kmplify_node::startup::append_note(
+                dir,
+                &format!(
+                    "a second start (pid {}) was refused: {msg}",
+                    std::process::id()
+                ),
+            );
+            Err(EXIT_ALREADY_RUNNING)
+        }
+        Err(LockError::Io(e)) => {
+            eprintln!(
+                "kmplify-node: warning: cannot lock {} ({e}); a second node started in this \
+                 directory would not be refused",
+                dir.join(node_dir::LOCK_FILE).display()
+            );
+            kmplify_node::startup::step(format!("node dir lock: unavailable ({e})"));
+            Ok(())
+        }
+    }
+}
 
 fn env_opt(key: &str) -> Option<String> {
     std::env::var(key)
@@ -1740,6 +1793,10 @@ async fn startup_summary(engine: String, dashboard_url: Option<String>) {
 /// Join the fabric and serve until told to stop. Returns the exit code.
 async fn serve(mut cfg: WorkerConfig, dir: PathBuf) -> i32 {
     use kmplify_node::dashboard::{self, UiMode};
+    // Already held for `run`; this is the one for `init` going on to run.
+    if let Err(code) = take_serve_lock(&dir) {
+        return code;
+    }
     kmplify_node::startup::step("view: choosing");
     let ui = match start_view(&dir) {
         Ok(u) => u,
@@ -2327,6 +2384,22 @@ fn main() {
 /// The exit code after a panic, as Rust's own default.
 const EXIT_PANIC: i32 = 101;
 
+/// [`take_serve_lock`] for a `tui` that has not decided yet whether it will
+/// serve or attach: taken when free, nothing said when not.
+fn take_serve_lock_quietly(dir: &std::path::Path) -> bool {
+    use kmplify_node::node_dir::ServeLock;
+    if SERVE_LOCK.get().is_some() {
+        return true;
+    }
+    match ServeLock::acquire(dir) {
+        Ok(lock) => {
+            let _ = SERVE_LOCK.set(lock);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// `std::process::exit`, with the code as the trace's last line.
 fn exit(code: i32) -> ! {
     kmplify_node::startup::step(format!("exit with code {code}"));
@@ -2387,7 +2460,23 @@ async fn async_main() {
     }
     // Only the commands that start a node own the trace: `status` or `set`
     // run next to a node must not overwrite the trace of its start.
-    if matches!(cli.cmd, cli::Cmd::Run | cli::Cmd::Tui) {
+    //
+    // `run` takes the node directory's serving lock first of all, before the
+    // GPU probe and long before anything connects: a second node in one
+    // directory shares its identity with the first, and the gateway would
+    // hand the link back and forth between them (close 4003) for as long as
+    // both run. Refused, it leaves the running node's trace as it is.
+    // A `tui` may only attach to the node that runs here, so it tries the
+    // lock without insisting; it insists right before it starts a node.
+    let owns_trace = match cli.cmd {
+        cli::Cmd::Run => match take_serve_lock(&dir) {
+            Ok(()) => true,
+            Err(code) => exit(code),
+        },
+        cli::Cmd::Tui => cli.attach || take_serve_lock_quietly(&dir),
+        _ => false,
+    };
+    if owns_trace {
         kmplify_node::startup::set_dir(&dir);
         kmplify_node::startup::step(format!("node dir {}", dir.display()));
     }

@@ -151,7 +151,7 @@ impl Store {
                 tokio::fs::create_dir_all(&self.dir)
                     .await
                     .map_err(|e| e.to_string())?;
-                let tmp = self.dir.join(format!("{id}.json.tmp"));
+                let tmp = crate::node_dir::unique_tmp(&path);
                 let bytes = serde_json::to_vec(s).map_err(|e| e.to_string())?;
                 tokio::fs::write(&tmp, &bytes)
                     .await
