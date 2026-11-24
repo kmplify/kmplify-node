@@ -56,7 +56,10 @@ fn a_second_node_in_one_dir_is_refused_and_reads_still_work() {
     let out = node(&dir.0, &["run", "--ui", "none"]);
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(EXIT_ALREADY_RUNNING), "{err}");
-    assert!(err.contains("another kmplify-node is already running in"), "{err}");
+    assert!(
+        err.contains("another kmplify-node is already running in"),
+        "{err}"
+    );
     assert!(err.contains("KMPLIFY_NODE_DIR"), "{err}");
     // The running node's trace is kept, with the refusal added to it.
     let trace = std::fs::read_to_string(dir.0.join(TRACE_FILE)).unwrap();

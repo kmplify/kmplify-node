@@ -666,6 +666,7 @@ kmplify-node set --clear max-cpus   # back to whatever the unit file says
 |---|---|---|
 | `share-inference` | `PROVIDER_SHARE_INFERENCE` | serve chat and embedding jobs |
 | `share-cpu` | `PROVIDER_SHARE_CPU` | lend spare CPU threads and RAM |
+| `marketplace` | `PROVIDER_MARKETPLACE` | show this machine in the KMPLIFY marketplace; off by default. Lending alone does not list it; when listed, peers see its hardware, country and your alias if the link is proven. Also a switch in the web dashboard, the terminal view (Sharing) and the app window |
 | `workloads` | `PROVIDER_WORKLOADS` | container templates to host; empty = sessions off |
 | `approval-mode` | `PROVIDER_APPROVAL_MODE` | `auto` or `manual` admission |
 | `country` | `PROVIDER_COUNTRY` | ISO alpha-2, for consumers who want EU capacity |

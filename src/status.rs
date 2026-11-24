@@ -124,6 +124,7 @@ pub struct Baseline {
     pub max_vram_mb: Option<u64>,
     pub max_ram_mb: Option<u64>,
     pub max_disk_gb: Option<u64>,
+    pub marketplace: bool,
 }
 
 /// Work this node has actually delivered, since this process started.
@@ -243,6 +244,9 @@ pub struct Snapshot {
 
     pub share_inference: bool,
     pub share_cpu: bool,
+    /// Listed in the KMPLIFY marketplace (`marketplace`,
+    /// PROVIDER_MARKETPLACE), as this worker advertises it.
+    pub marketplace: bool,
     /// Live pause, independent of `share_inference`: the owner hit pause in
     /// the dashboard. Advertises no models until resumed.
     pub paused: bool,

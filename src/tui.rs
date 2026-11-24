@@ -1983,6 +1983,16 @@ impl App {
                 overridden: d.share_cpu.is_some(),
             },
             SharingRow::Toggle {
+                key: "marketplace",
+                label: views::MARKETPLACE_LABEL,
+                on: d.marketplace.unwrap_or(b.marketplace),
+                note: "lending alone does not list it; peers then see hardware, country \
+                       and your alias if the link is proven"
+                    .into(),
+                editable: true,
+                overridden: d.marketplace.is_some(),
+            },
+            SharingRow::Toggle {
                 key: "approval-mode",
                 label: "Require my approval for new peers",
                 on: d
@@ -2181,6 +2191,7 @@ impl App {
                 match *key {
                     "share-inference" => self.draft.share_inference = Some(value),
                     "share-cpu" => self.draft.share_cpu = Some(value),
+                    "marketplace" => self.draft.marketplace = Some(value),
                     "approval-mode" => {
                         self.draft.approval_mode =
                             Some(if value { "manual" } else { "auto" }.to_string())

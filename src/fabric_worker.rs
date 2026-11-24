@@ -350,6 +350,7 @@ fn publish_config(cfg: &WorkerConfig) {
         s.accelerator = cfg.accel().as_str().to_string();
         s.share_inference = cfg.share_inference;
         s.share_cpu = cfg.share_cpu;
+        s.marketplace = cfg.marketplace;
         s.approval_mode = cfg.approval_mode.clone();
         s.country = cfg.country.clone();
         s.workloads = cfg.workload_templates.clone();
@@ -8318,6 +8319,7 @@ pub async fn run(cfg: WorkerConfig, mut stop: watch::Receiver<bool>) {
                 max_vram_mb: b.max_shared_vram_mb,
                 max_ram_mb: b.max_shared_ram_mb,
                 max_disk_gb: b.max_shared_disk_gb,
+                marketplace: b.marketplace,
             };
         }
     });
