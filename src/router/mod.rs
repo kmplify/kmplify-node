@@ -638,14 +638,11 @@ mod running {
             serde_json::to_vec(&*r)
         };
         let Ok(bytes) = bytes else { return };
-        let path = state_path(node_dir);
-        let tmp = path.with_extension("json.tmp");
-        if crate::fabric_worker::write_private(&tmp, bytes)
-            .await
-            .is_ok()
-        {
-            let _ = tokio::fs::rename(&tmp, &path).await;
-        }
+        // Atomic through a temporary file of this write's own: a fixed
+        // `router.json.tmp` was renamed away under a second writer (two
+        // nodes started in one directory) before the first had restricted
+        // it, and icacls then failed on every publish.
+        let _ = crate::fabric_worker::write_private_state(&state_path(node_dir), bytes).await;
     }
 
     /// A shared state for the tests of the router's parts.

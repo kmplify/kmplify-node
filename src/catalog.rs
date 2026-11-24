@@ -279,12 +279,14 @@ pub fn load_held_version(node_dir: &Path) -> u64 {
 
 pub fn save_held_version(node_dir: &Path, version: u64) -> std::io::Result<()> {
     let path = state_path(node_dir);
-    let tmp = path.with_extension("tmp");
+    let tmp = crate::node_dir::unique_tmp(&path);
     std::fs::write(
         &tmp,
         serde_json::json!({"catalog_version": version}).to_string(),
     )?;
-    std::fs::rename(tmp, path)
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 #[cfg(test)]

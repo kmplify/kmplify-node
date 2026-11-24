@@ -124,6 +124,7 @@ pub struct Baseline {
     pub max_vram_mb: Option<u64>,
     pub max_ram_mb: Option<u64>,
     pub max_disk_gb: Option<u64>,
+    pub marketplace: bool,
 }
 
 /// Work this node has actually delivered, since this process started.
@@ -243,6 +244,9 @@ pub struct Snapshot {
 
     pub share_inference: bool,
     pub share_cpu: bool,
+    /// Listed in the KMPLIFY marketplace (`marketplace`,
+    /// PROVIDER_MARKETPLACE), as this worker advertises it.
+    pub marketplace: bool,
     /// Live pause, independent of `share_inference`: the owner hit pause in
     /// the dashboard. Advertises no models until resumed.
     pub paused: bool,
@@ -700,7 +704,6 @@ pub async fn publish_loop(
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
     let path = status_path(&node_dir);
-    let tmp = path.with_extension("json.tmp");
     let mut tick: u32 = 0;
     loop {
         sample_host(accel, tick.is_multiple_of(GPU_EVERY)).await;
@@ -710,7 +713,7 @@ pub async fn publish_loop(
         }
         tick = tick.wrapping_add(1);
         let snap = snapshot();
-        write_snapshot(&path, &tmp, &snap).await;
+        write_snapshot(&path, &snap).await;
         tokio::select! {
             _ = tokio::time::sleep(PUBLISH_INTERVAL) => {}
             _ = stop.changed() => {
@@ -718,7 +721,7 @@ pub async fn publish_loop(
                     let mut last = snapshot();
                     last.link = Link::Stopped;
                     last.link_detail = "stopped".into();
-                    write_snapshot(&path, &tmp, &last).await;
+                    write_snapshot(&path, &last).await;
                     return;
                 }
             }
@@ -726,7 +729,7 @@ pub async fn publish_loop(
     }
 }
 
-async fn write_snapshot(path: &Path, tmp: &Path, snap: &Snapshot) {
+async fn write_snapshot(path: &Path, snap: &Snapshot) {
     let mut snap = snap.clone();
     snap.view = crate::control::view_state();
     let all = logs();
@@ -738,10 +741,15 @@ async fn write_snapshot(path: &Path, tmp: &Path, snap: &Snapshot) {
     let Ok(bytes) = serde_json::to_vec(&snap) else {
         return;
     };
-    if write_owner_only(tmp, &bytes).await.is_err() {
-        return;
+    // A temporary file of this write's own: see node_dir::unique_tmp.
+    let tmp = crate::node_dir::unique_tmp(path);
+    let written = match write_owner_only(&tmp, &bytes).await {
+        Ok(()) => tokio::fs::rename(&tmp, path).await,
+        Err(e) => Err(e),
+    };
+    if written.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
     }
-    let _ = tokio::fs::rename(tmp, path).await;
 }
 
 /// Write the snapshot so other local accounts cannot read it.

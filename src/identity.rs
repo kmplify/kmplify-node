@@ -374,9 +374,11 @@ impl Identity {
     /// own permissions still govern who can get to it.
     pub fn publish(&self, node_dir: &Path) -> std::io::Result<()> {
         let target = path(node_dir);
-        let tmp = target.with_extension("json.tmp");
+        let tmp = crate::node_dir::unique_tmp(&target);
         std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(&tmp, &target)
+        std::fs::rename(&tmp, &target).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
     }
 
     /// Read a node's published identity, or `None` when none has been

@@ -448,6 +448,7 @@ impl RouterInput {
 pub const EDITABLE: &[&str] = &[
     "share-inference",
     "share-cpu",
+    "marketplace",
     "approval-mode",
     "country",
     "workloads",
@@ -459,6 +460,16 @@ pub const EDITABLE: &[&str] = &[
     "router-allow",
     "router-name",
 ];
+
+/// The marketplace listing, as every view names it.
+pub const MARKETPLACE_LABEL: &str = "Show this machine in the marketplace";
+
+/// What the listing means, shown under it in every view. Off by default:
+/// lending does not list a machine, only this switch does.
+pub const MARKETPLACE_HOW: &str = "Lending alone does not list this machine; \
+     peers then see hardware, country and your alias if the link is proven. \
+     Off by default. kmplify-node set marketplace=true (or PROVIDER_MARKETPLACE); \
+     applied live, the node re-advertises";
 
 fn env_value(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
@@ -536,6 +547,18 @@ pub fn model(src: &Source) -> Value {
             stored.share_cpu.is_some(),
             "bool",
             "PROVIDER_SHARE_CPU",
+        ),
+        with_how(
+            setting(
+                "marketplace",
+                MARKETPLACE_LABEL,
+                json!(snap.marketplace),
+                json!(b.marketplace),
+                stored.marketplace.is_some(),
+                "bool",
+                "PROVIDER_MARKETPLACE",
+            ),
+            MARKETPLACE_HOW,
         ),
         setting(
             "workloads",
@@ -1486,6 +1509,73 @@ mod tests {
         assert!(labels.contains(&"Starting view"));
         assert_eq!(m["view"]["switchable"], false);
         assert!(m["trust"]["readiness"].is_object());
+    }
+
+    /// The marketplace listing is switched from every view (web, terminal,
+    /// app window) like the other sharing settings: off until chosen, and a
+    /// change is saved and handed to the running node as a reload, which
+    /// re-advertises the hello with the new value.
+    #[test]
+    fn the_marketplace_listing_is_editable_off_by_default_and_applied_live() {
+        use crate::control::Command;
+        assert!(EDITABLE.contains(&"marketplace"));
+        let row_of = |snap: &Snapshot, stored: &Settings| {
+            let m = model(&Source {
+                snap,
+                stored,
+                engine: "",
+                logs: vec![],
+                rechecking: false,
+                view: crate::control::ViewState::default(),
+                router: RouterInput::default(),
+            });
+            m["settings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["key"] == "marketplace")
+                .cloned()
+                .expect("a marketplace row")
+        };
+        let row = row_of(&Snapshot::default(), &Settings::default());
+        assert_eq!(row["label"], MARKETPLACE_LABEL);
+        assert_eq!(row["kind"], "bool");
+        assert_eq!(row["editable"], true);
+        assert_eq!(row["value"], false, "off by default");
+        assert_eq!(row["var"], "PROVIDER_MARKETPLACE");
+        assert!(row["how"]
+            .as_str()
+            .unwrap()
+            .contains("Lending alone does not list"));
+
+        let dir = std::env::temp_dir().join(format!("kn-views-market-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let o = perform(
+            Target::Attached,
+            &dir,
+            &Act::Setting {
+                key: "marketplace".into(),
+                value: "true".into(),
+            },
+        );
+        assert!(o.ok, "{}", o.message);
+        let stored = Settings::load(&dir);
+        assert_eq!(stored.marketplace, Some(true));
+        let ctl = crate::control::control_dir(&dir);
+        let frames: Vec<Value> = std::fs::read_dir(&ctl)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .map(|e| serde_json::from_slice(&std::fs::read(e.path()).unwrap()).unwrap())
+            .collect();
+        assert_eq!(frames, vec![Command::Reload.as_frame()]);
+        // And the worker turns the stored choice into the hello's value.
+        let mut cfg = crate::fabric_worker::WorkerConfig::default();
+        assert!(!cfg.marketplace);
+        stored.apply(&mut cfg);
+        assert!(cfg.marketplace);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Every action of the contract, from a view attached to a node in
