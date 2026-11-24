@@ -1548,6 +1548,17 @@ impl App {
                 });
             }
             ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Remote settings").family(theme::semibold()));
+                let mut on = r["remote_settings"].as_bool() == Some(true);
+                if ui.checkbox(&mut on, views::REMOTE_SETTINGS_LABEL).changed() {
+                    chosen = Some(Act::Setting {
+                        key: "router-remote-settings".into(),
+                        value: on.to_string(),
+                    });
+                }
+            });
+            muted(ui, views::REMOTE_SETTINGS_HOW);
+            ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("Cluster key").family(theme::semibold()));
                 let draft = self.drafts.entry("router-join".into()).or_default();
                 ui.add(

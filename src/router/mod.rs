@@ -43,6 +43,8 @@ pub mod pairing;
 #[cfg(feature = "router")]
 mod peers;
 #[cfg(feature = "router")]
+pub mod remote;
+#[cfg(feature = "router")]
 pub mod tls;
 
 use std::collections::VecDeque;
@@ -93,6 +95,17 @@ pub struct NodeReport {
     pub jobs_active: u64,
     pub jobs_done: u64,
     pub sessions: usize,
+    /// This node lets the router cluster change its allowlisted settings
+    /// (`router-remote-settings`, see `router::remote`). Absent in reports
+    /// of nodes before that request existed, which reads as off.
+    pub remote_settings: bool,
+    /// Listed in the marketplace, as the worker runs now.
+    pub marketplace: bool,
+    /// The ceilings as the worker runs now; `None` = no explicit ceiling.
+    pub max_cpus: Option<f64>,
+    pub max_vram_mb: Option<u64>,
+    pub max_ram_mb: Option<u64>,
+    pub max_disk_gb: Option<u64>,
 }
 
 impl NodeReport {
@@ -119,6 +132,12 @@ impl NodeReport {
             jobs_active: snap.jobs.active,
             jobs_done: snap.jobs.done,
             sessions: snap.sessions.len(),
+            remote_settings: false,
+            marketplace: snap.marketplace,
+            max_cpus: snap.max_cpus,
+            max_vram_mb: snap.max_vram_mb,
+            max_ram_mb: snap.max_ram_mb,
+            max_disk_gb: snap.max_disk_gb,
         }
     }
 
@@ -295,6 +314,23 @@ pub fn read_published(node_dir: &Path) -> Option<RouterState> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Does this node let the router cluster change its allowlisted settings
+/// (`router::remote`)? The stored choice, then
+/// `KMPLIFY_ROUTER_REMOTE_SETTINGS`, then off. Both are local to the
+/// machine; no remote request can change either.
+pub fn remote_settings_allowed(stored: &crate::settings::Settings) -> bool {
+    stored.router_remote_settings.unwrap_or_else(|| {
+        matches!(
+            env("KMPLIFY_ROUTER_REMOTE_SETTINGS")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 /// How the router is configured: the stored setting first, then the
 /// environment, then off. Settings and environment are the same pair every
 /// other node setting uses (`kmplify-node set` writes the first).
@@ -415,7 +451,7 @@ impl Config {
 }
 
 #[cfg(feature = "router")]
-pub use running::{run, run_with};
+pub use running::{run, run_with, run_with_host};
 
 #[cfg(feature = "router")]
 mod running {
@@ -468,9 +504,27 @@ mod running {
     /// (`router.json`) still live in `node_dir`; neither holds a secret.
     pub async fn run_with(
         node_dir: PathBuf,
-        mut stop: tokio::sync::watch::Receiver<bool>,
+        stop: tokio::sync::watch::Receiver<bool>,
         keys: Arc<dyn KeyStore>,
     ) {
+        let host = Arc::new(remote::NodeHost::new(&node_dir, keys.clone()));
+        run_with_host(node_dir, stop, keys, host).await
+    }
+
+    /// [`run_with`], with remote settings (`PUT /v2/node-settings`) applied
+    /// through `host` instead of this node directory's settings file: for
+    /// an application whose sharing settings live elsewhere
+    /// (kmplify-desktop). The opt-in is the host's to read.
+    pub async fn run_with_host(
+        node_dir: PathBuf,
+        mut stop: tokio::sync::watch::Receiver<bool>,
+        keys: Arc<dyn KeyStore>,
+        host: Arc<dyn remote::RemoteHost>,
+    ) {
+        let remote_ctx = Arc::new(endpoint::RemoteCtx {
+            host,
+            node_dir: node_dir.clone(),
+        });
         let shared: Shared = Arc::new(Mutex::new(RouterState {
             schema: 2,
             ..Default::default()
@@ -520,9 +574,15 @@ mod running {
                 if let Some(a) = active.take() {
                     a.stop();
                 }
-                active = Some(start(&shared, config.clone(), key.clone()));
+                active = Some(start(&shared, config.clone(), key.clone(), &remote_ctx));
             }
-            sample(&shared, &config, key.as_ref(), &snap);
+            sample(
+                &shared,
+                &config,
+                key.as_ref(),
+                &snap,
+                remote_ctx.host.allowed(),
+            );
             publish(&node_dir, &shared).await;
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -539,7 +599,12 @@ mod running {
         let _ = std::fs::remove_file(state_path(&node_dir));
     }
 
-    fn start(shared: &Shared, config: Config, key: Option<auth::ClusterKey>) -> Active {
+    fn start(
+        shared: &Shared,
+        config: Config,
+        key: Option<auth::ClusterKey>,
+        remote_ctx: &Arc<endpoint::RemoteCtx>,
+    ) -> Active {
         // Remembered, so a changed key file restarts the surfaces.
         let started_with = key.clone();
         let mut tasks = Vec::new();
@@ -587,6 +652,7 @@ mod running {
                 config.clone(),
                 key.clone(),
                 identity.clone(),
+                remote_ctx.clone(),
             )));
             if config.mode == Mode::Lan {
                 match discovery::Discovery::start(shared.clone(), &config, &key) {
@@ -618,6 +684,7 @@ mod running {
         config: &Config,
         key: Option<&auth::ClusterKey>,
         snap: &crate::status::Snapshot,
+        remote_settings: bool,
     ) {
         let mut r = lock(shared);
         r.key_fingerprint = key.map(|k| k.fingerprint()).unwrap_or_default();
@@ -626,7 +693,8 @@ mod running {
             r.local_meters = Meters::default();
             return;
         }
-        let me = NodeReport::local(snap, &config.name);
+        let mut me = NodeReport::local(snap, &config.name);
+        me.remote_settings = remote_settings;
         r.local_meters.sample(&me);
         r.local = Some(me);
     }
