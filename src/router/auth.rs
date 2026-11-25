@@ -33,7 +33,10 @@ pub use super::key::{ClusterKey, KEY_FILE};
 
 type HmacSha256 = Hmac<sha2::Sha256>;
 
-/// Request header: `v1.<unix ms>.<nonce hex>.<signature hex>`.
+/// Request header: `v1.<unix ms>.<nonce hex>.<signature hex>`, or for a
+/// request with a body (the settings write) `v2.` and the same parts, the
+/// signature then also covering the SHA-256 of the body
+/// ([`sign_request_with_body`]).
 pub const AUTH_HEADER: &str = "x-kmplify-router-auth";
 /// Response header: the signature over the request's nonce and the body.
 pub const SIG_HEADER: &str = "x-kmplify-router-sig";
@@ -71,6 +74,35 @@ pub async fn save_key(node_dir: &Path, key: &ClusterKey) -> std::io::Result<()> 
 /// The bytes a request signature covers.
 fn request_preimage(method: &str, path: &str, ts_ms: u64, nonce: &str) -> String {
     format!("{DOMAIN}\nreq\n{method}\n{path}\n{ts_ms}\n{nonce}")
+}
+
+/// The bytes a body-bound (`v2.`) request signature covers: the v1 fields,
+/// a different label, and the SHA-256 of the body, so a captured request
+/// cannot carry another body.
+fn request_preimage_with_body(
+    method: &str,
+    path: &str,
+    ts_ms: u64,
+    nonce: &str,
+    body: &[u8],
+) -> String {
+    use sha2::Digest;
+    let digest = hex(&sha2::Sha256::digest(body));
+    format!("{DOMAIN}\nreq-body\n{method}\n{path}\n{ts_ms}\n{nonce}\n{digest}")
+}
+
+/// The header value for one request with a body: `v2.<ts>.<nonce>.<sig>`.
+pub fn sign_request_with_body(
+    key: &ClusterKey,
+    method: &str,
+    path: &str,
+    ts_ms: u64,
+    nonce: &str,
+    body: &[u8],
+) -> String {
+    let mut m = mac(key);
+    m.update(request_preimage_with_body(method, path, ts_ms, nonce, body).as_bytes());
+    format!("v2.{ts_ms}.{nonce}.{}", hex(&m.finalize().into_bytes()))
 }
 
 /// The header value for one request.
@@ -140,9 +172,39 @@ impl Verifier {
         path: &str,
         now_ms: u64,
     ) -> Result<String, Denied> {
+        self.check(key, header, "v1", now_ms, |ts, nonce| {
+            request_preimage(method, path, ts, nonce)
+        })
+    }
+
+    /// Verify a body-bound (`v2.`) header over `method path` and `body`.
+    /// Only this form is accepted for a request that changes something: a
+    /// v1 header does not cover the body.
+    pub fn verify_with_body(
+        &mut self,
+        key: &ClusterKey,
+        header: Option<&str>,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        now_ms: u64,
+    ) -> Result<String, Denied> {
+        self.check(key, header, "v2", now_ms, |ts, nonce| {
+            request_preimage_with_body(method, path, ts, nonce, body)
+        })
+    }
+
+    fn check(
+        &mut self,
+        key: &ClusterKey,
+        header: Option<&str>,
+        version: &str,
+        now_ms: u64,
+        preimage: impl FnOnce(u64, &str) -> String,
+    ) -> Result<String, Denied> {
         let header = header.ok_or(Denied::Missing)?;
         let mut parts = header.trim().split('.');
-        let (Some("v1"), Some(ts), Some(nonce), Some(sig), None) = (
+        let (Some(v), Some(ts), Some(nonce), Some(sig), None) = (
             parts.next(),
             parts.next(),
             parts.next(),
@@ -151,6 +213,9 @@ impl Verifier {
         ) else {
             return Err(Denied::Malformed);
         };
+        if v != version {
+            return Err(Denied::Malformed);
+        }
         let ts: u64 = ts.parse().map_err(|_| Denied::Malformed)?;
         if nonce.len() != 32 || !nonce.bytes().all(|c| c.is_ascii_hexdigit()) {
             return Err(Denied::Malformed);
@@ -164,7 +229,7 @@ impl Verifier {
         // The signature before the replay cache: only a request that proves
         // the key may occupy a slot in it.
         let mut m = mac(key);
-        m.update(request_preimage(method, path, ts, nonce).as_bytes());
+        m.update(preimage(ts, nonce).as_bytes());
         m.verify_slice(&sig).map_err(|_| Denied::BadSignature)?;
         self.seen.retain(|_, t| t.abs_diff(now_ms) <= MAX_SKEW_MS);
         if self.seen.contains_key(nonce) {
@@ -331,6 +396,71 @@ mod tests {
         let h = sign_request(&k, "GET", "/", later, &n);
         assert!(v.verify(&k, Some(&h), "GET", "/", later).is_ok());
         assert_eq!(v.seen.len(), 1);
+    }
+
+    /// Golden value shared with kmplify-rag-system's client
+    /// (tests/test_lan_router_admin.py), so the two never drift apart.
+    #[test]
+    fn the_body_bound_signature_matches_the_golden_value() {
+        assert_eq!(
+            sign_request_with_body(
+                &key(7),
+                "PUT",
+                "/v2/node-settings",
+                1_800_000_000_000,
+                "0123456789abcdef0123456789abcdef",
+                br#"{"name":"studio"}"#,
+            ),
+            "v2.1800000000000.0123456789abcdef0123456789abcdef.\
+             5582be7da0c48ae5164b91fcfe20fa8f8f8d0f619e59b7d28a5ac51fd11c9a0b"
+        );
+    }
+
+    #[test]
+    fn a_body_bound_request_covers_its_body_and_is_accepted_once() {
+        let k = key(7);
+        let mut v = Verifier::default();
+        let p = "/v2/node-settings";
+        let body = br#"{"name":"studio"}"#;
+        let nonce = new_nonce();
+        let h = sign_request_with_body(&k, "PUT", p, NOW, &nonce, body);
+        assert!(h.starts_with("v2."));
+        // Another body under the same signature: refused.
+        assert_eq!(
+            v.verify_with_body(&k, Some(&h), "PUT", p, br#"{"name":"evil"}"#, NOW),
+            Err(Denied::BadSignature)
+        );
+        assert_eq!(
+            v.verify_with_body(&k, Some(&h), "PUT", p, body, NOW),
+            Ok(nonce)
+        );
+        assert_eq!(
+            v.verify_with_body(&k, Some(&h), "PUT", p, body, NOW),
+            Err(Denied::Replay)
+        );
+        // A v1 header is not accepted where the body must be covered, and a
+        // v2 header is not accepted where v1 is expected.
+        let v1 = sign_request(&k, "PUT", p, NOW, &new_nonce());
+        assert_eq!(
+            v.verify_with_body(&k, Some(&v1), "PUT", p, body, NOW),
+            Err(Denied::Malformed)
+        );
+        let v2 = sign_request_with_body(&k, "GET", "/v1/node-info", NOW, &new_nonce(), b"");
+        assert_eq!(
+            v.verify(&k, Some(&v2), "GET", "/v1/node-info", NOW),
+            Err(Denied::Malformed)
+        );
+        // Another key, another method.
+        let h = sign_request_with_body(&key(8), "PUT", p, NOW, &new_nonce(), body);
+        assert_eq!(
+            v.verify_with_body(&k, Some(&h), "PUT", p, body, NOW),
+            Err(Denied::BadSignature)
+        );
+        let h = sign_request_with_body(&k, "POST", p, NOW, &new_nonce(), body);
+        assert_eq!(
+            v.verify_with_body(&k, Some(&h), "PUT", p, body, NOW),
+            Err(Denied::BadSignature)
+        );
     }
 
     #[test]

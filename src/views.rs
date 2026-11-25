@@ -339,8 +339,22 @@ pub const ACTIONS: &[Action] = &[
 ];
 
 /// The router settings every view edits in its `router` section (mode,
-/// allowlist, name), through the same [`Act::Setting`] as the rest.
-pub const ROUTER_SETTINGS: &[&str] = &["router", "router-allow", "router-name"];
+/// allowlist, name, and whether the router cluster may change this node's
+/// allowlisted settings), through the same [`Act::Setting`] as the rest.
+pub const ROUTER_SETTINGS: &[&str] = &[
+    "router",
+    "router-allow",
+    "router-name",
+    "router-remote-settings",
+];
+
+/// What every view says next to the remote settings switch.
+pub const REMOTE_SETTINGS_LABEL: &str = "Allow remote settings from the router cluster";
+pub const REMOTE_SETTINGS_HOW: &str = "Off by default. When on, a holder of this cluster's key \
+     (for example the installation's web app) may change, over mutual TLS only: the router \
+     name, pause and resume, the marketplace listing and the four ceilings. Never the mode, \
+     the allowlist, the key or credentials. Every change is in the log. Changed only on \
+     this machine";
 
 /// The modes a view offers for the `router` setting, in this order.
 pub const ROUTER_MODES: &[&str] = &["off", "local", "lan"];
@@ -459,6 +473,7 @@ pub const EDITABLE: &[&str] = &[
     "router",
     "router-allow",
     "router-name",
+    "router-remote-settings",
 ];
 
 /// The marketplace listing, as every view names it.
@@ -730,6 +745,18 @@ pub fn model(src: &Source) -> Value {
         ),
         with_how(
             setting(
+                "router-remote-settings",
+                REMOTE_SETTINGS_LABEL,
+                json!(crate::router::remote_settings_allowed(stored)),
+                Value::Null,
+                stored.router_remote_settings.is_some(),
+                "bool",
+                "KMPLIFY_ROUTER_REMOTE_SETTINGS",
+            ),
+            "kmplify-node set router-remote-settings=true (off by default; only on this machine)",
+        ),
+        with_how(
+            setting(
                 "ui",
                 "Starting view",
                 json!(start_view_text(stored, &src.view)),
@@ -877,6 +904,7 @@ pub fn router_model(input: &RouterInput, stored: &Settings, node_id: &str) -> Va
                 "cert_fingerprint": r.cert_fingerprint,
                 "pair_port": pair_port(),
                 "pairing": pairing_model(),
+                "remote_settings": crate::router::remote_settings_allowed(stored),
             })
         }
         None => json!({
@@ -899,6 +927,7 @@ pub fn router_model(input: &RouterInput, stored: &Settings, node_id: &str) -> Va
             "cert_fingerprint": "",
             "pair_port": pair_port(),
             "pairing": pairing_model(),
+            "remote_settings": crate::router::remote_settings_allowed(stored),
         }),
     }
 }
@@ -1787,6 +1816,16 @@ mod tests {
         assert!(set("router", "lan").ok);
         assert!(set("router-allow", "192.168.1.0/24, 10.0.0.5").ok);
         assert!(set("router-name", "studio").ok);
+        // The remote settings switch: off by default, changed here (a
+        // local view), shown in the router model.
+        if std::env::var_os("KMPLIFY_ROUTER_REMOTE_SETTINGS").is_none() {
+            let m = router_model(&RouterInput::read(&dir), &Settings::load(&dir), "abc");
+            assert_eq!(m["remote_settings"], false);
+        }
+        assert!(set("router-remote-settings", "true").ok);
+        assert_eq!(set("router-remote-settings", "maybe").status, 400);
+        let m = router_model(&RouterInput::read(&dir), &Settings::load(&dir), "abc");
+        assert_eq!(m["remote_settings"], true);
         let s = Settings::load(&dir);
         assert_eq!(s.router.as_deref(), Some("lan"));
         assert_eq!(s.router_name.as_deref(), Some("studio"));

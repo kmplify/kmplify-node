@@ -155,6 +155,13 @@ pub struct Settings {
     /// the computer's name, which often carries a person's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub router_name: Option<String>,
+    /// Let the router cluster change an allowlisted few settings of this
+    /// node over protocol v2 (`KMPLIFY_ROUTER_REMOTE_SETTINGS`): the name,
+    /// pause and resume, the marketplace listing and the four ceilings. Off
+    /// unless switched on here, on this machine; no remote request can
+    /// switch it (see `router::remote`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub router_remote_settings: Option<bool>,
 }
 
 /// The settings a caller may address by name, in `kmplify-node set` and in
@@ -193,6 +200,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("router", "KMPLIFY_ROUTER"),
     ("router-allow", "KMPLIFY_ROUTER_ALLOW"),
     ("router-name", "KMPLIFY_ROUTER_NAME"),
+    ("router-remote-settings", "KMPLIFY_ROUTER_REMOTE_SETTINGS"),
 ];
 
 pub fn path(node_dir: &Path) -> PathBuf {
@@ -568,6 +576,7 @@ impl Settings {
                 self.router_allow = Some(entries);
             }
             "router-name" => self.router_name = Some(crate::router::policy::check_name(value)?),
+            "router-remote-settings" => self.router_remote_settings = Some(parse_bool(key, value)?),
             _ => {
                 return Err(format!(
                     "unknown setting {key:?} (one of: {})",
@@ -609,6 +618,7 @@ impl Settings {
             "router" => self.router = None,
             "router-allow" => self.router_allow = None,
             "router-name" => self.router_name = None,
+            "router-remote-settings" => self.router_remote_settings = None,
             _ => {
                 return Err(format!(
                     "unknown setting {key:?} (one of: {})",
@@ -688,6 +698,10 @@ impl Settings {
             self.router_allow.as_ref().map(|v| v.join(",")),
         );
         push("router-name", self.router_name.clone());
+        push(
+            "router-remote-settings",
+            self.router_remote_settings.map(|v| v.to_string()),
+        );
         out
     }
 }
