@@ -75,6 +75,7 @@ same things through one action layer (`views::perform`):
 | Mode off, local, lan | mode buttons | `M` cycles | mode buttons |
 | Allowlist | field, Save | `A` | field, Save |
 | Name | field, Save | `N` | field, Save |
+| Remote settings from the cluster | checkbox | `E` | checkbox |
 | Pair a device | button: PIN, countdown, address | `P` | button: PIN, countdown, address |
 | Close pairing | button | `P` again | button |
 | Join with PIN | address and PIN fields | `I` (address, then PIN) | address and PIN fields |
@@ -163,6 +164,58 @@ announces `v=1` (or nothing) in plain. The `peers` entries in `router.json`
 carry `proto` and `secure` (its last report came over TLS); the router state
 carries `cert_fingerprint` (SHA-256 of this start's certificate).
 
+### Remote settings (protocol v2)
+
+A holder of the cluster key (another member, or the installation's web
+app through kmplify-rag-system) may change a few settings of a node, if
+that node's operator allows it **on the machine**:
+
+```
+kmplify-node set router-remote-settings=true   # off by default
+```
+
+The same switch is in the LAN router section of the web dashboard, the
+terminal view (`E`) and the app window, and in kmplify-desktop's Router
+page. No remote request can turn it on.
+
+| Field | Setting | Values |
+|---|---|---|
+| `name` | `router-name` | 1 to 40 letters, digits, `-` or `_` |
+| `paused` | pause or resume sharing | `true` / `false` |
+| `marketplace` | `marketplace` | `true` / `false` |
+| `max_cpus` | `max-cpus` | whole number, 1 to 1024 |
+| `max_vram_mb` | `max-vram-mb` | 1 to 4,194,304 |
+| `max_ram_mb` | `max-ram-mb` | 1 to 16,777,216 |
+| `max_disk_gb` | `max-disk-gb` | 1 to 1,000,000 |
+
+**Never** settable remotely: the router mode and the allowlist (a remote
+request must not widen what the network can reach), the cluster key,
+credentials, the engine and gateway addresses, and the opt-in itself. A
+ceiling cannot be cleared remotely either: clearing hands it back to the
+environment, which may mean no ceiling.
+
+The request (`src/router/remote.rs`): `PUT /v2/node-settings` with a JSON
+body, inside the mutual TLS session only (plain v1 is refused), signed with
+the body-bound `v2.` header: HMAC-SHA256 over `kmplify-router-v1`,
+`req-body`, method, path, time, nonce and the SHA-256 of the body, so a
+captured request carries no other body; the 30 second window and the
+one-time nonce apply as for every request. The whole body is checked
+before anything is written (an unknown or forbidden field, or a value out
+of range, refuses all of it); the changes then go through the same action
+layer as a local change (`views::perform_with`: the settings file and the
+reload, or pause and resume), pause or resume last.
+
+**Audit.** Every authenticated request, applied or refused, leaves one line
+in the node's log (the Logs view), in the router log, and in
+`router-audit.log` in the node directory (owner-only, UTC time, rotated at
+1 MB): the cluster key's fingerprint, the caller's `request_id` (or the
+start of the nonce), the peer address, and what was applied or why it was
+refused. Never the key, never a person's name.
+
+An embedding application applies the changes its own way through
+`router::run_with_host` and a `router::remote::RemoteHost` (kmplify-desktop
+writes its sharing settings, not `settings.json`).
+
 ### Embedding (kmplify-desktop)
 
 An application that embeds the router runs `router::run_with` and acts with
@@ -212,6 +265,7 @@ a node join one cluster with the same key.
    endpoint that sends each request to the best placed node) between members
    over the mutual TLS above, and per-GPU telemetry in the report.
 2. Remote engine control for paired nodes.
-3. The router as an installation admin view in the KMPLIFY web app.
+3. The router as an installation admin view in the KMPLIFY web app: built
+   (read, and the remote settings above).
 
 The design adapts NVIDIA's Personal AI Router (Apache-2.0); see NOTICE.

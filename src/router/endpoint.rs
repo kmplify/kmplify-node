@@ -14,6 +14,10 @@
 //!
 //! One request per connection, small bounded reads and a deadline: the
 //! dashboard's HTTP reader, which already holds those limits.
+//!
+//! The one request that changes something, `PUT /v2/node-settings`
+//! ([`super::remote`]), is answered inside mutual TLS only, with a
+//! body-bound signature, and only while the node's operator allows it.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,8 +29,16 @@ use super::policy::{self, Mode};
 use super::{lock, Config, Shared};
 use crate::dashboard::http::{self, Request, Response};
 
-/// The one path this surface answers.
+/// The path of the node report.
 pub const NODE_INFO_PATH: &str = "/v1/node-info";
+pub use super::remote::SETTINGS_PATH;
+
+/// What the settings write needs: who applies it, and where the audit file
+/// goes.
+pub struct RemoteCtx {
+    pub host: Arc<dyn super::remote::RemoteHost>,
+    pub node_dir: std::path::PathBuf,
+}
 /// Connections handled at once; more are closed unanswered.
 const MAX_CONNECTIONS: usize = 16;
 
@@ -63,17 +75,120 @@ pub fn answer(
     resp.with_header(auth::SIG_HEADER, sig)
 }
 
+/// Answer `PUT /v2/node-settings`. `secure` is true inside mutual TLS.
+/// Returns the answer and the audit line (none for a stranger).
+pub fn answer_settings(
+    req: &Request,
+    key: &ClusterKey,
+    verifier: &std::sync::Mutex<Verifier>,
+    ctx: &RemoteCtx,
+    secure: bool,
+    peer: &str,
+    now_ms: u64,
+) -> (Response, Option<String>) {
+    if req.method != super::remote::SETTINGS_METHOD {
+        return (Response::text(405, "PUT only"), None);
+    }
+    let verified = verifier
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .verify_with_body(
+            key,
+            req.header(auth::AUTH_HEADER),
+            &req.method,
+            &req.path,
+            &req.body,
+            now_ms,
+        );
+    let nonce = match verified {
+        Ok(n) => n,
+        Err(_) => {
+            return (
+                Response::text(401, "a signature with this cluster's key is required"),
+                None,
+            )
+        }
+    };
+    let mut caller = super::remote::Caller {
+        fingerprint: key.fingerprint(),
+        request_id: String::new(),
+        nonce: nonce.clone(),
+        peer: peer.to_string(),
+    };
+    let (status, body, line) = if !secure {
+        (
+            403,
+            json!({
+                "ok": false,
+                "error": "tls_required",
+                "message": "settings are changed over protocol v2 (mutual TLS) only",
+            }),
+            format!(
+                "router cluster (key {}, from {peer}): refused a settings write in plain v1",
+                caller.fingerprint
+            ),
+        )
+    } else {
+        super::remote::handle(&req.body, ctx.host.as_ref(), &mut caller)
+    };
+    let resp = Response::json(status, &body);
+    let sig = auth::sign_response(key, &nonce, &resp.body);
+    (resp.with_header(auth::SIG_HEADER, sig), Some(line))
+}
+
+/// Record a settings audit line in the node's log (the Logs view), the
+/// router log and `router-audit.log`.
+fn audit(shared: &Shared, node_dir: &std::path::Path, line: &str) {
+    let line = format!("remote settings: {line}");
+    crate::status::push_log(line.clone());
+    lock(shared).push_log(line.clone());
+    super::remote::append_audit(node_dir, &line);
+}
+
 /// Read one request from `stream`, answer it, write the answer.
 async fn exchange<S>(
     stream: &mut S,
     shared: &Shared,
-    verifier: &std::sync::Mutex<Verifier>,
-    key: &ClusterKey,
+    verifier: &Arc<std::sync::Mutex<Verifier>>,
+    key: &Arc<ClusterKey>,
     peer: SocketAddr,
+    ctx: &Arc<RemoteCtx>,
+    secure: bool,
 ) where
     S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin,
 {
     let resp = match tokio::time::timeout(http::READ_DEADLINE, http::read_request(stream)).await {
+        Ok(Ok(req)) if req.path == SETTINGS_PATH => {
+            // The action layer writes files and may wait on the embedding
+            // application: off the async runtime.
+            let (key, verifier, ctx2, shared2) =
+                (key.clone(), verifier.clone(), ctx.clone(), shared.clone());
+            let ip = peer.ip().to_string();
+            let done = tokio::task::spawn_blocking(move || {
+                let (resp, line) = answer_settings(
+                    &req,
+                    &key,
+                    &verifier,
+                    &ctx2,
+                    secure,
+                    &ip,
+                    crate::status::now_ms(),
+                );
+                match line {
+                    Some(l) => audit(&shared2, &ctx2.node_dir, &l),
+                    None if resp.status == 401 => lock(&shared2).push_log(format!(
+                        "refused an unsigned or foreign settings request from {ip}"
+                    )),
+                    None => {}
+                }
+                resp
+            })
+            .await;
+            match done {
+                Ok(r) => r,
+                Err(_) => Response::text(500, "internal error"),
+            }
+        }
         Ok(Ok(req)) => {
             let report = lock(shared).local.clone();
             let mut v = verifier.lock().unwrap_or_else(|p| p.into_inner());
@@ -105,6 +220,7 @@ pub async fn serve(
     config: Config,
     key: ClusterKey,
     identity: Option<super::tls::BoundIdentity>,
+    ctx: Arc<RemoteCtx>,
 ) {
     let Some(addr) = policy::bind_addr(config.mode, config.port) else {
         return;
@@ -163,11 +279,12 @@ pub async fn serve(
         let Ok(permit) = limit.clone().try_acquire_owned() else {
             continue;
         };
-        let (shared, verifier, key, acceptor) = (
+        let (shared, verifier, key, acceptor, ctx) = (
             shared.clone(),
             verifier.clone(),
             key.clone(),
             acceptor.clone(),
+            ctx.clone(),
         );
         tokio::spawn(async move {
             let _permit = permit;
@@ -179,12 +296,14 @@ pub async fn serve(
             if first[0] == super::tls::TLS_HANDSHAKE_BYTE {
                 let Some(acceptor) = acceptor else { return };
                 match tokio::time::timeout(http::READ_DEADLINE, acceptor.accept(stream)).await {
-                    Ok(Ok(mut tls)) => exchange(&mut tls, &shared, &verifier, &key, peer).await,
+                    Ok(Ok(mut tls)) => {
+                        exchange(&mut tls, &shared, &verifier, &key, peer, &ctx, true).await
+                    }
                     Ok(Err(_)) => note_tls_refusal(&shared, peer),
                     Err(_) => {}
                 }
             } else {
-                exchange(&mut stream, &shared, &verifier, &key, peer).await;
+                exchange(&mut stream, &shared, &verifier, &key, peer, &ctx, false).await;
             }
         });
     }
@@ -384,7 +503,13 @@ mod tests {
             name: "studio".into(),
             problem: String::new(),
         };
-        let task = tokio::spawn(serve(shared.clone(), config, key.clone(), None));
+        let task = tokio::spawn(serve(
+            shared.clone(),
+            config,
+            key.clone(),
+            None,
+            recorder_ctx(false),
+        ));
         let mut listening = String::new();
         for _ in 0..100 {
             listening = lock(&shared).listening.clone();
@@ -419,6 +544,180 @@ mod tests {
         task.abort();
     }
 
+    struct Recorder {
+        allowed: bool,
+        done: std::sync::Mutex<Vec<crate::views::Act>>,
+    }
+
+    impl super::super::remote::RemoteHost for Recorder {
+        fn allowed(&self) -> bool {
+            self.allowed
+        }
+        fn perform(&self, act: &crate::views::Act) -> crate::views::Outcome {
+            self.done.lock().unwrap().push(act.clone());
+            crate::views::Outcome {
+                status: 200,
+                ok: true,
+                message: "ok".into(),
+            }
+        }
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("kn-endpoint-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn recorder_ctx(allowed: bool) -> Arc<RemoteCtx> {
+        Arc::new(RemoteCtx {
+            host: Arc::new(Recorder {
+                allowed,
+                done: std::sync::Mutex::new(Vec::new()),
+            }),
+            node_dir: temp_dir(&format!("rec-{allowed}")),
+        })
+    }
+
+    fn put(body: &str, header: Option<String>) -> Request {
+        Request {
+            method: "PUT".into(),
+            path: SETTINGS_PATH.into(),
+            query: Vec::new(),
+            headers: header
+                .map(|v| vec![(auth::AUTH_HEADER.to_string(), v)])
+                .unwrap_or_default(),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    fn signed_put(key: &ClusterKey, body: &str) -> (Request, String) {
+        let nonce = auth::new_nonce();
+        let h =
+            auth::sign_request_with_body(key, "PUT", SETTINGS_PATH, NOW, &nonce, body.as_bytes());
+        (put(body, Some(h)), nonce)
+    }
+
+    /// The settings write, request by request: a signed write over TLS is
+    /// applied and answered with a signature; a replay, another key, a v1
+    /// header, a body swapped under a signature, plain v1 transport and the
+    /// opt-in off are all refused, and nothing reaches the host.
+    #[test]
+    fn the_settings_write_is_v2_signed_and_opt_in_only() {
+        let key = ClusterKey::generate();
+        let v = std::sync::Mutex::new(Verifier::default());
+        let rec = Arc::new(Recorder {
+            allowed: true,
+            done: std::sync::Mutex::new(Vec::new()),
+        });
+        let ctx = RemoteCtx {
+            host: rec.clone(),
+            node_dir: temp_dir("write"),
+        };
+        let body = r#"{"request_id":"t-1","name":"studio"}"#;
+        let (req, nonce) = signed_put(&key, body);
+        let (resp, line) = answer_settings(&req, &key, &v, &ctx, true, "127.0.0.1", NOW);
+        assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+        assert!(auth::verify_response(
+            &key,
+            &nonce,
+            &resp.body,
+            sig(&resp).unwrap()
+        ));
+        let line = line.unwrap();
+        assert!(
+            line.contains(&key.fingerprint()) && line.contains("request t-1"),
+            "{line}"
+        );
+        assert_eq!(rec.done.lock().unwrap().len(), 1);
+
+        // The same request again: a replay.
+        let (resp, line) = answer_settings(&req, &key, &v, &ctx, true, "127.0.0.1", NOW);
+        assert_eq!((resp.status, line), (401, None));
+        // Another cluster's key; unsigned; a v1 header.
+        let (req, _) = signed_put(&ClusterKey::generate(), body);
+        assert_eq!(
+            answer_settings(&req, &key, &v, &ctx, true, "x", NOW)
+                .0
+                .status,
+            401
+        );
+        assert_eq!(
+            answer_settings(&put(body, None), &key, &v, &ctx, true, "x", NOW)
+                .0
+                .status,
+            401
+        );
+        let v1 = auth::sign_request(&key, "PUT", SETTINGS_PATH, NOW, &auth::new_nonce());
+        assert_eq!(
+            answer_settings(&put(body, Some(v1)), &key, &v, &ctx, true, "x", NOW)
+                .0
+                .status,
+            401
+        );
+        // A body swapped under a valid signature.
+        let (mut req, _) = signed_put(&key, body);
+        req.body = br#"{"name":"other"}"#.to_vec();
+        assert_eq!(
+            answer_settings(&req, &key, &v, &ctx, true, "x", NOW)
+                .0
+                .status,
+            401
+        );
+        // Too old.
+        let h = auth::sign_request_with_body(
+            &key,
+            "PUT",
+            SETTINGS_PATH,
+            NOW - 60_000,
+            &auth::new_nonce(),
+            body.as_bytes(),
+        );
+        assert_eq!(
+            answer_settings(&put(body, Some(h)), &key, &v, &ctx, true, "x", NOW)
+                .0
+                .status,
+            401
+        );
+        // Valid, but in plain v1: refused, signed, audited.
+        let (req, _) = signed_put(&key, body);
+        let (resp, line) = answer_settings(&req, &key, &v, &ctx, false, "127.0.0.1", NOW);
+        assert_eq!(resp.status, 403);
+        assert!(String::from_utf8_lossy(&resp.body).contains("tls_required"));
+        assert!(line.unwrap().contains("plain v1"));
+        // A refused field.
+        let (req, _) = signed_put(&key, r#"{"router":"lan"}"#);
+        let (resp, line) = answer_settings(&req, &key, &v, &ctx, true, "127.0.0.1", NOW);
+        assert_eq!(resp.status, 400);
+        assert!(String::from_utf8_lossy(&resp.body).contains("field_not_allowed"));
+        assert!(line.unwrap().contains("refused field router"));
+        assert_eq!(
+            rec.done.lock().unwrap().len(),
+            1,
+            "nothing more was applied"
+        );
+
+        // The opt-in off.
+        let off = RemoteCtx {
+            host: Arc::new(Recorder {
+                allowed: false,
+                done: std::sync::Mutex::new(Vec::new()),
+            }),
+            node_dir: temp_dir("off"),
+        };
+        let (req, nonce) = signed_put(&key, body);
+        let (resp, _) = answer_settings(&req, &key, &v, &off, true, "127.0.0.1", NOW);
+        assert_eq!(resp.status, 403);
+        assert!(String::from_utf8_lossy(&resp.body).contains("remote_settings_off"));
+        assert!(auth::verify_response(
+            &key,
+            &nonce,
+            &resp.body,
+            sig(&resp).unwrap()
+        ));
+    }
+
     async fn listening(shared: &Shared) -> SocketAddr {
         for _ in 0..100 {
             let l = lock(shared).listening.clone();
@@ -450,7 +749,13 @@ mod tests {
             name: "studio".into(),
             problem: String::new(),
         };
-        let task = tokio::spawn(serve(shared.clone(), config, key.clone(), Some(server_id)));
+        let task = tokio::spawn(serve(
+            shared.clone(),
+            config,
+            key.clone(),
+            Some(server_id),
+            recorder_ctx(false),
+        ));
         let addr = listening(&shared).await;
         assert!(addr.ip().is_loopback());
 
@@ -501,5 +806,122 @@ mod tests {
             .expect("v1 still answers");
         assert_eq!(v1.name, "studio");
         task.abort();
+    }
+
+    /// End to end on loopback with the node's own host: over mutual TLS a
+    /// signed write changes `settings.json` through the views action layer
+    /// once the opt-in is on, leaves an audit line in the node log, the
+    /// router log and `router-audit.log`; with the opt-in off it is
+    /// refused; plain v1 is refused.
+    #[tokio::test]
+    async fn a_member_changes_settings_over_mutual_tls_through_the_action_layer() {
+        use super::super::tls::BoundIdentity;
+        let dir = temp_dir("e2e");
+        let shared = super::super::shared_for_tests();
+        lock(&shared).local = Some(report());
+        let key = ClusterKey::generate();
+        let keys: Arc<dyn super::super::KeyStore> = Arc::new(super::super::FileKeyStore::new(&dir));
+        let ctx = Arc::new(RemoteCtx {
+            host: Arc::new(super::super::remote::NodeHost::new(&dir, keys)),
+            node_dir: dir.clone(),
+        });
+        let config = Config {
+            asked: Mode::Local,
+            mode: Mode::Local,
+            port: 0,
+            allow: policy::Allowlist::default(),
+            allow_text: Vec::new(),
+            name: "studio".into(),
+            problem: String::new(),
+        };
+        let task = tokio::spawn(serve(
+            shared.clone(),
+            config,
+            key.clone(),
+            Some(BoundIdentity::mint(&key).unwrap()),
+            ctx,
+        ));
+        let addr = listening(&shared).await;
+        let member = BoundIdentity::mint(&key).unwrap();
+        let tls = super::super::peers::tls_client(&member, &key).unwrap();
+        let send = |client: reqwest::Client, scheme: &'static str, body: &'static str| {
+            let key = key.clone();
+            async move {
+                let nonce = auth::new_nonce();
+                let h = auth::sign_request_with_body(
+                    &key,
+                    "PUT",
+                    SETTINGS_PATH,
+                    crate::status::now_ms(),
+                    &nonce,
+                    body.as_bytes(),
+                );
+                let r = client
+                    .put(format!(
+                        "{scheme}://127.0.0.1:{}{SETTINGS_PATH}",
+                        addr.port()
+                    ))
+                    .header(auth::AUTH_HEADER, h)
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .send()
+                    .await
+                    .unwrap();
+                let status = r.status().as_u16();
+                let s = r
+                    .headers()
+                    .get(auth::SIG_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                let b = r.bytes().await.unwrap();
+                assert!(auth::verify_response(&key, &nonce, &b, &s), "signed answer");
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&b).unwrap(),
+                )
+            }
+        };
+        let body = r#"{"request_id":"e2e-1","name":"remote-name","max_cpus":3}"#;
+        // Off by default.
+        let (status, b) = send(tls.clone(), "https", body).await;
+        assert_eq!(
+            (status, b["error"].as_str()),
+            (403, Some("remote_settings_off"))
+        );
+        assert_eq!(crate::settings::Settings::load(&dir).router_name, None);
+        // Allowed on the machine.
+        let mut s = crate::settings::Settings::load(&dir);
+        s.set(super::super::remote::OPT_IN, "true").unwrap();
+        s.save(&dir).unwrap();
+        let (status, b) = send(tls.clone(), "https", body).await;
+        assert_eq!(status, 200, "{b}");
+        let s = crate::settings::Settings::load(&dir);
+        assert_eq!(s.router_name.as_deref(), Some("remote-name"));
+        assert_eq!(s.max_cpus, Some(3.0));
+        assert_eq!(s.router_remote_settings, Some(true));
+        // The mode and the allowlist stay out of reach.
+        let (status, b) = send(tls.clone(), "https", r#"{"router-allow":"10.0.0.0/8"}"#).await;
+        assert_eq!((status, b["field"].as_str()), (400, Some("router-allow")));
+        assert_eq!(crate::settings::Settings::load(&dir).router_allow, None);
+        // Plain v1 on the same port: refused.
+        let (status, b) = send(reqwest::Client::new(), "http", body).await;
+        assert_eq!((status, b["error"].as_str()), (403, Some("tls_required")));
+        // The audit: node log (the Logs view), router log, audit file.
+        let fp = key.fingerprint();
+        assert!(crate::status::logs()
+            .iter()
+            .any(|l| l.contains("remote settings")
+                && l.contains(&fp)
+                && l.contains("request e2e-1")));
+        assert!(lock(&shared)
+            .log
+            .iter()
+            .any(|l| l.contains("applied router-name=remote-name")));
+        let audit = std::fs::read_to_string(dir.join(super::super::remote::AUDIT_FILE)).unwrap();
+        assert_eq!(audit.lines().count(), 4, "{audit}");
+        assert!(!audit.contains(&key.reveal()), "never the key");
+        task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1082,3 +1082,22 @@ The node-info port tells the two apart by the first byte (0x16 = TLS
 handshake). A v2 node asks a `v=2` peer over TLS only. Key format and
 fingerprint are unchanged, so v1 and v2 nodes with the same key form one
 cluster. Wire details: docs/ROUTER.md, "Pairing" and "Mutual TLS".
+
+### Remote settings (v2 only, 2026-11-24)
+
+One request changes something: `PUT /v2/node-settings` on the node-info
+port. It is answered **only inside the v2 mutual TLS session**; the same
+request in plain v1 is refused (`403 tls_required`) even with a valid
+signature. Details: docs/ROUTER.md, "Remote settings".
+
+| | |
+|---|---|
+| Header | `x-kmplify-router-auth: v2.<unix ms>.<nonce>.<sig>`, `sig` = HMAC-SHA256(cluster key, `kmplify-router-v1\nreq-body\nPUT\n/v2/node-settings\n<ms>\n<nonce>\n<sha256 hex of the body>`); 30 s window, nonce once |
+| Body | JSON object with any of `name`, `paused`, `marketplace`, `max_cpus`, `max_vram_mb`, `max_ram_mb`, `max_disk_gb`, and an optional `request_id` (up to 64 of `A-Z a-z 0-9 - _ .`) |
+| Answer | signed as every answer (`x-kmplify-router-sig`); `200 {ok, applied}`, `400 {error: field_not_allowed / invalid_value / nothing_to_change / invalid_body, field}`, `403 {error: remote_settings_off / tls_required}`, `409/500 {error: apply_failed, applied}`, `401` for anything unsigned |
+| Never settable | the router mode, the allowlist, the cluster key, credentials, engine and gateway addresses, `router-remote-settings` itself; a ceiling cannot be cleared |
+| Opt-in | `router-remote-settings` (`KMPLIFY_ROUTER_REMOTE_SETTINGS`), off by default, changed only on the machine |
+
+The node report (`GET /v1/node-info`) gains `remote_settings`,
+`marketplace`, `max_cpus`, `max_vram_mb`, `max_ram_mb` and `max_disk_gb`
+(additive; absent from older nodes, read as off / none).

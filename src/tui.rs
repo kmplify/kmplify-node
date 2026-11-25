@@ -1805,6 +1805,7 @@ fn help_text() -> String {
      o  LAN router: M mode (off, local, lan)   ·   A allowlist   ·   N name\n\
      K  new cluster key   ·   J  join a cluster (the key is typed, never shown)\n\
      P  pair a device (shows a PIN) / close pairing   ·   I  join with PIN\n\
+     E  allow or stop remote settings from the router cluster (LAN router)\n\
      q  leave: back to the console when the node runs here as a view,\n\
         otherwise stops the node only if it started here\n\
      \n\
@@ -3883,6 +3884,13 @@ impl App {
                     masked: false,
                 });
             }
+            KeyCode::Char('E') => {
+                let on = self.model["router"]["remote_settings"].as_bool() == Some(true);
+                self.router_act(views::Act::Setting {
+                    key: "router-remote-settings".into(),
+                    value: (!on).to_string(),
+                });
+            }
             KeyCode::Char('N') => {
                 self.editing = Some(Editing {
                     key: "router-name",
@@ -4083,6 +4091,14 @@ fn draw_router(f: &mut Frame, app: &App, area: Rect) {
         ),
         ("discovery", s_of(r, "discovery").to_string()),
         (
+            "remote",
+            if r["remote_settings"].as_bool() == Some(true) {
+                "allowed: the cluster may change name, pause, listing and ceilings (E stops)".into()
+            } else {
+                "off: the cluster may not change this node's settings (E allows)".into()
+            },
+        ),
+        (
             "key",
             if fp.is_empty() {
                 "none yet (made when the router is turned on)".into()
@@ -4156,7 +4172,7 @@ fn draw_router(f: &mut Frame, app: &App, area: Rect) {
         ])),
     }
     me.push(Line::styled(
-        "M mode · A allowlist · N name · P pair a device · I join with PIN · K new key · J join by key",
+        "M mode · A allowlist · N name · E remote settings · P pair · I join with PIN · K new key · J join by key",
         Style::new().fg(ACCENT),
     ));
     let mut nodes: Vec<Line> = Vec::new();
